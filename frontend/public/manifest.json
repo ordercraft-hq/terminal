@@ -1,0 +1,24 @@
+{
+  "short_name": "OrderCraft",
+  "name": "OrderCraft — Financial Workstation",
+  "description": "High-Performance Open-Source Financial Charting & Market Analysis Workstation",
+  "icons": [
+    {
+      "src": "/favicon.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": "/",
+  "display": "standalone",
+  "theme_color": "#131722",
+  "background_color": "#131722",
+  "orientation": "landscape"
+}
+

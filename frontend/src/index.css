@@ -1,0 +1,146 @@
+@import "tailwindcss";
+@import "dockview/dist/styles/dockview.css";
+
+@layer base {
+  :root {
+    --bg-primary: #131722;
+    --bg-secondary: #1e222d;
+    --bg-surface: #181b27;
+    --border-subtle: #2a2e39;
+    --border-highlight: #363c4e;
+    --text-primary: #d1d4dc;
+    --text-muted: #787b86;
+    --bullish: #089981;
+    --bearish: #f23645;
+    --accent: #2962ff;
+    --accent-hover: #1e53e5;
+  }
+
+  body {
+    margin: 0;
+    padding: 0;
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: -apple-system, BlinkMacSystemFont, "Trebuchet MS", Roboto, Ubuntu, sans-serif;
+    user-select: none;
+    -webkit-user-select: none;
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+  }
+
+  /* Global selection styling for crisp contrast across pro dark theme */
+  ::selection {
+    background-color: #2962ff;
+    color: #ffffff;
+  }
+
+  /* Form inputs & textareas must allow native text selection */
+  input,
+  textarea {
+    user-select: text;
+    -webkit-user-select: text;
+  }
+
+  /* Numeric values, price scales, and time scales */
+  .tabular-nums {
+    font-family: 'JetBrains Mono', 'Roboto Mono', monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Custom Scrollbars */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: #131722;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a2e39;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #363c4e;
+}
+
+/* Hide scrollbars on pills */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Frameless Window Drag Region */
+.wails-drag {
+  --wails-draggable: drag;
+  -webkit-app-region: drag;
+}
+.wails-no-drag {
+  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
+}
+
+/* Suppress library default attribution overlay widgets */
+[id*="-attr-logo"],
+[class*="-attr-logo"] {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+/* Crosshair / Pointer Cursor Modes */
+.cursor-mode-cross,
+.cursor-mode-cross *,
+.cursor-mode-cross canvas,
+.cursor-mode-cross [class*="lightweight-charts"],
+.cursor-mode-cross [data-role="pane"] {
+  cursor: crosshair !important;
+}
+
+.cursor-mode-dot,
+.cursor-mode-dot *,
+.cursor-mode-dot canvas,
+.cursor-mode-dot [class*="lightweight-charts"],
+.cursor-mode-dot [data-role="pane"],
+.cursor-dot {
+  cursor:
+    url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABEAAAARCAYAAAA7bUf6AAAAU0lEQVR4nGNgGAVEA2FxJXZhcaUEYXGlBijNTqoBTsLiSk/+IwEQHyROigtQDEAziLCLQE7HZgCSQQnEGNJAwJAGurmE8jBhoEbsoLmI/HQywgEAMV2qTX0cWmoAAAAASUVORK5CYII=") 8 8,
+    url("data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='3.5' fill='%23ffffff' stroke='%23131722' stroke-width='1.5'/%3E%3C/svg%3E") 8 8,
+    crosshair !important;
+}
+
+.cursor-mode-arrow,
+.cursor-mode-arrow *,
+.cursor-mode-arrow canvas,
+.cursor-mode-arrow [class*="lightweight-charts"],
+.cursor-mode-arrow [data-role="pane"],
+.cursor-default {
+  cursor: default !important;
+}
+
+.drawing-tool-active,
+.drawing-tool-active *,
+.drawing-tool-active canvas,
+.drawing-tool-active [class*="lightweight-charts"],
+.drawing-tool-active [data-role="pane"] {
+  cursor: crosshair !important;
+}
+
+/* Dynamic handle/grab overrides (applied when hovering over drawing shapes/handles) */
+[data-active-cursor="pointer"], [data-active-cursor="pointer"] * { cursor: pointer !important; }
+[data-active-cursor="grab"], [data-active-cursor="grab"] * { cursor: grab !important; }
+[data-active-cursor="grabbing"], [data-active-cursor="grabbing"] * { cursor: grabbing !important; }
+[data-active-cursor="move"], [data-active-cursor="move"] * { cursor: move !important; }
+[data-active-cursor="ns-resize"], [data-active-cursor="ns-resize"] * { cursor: ns-resize !important; }
+[data-active-cursor="ew-resize"], [data-active-cursor="ew-resize"] * { cursor: ew-resize !important; }
+
+/* Star button on drawing tools flyout row */
+.drawing-tool-row:hover .drawing-tool-star-btn {
+  opacity: 1 !important;
+}
+

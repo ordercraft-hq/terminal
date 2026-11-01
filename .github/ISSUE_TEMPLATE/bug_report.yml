@@ -1,0 +1,67 @@
+name: 🐛 Bug Report
+description: Create a report to help us fix an issue or unexpected behavior in OrderCraft
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue! Please provide as much detail as possible to help us reproduce and resolve the problem.
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: Tell us what happened...
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Detailed steps to reproduce the behavior.
+      placeholder: |
+        1. Open symbol 'BINANCE:BTCUSDT' on '15m'
+        2. Draw a Fibonacci Retracement from point A to point B
+        3. Zoom out on the price scale
+        4. See anchor coordinate drift
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: A clear description of what you expected to happen.
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Execution Environment
+      description: How are you running OrderCraft?
+      options:
+        - Standalone Prebuilt Binary
+        - Built from Source (`go build`)
+        - Docker Container
+        - Browser / Web Client
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating System
+      placeholder: e.g. Windows 11, macOS Sequoia (ARM64), Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Active Market Data Provider
+      placeholder: e.g. Binance, Bybit, Alpaca, OANDA
+  - type: textarea
+    id: logs
+    attributes:
+      label: Terminal Logs / Browser Console
+      description: Paste any relevant terminal or browser console logs here.
+      render: shell
+

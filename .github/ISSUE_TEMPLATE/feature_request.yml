@@ -1,0 +1,45 @@
+name: 💡 Feature Request
+description: Propose a new feature, technical indicator, drawing tool, or data provider for OrderCraft
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        We welcome ideas for new charting primitives, technical indicators, broker integrations, or UI optimizations!
+  - type: dropdown
+    id: category
+    attributes:
+      label: Feature Category
+      description: What area of the workstation does this request target?
+      options:
+        - Drawing Tool Primitive
+        - Technical Indicator / Math Engine
+        - Market Data Provider / Broker Integration
+        - Multi-Chart Workspace / UX
+        - Standalone Shell / Platform Packaging
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Motivation
+      description: Is your feature request related to a specific workflow problem or limitation?
+      placeholder: I'm always frustrated when...
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution / Specification
+      description: Describe your proposed solution, mathematical formula, or behavioral specification.
+      placeholder: Provide formulas, parameters, or interaction flow...
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Describe any alternative solutions or workarounds you have considered.
+

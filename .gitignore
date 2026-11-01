@@ -1,0 +1,65 @@
+# Binaries & Build Output
+dist/
+frontend/dist/*
+!frontend/dist/.gitkeep
+build/
+bin/
+build/bin/
+tmp/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Dependencies
+node_modules/
+frontend/node_modules/
+vendor/
+
+# Local databases, caches & parquet data
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite*
+*.parquet
+data/
+cache/
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# Test coverage
+coverage/
+*.coverage
+
+# Session Summaries & Local Notes
+chatsummary.md
+skills/
+.ecc/
+
+# Local runner scripts & launchers
+runner.cjs
+stop_ordercraft.bat
+
+# AI Coding Agent Configs
+AGENTS.md
+CLAUDE.md
+.cursor/
+.claude/
+.windsurf/
+
+# Internal migration & planning docs (never commit)
+docs/migration-klinecharts.md
+
+
