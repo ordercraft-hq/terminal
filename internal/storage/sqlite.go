@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/ordercraft-hq/terminal/internal/security"
 	_ "modernc.org/sqlite"
 )
 
@@ -46,7 +48,8 @@ type ChartTemplate struct {
 }
 
 type Storage struct {
-	db *sql.DB
+	db     *sql.DB
+	cipher *security.Cipher
 }
 
 // NewStorage opens an embedded SQLite database using pure-Go modernc.org/sqlite.
@@ -55,6 +58,20 @@ func NewStorage(dbPath string) (*Storage, error) {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return nil, fmt.Errorf("failed to create db directory: %w", err)
 		}
+	}
+
+	// Resolve master encryption key and initialize credential cipher
+	keyPath := ""
+	if dbPath != ":memory:" && !strings.Contains(dbPath, "mode=memory") {
+		keyPath = filepath.Join(filepath.Dir(dbPath), ".ordercraft.key")
+	}
+	masterKey, err := security.ResolveMasterKey(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve encryption key: %w", err)
+	}
+	c, err := security.NewCipher(masterKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize credential cipher: %w", err)
 	}
 
 	db, err := sql.Open("sqlite", dbPath)
@@ -83,11 +100,14 @@ func NewStorage(dbPath string) (*Storage, error) {
 		}
 	}
 
-	s := &Storage{db: db}
+	s := &Storage{db: db, cipher: c}
 	if err := s.initSchema(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
 	}
+
+	// Migrate any existing unencrypted legacy API keys to AES-256-GCM
+	_ = s.migrateLegacyKeys(context.Background())
 
 	// Enforce 0600 file permissions on database file so only file owner can read/write API credentials
 	if info, err := os.Stat(dbPath); err == nil && !info.IsDir() {
@@ -395,9 +415,18 @@ func (s *Storage) DeleteChartTemplate(ctx context.Context, id string) error {
 	return err
 }
 
-// API Key operations
+// API Key operations (encrypted via AES-256-GCM)
 
 func (s *Storage) SaveAPIKey(ctx context.Context, provider, keyData string) error {
+	storedData := keyData
+	if s.cipher != nil && keyData != "" {
+		encrypted, err := s.cipher.Encrypt(keyData)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt api key for %s: %w", provider, err)
+		}
+		storedData = encrypted
+	}
+
 	query := `
 	INSERT INTO api_keys (provider, key_data, updated_at)
 	VALUES (?, ?, ?)
@@ -405,7 +434,7 @@ func (s *Storage) SaveAPIKey(ctx context.Context, provider, keyData string) erro
 		key_data = excluded.key_data,
 		updated_at = excluded.updated_at;
 	`
-	_, err := s.db.ExecContext(ctx, query, provider, keyData, time.Now().Unix())
+	_, err := s.db.ExecContext(ctx, query, provider, storedData, time.Now().Unix())
 	return err
 }
 
@@ -415,11 +444,54 @@ func (s *Storage) GetAPIKey(ctx context.Context, provider string) (string, error
 	if err == sql.ErrNoRows {
 		return "", nil
 	}
-	return keyData, err
+	if err != nil {
+		return "", err
+	}
+
+	if s.cipher != nil && keyData != "" {
+		decrypted, err := s.cipher.Decrypt(keyData)
+		if err != nil {
+			return "", fmt.Errorf("failed to decrypt api key for %s: %w", provider, err)
+		}
+		return decrypted, nil
+	}
+
+	return keyData, nil
 }
 
 func (s *Storage) DeleteAPIKey(ctx context.Context, provider string) error {
 	_, err := s.db.ExecContext(ctx, "DELETE FROM api_keys WHERE provider = ?", provider)
 	return err
+}
+
+func (s *Storage) migrateLegacyKeys(ctx context.Context) error {
+	if s.cipher == nil {
+		return nil
+	}
+	rows, err := s.db.QueryContext(ctx, "SELECT provider, key_data FROM api_keys")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type keyItem struct {
+		provider string
+		data     string
+	}
+	var unencrypted []keyItem
+	for rows.Next() {
+		var prov, data string
+		if err := rows.Scan(&prov, &data); err == nil {
+			if !strings.HasPrefix(data, security.EnvelopePrefix) && data != "" {
+				unencrypted = append(unencrypted, keyItem{provider: prov, data: data})
+			}
+		}
+	}
+	_ = rows.Close()
+
+	for _, item := range unencrypted {
+		_ = s.SaveAPIKey(ctx, item.provider, item.data)
+	}
+	return nil
 }
 
