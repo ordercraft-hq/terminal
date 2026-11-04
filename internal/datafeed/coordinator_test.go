@@ -2,6 +2,7 @@ package datafeed
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -76,6 +77,15 @@ func TestCoordinatorResolutionAndRouting(t *testing.T) {
 	}
 	if prov.Name() != "BINANCE" || sym != "BTCUSDT" {
 		t.Fatalf("expected BINANCE and BTCUSDT, got %s and %s", prov.Name(), sym)
+	}
+
+	// Test explicit unconfigured provider prefix must fail, never silently fallback to Binance
+	_, _, err = coord.ResolveProvider("TWELVEDATA:AAPL")
+	if err == nil {
+		t.Fatalf("expected error for unconfigured provider TWELVEDATA:AAPL, but got nil")
+	}
+	if !strings.Contains(err.Error(), `provider "TWELVEDATA" is not configured or supported`) {
+		t.Fatalf("unexpected error message: %v", err)
 	}
 }
 

@@ -74,15 +74,22 @@ func (c *Coordinator) ResolveProvider(fullSymbol string) (DataProvider, string, 
 	clean := strings.TrimSpace(fullSymbol)
 	exchange := "BINANCE"
 	sym := clean
+	explicitExchange := false
 
 	if parts := strings.SplitN(clean, ":", 2); len(parts) == 2 {
 		exchange = strings.ToUpper(parts[0])
 		sym = parts[1]
+		explicitExchange = true
 	}
 
 	p, ok := c.GetProvider(exchange)
 	if !ok {
-		// Fallback to Binance if available, else first registered
+		// If an explicit provider prefix was requested (e.g. TWELVEDATA:AAPL), do NOT silently fallback
+		if explicitExchange {
+			return nil, "", fmt.Errorf("provider %q is not configured or supported", exchange)
+		}
+
+		// Fallback to Binance if available, else first registered (for bare symbols without prefix like "BTCUSDT")
 		p, ok = c.GetProvider("BINANCE")
 		if !ok {
 			c.mu.RLock()

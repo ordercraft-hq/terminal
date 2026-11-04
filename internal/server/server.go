@@ -824,7 +824,7 @@ func (s *Server) handleProvidersStatus(w http.ResponseWriter, r *http.Request) {
 		"name":     "Twelve Data",
 		"category": "Multi-Asset Global",
 		"authType": "API Key",
-		"status":   "available",
+		"status":   "coming_soon",
 		"docUrl":   twelveDoc,
 	}
 	ibkrItem := map[string]interface{}{
@@ -832,7 +832,7 @@ func (s *Server) handleProvidersStatus(w http.ResponseWriter, r *http.Request) {
 		"name":     "Interactive Brokers (TWS)",
 		"category": "Global Brokerage",
 		"authType": "Gateway",
-		"status":   "available",
+		"status":   "coming_soon",
 		"docUrl":   ibkrDoc,
 	}
 
@@ -1012,10 +1012,8 @@ func (s *Server) handleProviderConfigure(w http.ResponseWriter, r *http.Request)
 				_ = s.storage.SaveAPIKey(r.Context(), "OANDA", string(keyData))
 			}
 		case "TWELVEDATA", "IBKR":
-			if s.storage != nil {
-				keyData, _ := json.Marshal(saved)
-				_ = s.storage.SaveAPIKey(r.Context(), provID, string(keyData))
-			}
+			http.Error(w, fmt.Sprintf(`{"error":"%s feed adapter is in development for an upcoming release"}`, provID), http.StatusBadRequest)
+			return
 		default:
 			http.Error(w, `{"error":"unsupported provider"}`, http.StatusBadRequest)
 			return
