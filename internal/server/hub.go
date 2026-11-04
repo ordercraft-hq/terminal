@@ -22,6 +22,7 @@ type StreamHub struct {
 	clients     map[*HubClient]bool
 	topics      map[string]map[*HubClient]bool
 	lastCandles map[string]datafeed.Candle
+	authToken   string
 }
 
 type HubClient struct {
@@ -59,9 +60,41 @@ func (h *StreamHub) topicKey(symbol, resolution string) string {
 	return strings.ToUpper(strings.TrimSpace(symbol)) + "::" + strings.TrimSpace(resolution)
 }
 
+func (h *StreamHub) SetAuthToken(token string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.authToken = token
+}
+
 func (h *StreamHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	expectedToken := h.authToken
+	h.mu.RUnlock()
+
+	if expectedToken != "" {
+		token := r.URL.Query().Get("token")
+		if token == "" {
+			if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+				token = strings.TrimPrefix(auth, "Bearer ")
+			}
+		}
+		if token != expectedToken {
+			http.Error(w, `{"error":"unauthorized: invalid or missing auth token"}`, http.StatusUnauthorized)
+			return
+		}
+	}
+
+	var originPatterns []string
+	if expectedToken != "" {
+		// When token authentication is active, allow authenticated remote clients
+		originPatterns = []string{"*"}
+	} else {
+		// Localhost only
+		originPatterns = []string{"localhost:*", "127.0.0.1:*", "[::1]:*", "localhost", "127.0.0.1", "[::1]"}
+	}
+
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: []string{"localhost:*", "127.0.0.1:*", "[::1]:*", "localhost", "127.0.0.1", "[::1]"},
+		OriginPatterns: originPatterns,
 	})
 	if err != nil {
 		log.Printf("[StreamHub] Accept error: %v\n", err)

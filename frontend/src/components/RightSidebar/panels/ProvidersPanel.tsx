@@ -95,7 +95,7 @@ export const ProvidersPanel: React.FC = () => {
       name: 'Twelve Data',
       category: 'Multi-Asset Global',
       authType: 'API Key',
-      status: 'available',
+      status: 'coming_soon',
       docUrl: 'https://github.com/ordercraft-hq/terminal/blob/main/docs/provider-setup/TwelveData.md',
     },
     {
@@ -103,7 +103,7 @@ export const ProvidersPanel: React.FC = () => {
       name: 'Interactive Brokers (TWS)',
       category: 'Global Brokerage',
       authType: 'Gateway',
-      status: 'available',
+      status: 'coming_soon',
       docUrl: 'https://github.com/ordercraft-hq/terminal/blob/main/docs/provider-setup/InteractiveBrokers.md',
     },
   ]);
@@ -121,6 +121,7 @@ export const ProvidersPanel: React.FC = () => {
   const [saveError, setSaveError] = useState<string | null>(null);
 
   const openConfigure = (integ: IntegrationInfo) => {
+    if (integ.status === 'coming_soon') return;
     setSelectedIntegration(integ);
     setAccountId(integ.accountId || '');
     setApiKey(integ.maskedApiKey || '');
@@ -376,28 +377,48 @@ export const ProvidersPanel: React.FC = () => {
           </div>
 
           <div className="space-y-1.5">
-            {integrations.map((integ) => (
-              <div
-                key={integ.id}
-                className="p-2.5 bg-[#181b27]/60 hover:bg-[#1e222d] border border-[#2a2e39]/60 rounded-lg flex items-center justify-between transition-colors"
-              >
-                <div className="flex flex-col min-w-0 pr-2">
-                  <span className="font-semibold text-white text-[11px] truncate">
-                    {integ.name}
-                  </span>
-                  <span className="text-[10px] text-[#787b86]">
-                    {integ.category} · {integ.authType}
-                  </span>
-                </div>
-
-                <button
-                  onClick={() => openConfigure(integ)}
-                  className="px-2.5 py-1 rounded bg-[#2a2e39] hover:bg-[#2962ff] text-white text-[11px] font-medium transition-colors cursor-pointer shrink-0"
+            {integrations.map((integ) => {
+              const isComingSoon = integ.status === 'coming_soon';
+              return (
+                <div
+                  key={integ.id}
+                  className="p-2.5 bg-[#181b27]/60 hover:bg-[#1e222d] border border-[#2a2e39]/60 rounded-lg flex items-center justify-between transition-colors"
                 >
-                  Configure
-                </button>
-              </div>
-            ))}
+                  <div className="flex flex-col min-w-0 pr-2">
+                    <div className="flex items-center space-x-1.5">
+                      <span className="font-semibold text-white text-[11px] truncate">
+                        {integ.name}
+                      </span>
+                      {isComingSoon && (
+                        <span className="text-[9px] text-[#e0a82e] bg-[#e0a82e]/15 px-1.5 py-0.5 rounded font-mono font-medium">
+                          Coming Soon
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-[10px] text-[#787b86]">
+                      {integ.category} · {integ.authType}
+                    </span>
+                  </div>
+
+                  {isComingSoon ? (
+                    <button
+                      disabled
+                      title="Feed adapter is in development for an upcoming release"
+                      className="px-2.5 py-1 rounded bg-[#2a2e39]/50 text-[#787b86] text-[11px] font-medium cursor-not-allowed shrink-0"
+                    >
+                      Planned
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => openConfigure(integ)}
+                      className="px-2.5 py-1 rounded bg-[#2a2e39] hover:bg-[#2962ff] text-white text-[11px] font-medium transition-colors cursor-pointer shrink-0"
+                    >
+                      Configure
+                    </button>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </div>
 

@@ -36,6 +36,8 @@ type Server struct {
 	oandaProv    *providers.OandaProvider
 	mux          *http.ServeMux
 	server       *http.Server
+	authToken    string
+	bindHost     string
 }
 
 func NewServer(s *storage.Storage) *Server {
@@ -184,7 +186,13 @@ func (s *Server) routes() {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"ok","app":"ORDERCRAFT"}`))
+		resp := map[string]interface{}{
+			"status":       "ok",
+			"app":          "ORDERCRAFT",
+			"auth_enabled": s.authToken != "",
+			"loopback":     IsLoopbackHost(s.bindHost),
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 }
 
@@ -824,7 +832,7 @@ func (s *Server) handleProvidersStatus(w http.ResponseWriter, r *http.Request) {
 		"name":     "Twelve Data",
 		"category": "Multi-Asset Global",
 		"authType": "API Key",
-		"status":   "available",
+		"status":   "coming_soon",
 		"docUrl":   twelveDoc,
 	}
 	ibkrItem := map[string]interface{}{
@@ -832,7 +840,7 @@ func (s *Server) handleProvidersStatus(w http.ResponseWriter, r *http.Request) {
 		"name":     "Interactive Brokers (TWS)",
 		"category": "Global Brokerage",
 		"authType": "Gateway",
-		"status":   "available",
+		"status":   "coming_soon",
 		"docUrl":   ibkrDoc,
 	}
 
@@ -1012,10 +1020,8 @@ func (s *Server) handleProviderConfigure(w http.ResponseWriter, r *http.Request)
 				_ = s.storage.SaveAPIKey(r.Context(), "OANDA", string(keyData))
 			}
 		case "TWELVEDATA", "IBKR":
-			if s.storage != nil {
-				keyData, _ := json.Marshal(saved)
-				_ = s.storage.SaveAPIKey(r.Context(), provID, string(keyData))
-			}
+			http.Error(w, fmt.Sprintf(`{"error":"%s feed adapter is in development for an upcoming release"}`, provID), http.StatusBadRequest)
+			return
 		default:
 			http.Error(w, `{"error":"unsupported provider"}`, http.StatusBadRequest)
 			return
@@ -1097,10 +1103,67 @@ func enableCORS(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+func IsLoopbackHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "" {
+		return true
+	}
+	return h == "127.0.0.1" || h == "localhost" || h == "::1" || h == "[::1]" || strings.HasPrefix(h, "127.")
+}
+
+func (s *Server) SetAuthToken(token string) {
+	s.authToken = strings.TrimSpace(token)
+	if s.streamHub != nil {
+		s.streamHub.SetAuthToken(s.authToken)
+	}
+}
+
+func (s *Server) SetBindHost(host string) {
+	s.bindHost = strings.TrimSpace(host)
+}
+
+func (s *Server) ValidateAuth(r *http.Request) bool {
+	if s.authToken == "" {
+		return true // No authentication required in local loopback mode
+	}
+	// Check query param (needed for WebSockets and simple curls)
+	if token := r.URL.Query().Get("token"); token == s.authToken {
+		return true
+	}
+	// Check Authorization header
+	auth := r.Header.Get("Authorization")
+	if auth != "" {
+		if strings.HasPrefix(auth, "Bearer ") {
+			auth = strings.TrimPrefix(auth, "Bearer ")
+		}
+		if auth == s.authToken {
+			return true
+		}
+	}
+	return false
+}
+
+// Handler returns the HTTP handler wrapped with optional token authentication middleware.
+func (s *Server) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.authToken != "" {
+			// Health check, docs, and non-API static assets are public
+			isPublic := r.URL.Path == "/api/health" || strings.HasPrefix(r.URL.Path, "/docs/") || !strings.HasPrefix(r.URL.Path, "/api/")
+			if !isPublic && !s.ValidateAuth(r) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"error":"unauthorized: invalid or missing authentication token"}`))
+				return
+			}
+		}
+		s.mux.ServeHTTP(w, r)
+	})
+}
+
 func (s *Server) Start(addr string) error {
 	s.server = &http.Server{
 		Addr:              addr,
-		Handler:           s.mux,
+		Handler:           s.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -1113,7 +1176,7 @@ func (s *Server) Start(addr string) error {
 
 func (s *Server) Serve(listener net.Listener) error {
 	s.server = &http.Server{
-		Handler:           s.mux,
+		Handler:           s.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,

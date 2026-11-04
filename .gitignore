@@ -25,6 +25,8 @@ vendor/
 *.sqlite*
 *.parquet
 data/
+*.key
+.ordercraft.key
 cache/
 
 # Environment variables & secrets

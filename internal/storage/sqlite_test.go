@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -177,3 +178,86 @@ func TestStorageLifecycle(t *testing.T) {
 		t.Fatalf("Expected 1 chart template (ctmpl_light), got %+v", chartTmplsAfter)
 	}
 }
+
+func TestStorage_APIKeyEncryption(t *testing.T) {
+	tmpDB := "test_ordercraft_keys.db"
+	keyFile := ".ordercraft.key"
+	defer os.Remove(tmpDB)
+	defer os.Remove(keyFile)
+
+	s, err := NewStorage(tmpDB)
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	plainSecret := `{"apiKey":"PKALPACA123456","apiSecret":"secret_live_token_789"}`
+
+	// 1. Save API Key
+	if err := s.SaveAPIKey(ctx, "ALPACA", plainSecret); err != nil {
+		t.Fatalf("SaveAPIKey failed: %v", err)
+	}
+
+	// 2. Query raw database directly - must be encrypted!
+	var rawInDB string
+	err = s.db.QueryRow("SELECT key_data FROM api_keys WHERE provider = 'ALPACA'").Scan(&rawInDB)
+	if err != nil {
+		t.Fatalf("Failed to query raw db: %v", err)
+	}
+
+	if !strings.HasPrefix(rawInDB, "enc:v1:") {
+		t.Fatalf("Expected key_data in SQLite to start with 'enc:v1:', got: %s", rawInDB)
+	}
+	if strings.Contains(rawInDB, "PKALPACA123456") || strings.Contains(rawInDB, "secret_live_token_789") {
+		t.Fatalf("Security failure: raw SQLite database contains plaintext credentials! Stored: %s", rawInDB)
+	}
+
+	// 3. GetAPIKey should transparently decrypt
+	decrypted, err := s.GetAPIKey(ctx, "ALPACA")
+	if err != nil {
+		t.Fatalf("GetAPIKey failed: %v", err)
+	}
+	if decrypted != plainSecret {
+		t.Fatalf("Decrypted mismatch. Expected %q, got %q", plainSecret, decrypted)
+	}
+
+	// 4. Test backward compatibility: insert raw unencrypted legacy key
+	legacyPlain := `{"apiKey":"PKLEGACY","apiSecret":"old_unencrypted_secret"}`
+	_, err = s.db.Exec("INSERT INTO api_keys (provider, key_data, updated_at) VALUES ('OANDA', ?, ?)", legacyPlain, time.Now().Unix())
+	if err != nil {
+		t.Fatalf("Failed to insert legacy key: %v", err)
+	}
+
+	// Should read legacy key without error
+	gotLegacy, err := s.GetAPIKey(ctx, "OANDA")
+	if err != nil {
+		t.Fatalf("GetAPIKey for legacy row failed: %v", err)
+	}
+	if gotLegacy != legacyPlain {
+		t.Fatalf("Expected legacy key returned unchanged, got: %q", gotLegacy)
+	}
+
+	// Re-saving OANDA should now encrypt it
+	if err := s.SaveAPIKey(ctx, "OANDA", gotLegacy); err != nil {
+		t.Fatalf("SaveAPIKey re-save failed: %v", err)
+	}
+	var rawOandaInDB string
+	_ = s.db.QueryRow("SELECT key_data FROM api_keys WHERE provider = 'OANDA'").Scan(&rawOandaInDB)
+	if !strings.HasPrefix(rawOandaInDB, "enc:v1:") {
+		t.Fatalf("Expected re-saved OANDA key to be encrypted with 'enc:v1:', got: %s", rawOandaInDB)
+	}
+
+	// 5. Delete API Key
+	if err := s.DeleteAPIKey(ctx, "ALPACA"); err != nil {
+		t.Fatalf("DeleteAPIKey failed: %v", err)
+	}
+	deletedKey, err := s.GetAPIKey(ctx, "ALPACA")
+	if err != nil {
+		t.Fatalf("GetAPIKey after delete failed: %v", err)
+	}
+	if deletedKey != "" {
+		t.Fatalf("Expected empty string for deleted key, got: %q", deletedKey)
+	}
+}
+
