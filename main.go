@@ -60,11 +60,31 @@ func main() {
 	dbPath := flag.String("db", "data/ordercraft.db", "SQLite database path")
 	noBrowser := flag.Bool("no-browser", false, "Disable automatic browser launching on startup")
 	appMode := flag.Bool("app-mode", false, "Launch browser in standalone application window mode (--app)")
+	tokenEnv := os.Getenv("ORDERCRAFT_AUTH_TOKEN")
+	tokenFlag := flag.String("token", tokenEnv, "Optional bearer/query token for authenticating API and WebSocket requests (supports ORDERCRAFT_AUTH_TOKEN env var)")
 	flag.Parse()
 
 	log.Println("==================================================")
 	log.Println("  ORDERCRAFT — Financial Workstation v0.1.0        ")
 	log.Println("==================================================")
+
+	// Security advisory check for network host binding
+	if !server.IsLoopbackHost(*host) {
+		if *tokenFlag == "" {
+			log.Println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+			log.Printf("  [SECURITY WARNING] Non-loopback host binding detected: %s\n", *host)
+			log.Println("  OrderCraft is running WITHOUT authentication on a network-accessible host.")
+			log.Println("  Exposing port 8448 allows any device on your local network or the internet")
+			log.Println("  to view and modify workspace layouts, drawings, and configured API credentials!")
+			log.Println("  ")
+			log.Println("  RECOMMENDATION:")
+			log.Println("  To secure remote or Docker deployments, set a shared secret token via:")
+			log.Println("    --token=<secret>  or  export ORDERCRAFT_AUTH_TOKEN=<secret>")
+			log.Println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+		} else {
+			log.Printf("[Security] Binding to network interface %s with token authentication enabled.\n", *host)
+		}
+	}
 
 	s, err := storage.NewStorage(*dbPath)
 	if err != nil {
@@ -74,6 +94,11 @@ func main() {
 	log.Printf("[Storage] SQLite initialized at %s\n", *dbPath)
 
 	srv := server.NewServer(s)
+	srv.SetBindHost(*host)
+	if *tokenFlag != "" {
+		srv.SetAuthToken(*tokenFlag)
+		log.Println("[Security] Token authentication active for all /api/ endpoints and /ws.")
+	}
 
 	// Mount embedded frontend production bundle with SPA routing
 	if distFS, err := fs.Sub(embeddedFrontend, "frontend/dist"); err == nil {

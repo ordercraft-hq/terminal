@@ -37,8 +37,8 @@ Every dependency in this stack uses a permissive open-source license (**MIT**, *
   * *Control Plane:* Wails IPC bindings (with an automatic fallback to REST/JSON-RPC when running in Docker/Web mode).
   * *High-Frequency Data Plane:* Embedded localhost binary WebSocket server (`nhooyr.io/websocket` + **MessagePack** / **FlatBuffers**) capable of streaming 50,000+ orderbook/tick updates per second at 60–144fps without IPC JSON serialization bottlenecks.
 * **Local Storage:**
-  * **SQLite (`modernc.org/sqlite` — pure Go, no CGO required):** Stores saved multi-chart layouts, drawing objects, watchlists, alert rules, and encrypted user API keys.
-  * **DuckDB / Local Parquet Cache:** Stores historical OHLCV candles and ticks for offline loading and multi-year Bar Replay.
+  * **SQLite (`modernc.org/sqlite` — pure Go, no CGO required):** Stores saved multi-chart layouts, drawing objects, watchlists, alert rules, drawing templates, chart style templates, and authenticated **AES-256-GCM encrypted** broker API credentials (`data/ordercraft.db` with 0600 file permissions).
+  * **Local Memory Cache & Planned Parquet Storage:** In-memory LRU cache (10s TTL) for active candle streams; cold storage (DuckDB / Parquet) planned alongside historical Bar Replay.
 
 ### 2.2 Frontend & Charting Engine
 * **Framework:** **React 19 + TypeScript + Vite**
@@ -73,7 +73,8 @@ ordercraft/
 │   │   └── orderscript-grammar.md   # EBNF grammar for declarative indicator scripting
 │   └── provider-setup/              # Market data provider configuration guides
 ├── internal/
-│   ├── server/                      # Localhost REST & real-time WebSocket relay hub
+│   ├── server/                      # Localhost REST & real-time WebSocket relay hub (with loopback & token auth)
+│   ├── security/                    # AES-256-GCM authenticated cipher & local master key resolver
 │   ├── datafeed/                    # Unified multi-provider market data engine
 │   │   ├── provider.go              # DataProvider interface (GetHistory, Subscribe, Search)
 │   │   ├── aggregator.go            # Real-time tick-to-custom-timeframe (1s, 5s, 15m, Range)
@@ -127,11 +128,20 @@ To make the repository useful to both desktop traders and self-hosted/cloud deve
   * Window management actions (Minimize, Maximize, Tear-off Window, System Tray) check `if (window.runtime)` and invoke Wails APIs.
   * Market data subscriptions, historical candle fetches, indicator calculations, and SQLite layout saves route over the binary WebSocket connection.
 
-### 4.2 Multi-Provider Data Engine & Synthetic Ticker Router
+### 4.2 Multi-Provider Data Engine & Explicit Ticker Router
 Every symbol in the platform uses a `PROVIDER:SYMBOL` namespace:
-* `BINANCE:BTCUSDT` -> Routes to `BinanceProvider`
-* `YAHOO:AAPL` or `YAHOO:^NSEI` -> Routes to `YahooProvider`
-* **Synthetic Expressions:** If a user enters `BINANCE:BTCUSDT / BINANCE:ETHUSDT` or `YAHOO:SPY - YAHOO:QQQ`, the Go `SyntheticEngine` subscribes to both underlying feeds concurrently, aligns timestamps in memory, evaluates the expression, and streams the synthetic OHLCV bars to the chart.
+* **Active Native Feeds:**
+  * `BINANCE:BTCUSDT` -> Routes to `BinanceProvider` (Free Crypto Spot/Futures)
+  * `BYBIT:BTCUSDT` -> Routes to `BybitProvider` (Free Crypto v5)
+  * `COINBASE:BTC-USD` -> Routes to `CoinbaseProvider` (Advanced Trade)
+  * `ALPACA:AAPL` -> Routes to `AlpacaProvider` (BYOK US Stocks & Crypto)
+  * `OANDA:EUR_USD` -> Routes to `OandaProvider` (BYOK Forex & CFD v20)
+* **Planned Provider Feeds (Marked "Coming Soon"):**
+  * `TWELVEDATA:AAPL` -> Planned feed adapter (integration stub in development)
+  * `IBKR:AAPL` -> Planned Gateway/TWS adapter
+  * `YAHOO:AAPL` -> Currently powers Watchlist Quotes & Movers; direct candle streaming feed planned
+* **Explicit Routing & Fail-Fast:** If a symbol prefix specifies an unconfigured or unsupported provider (e.g. `TWELVEDATA:AAPL`), the coordinator immediately returns an explicit error (`provider "TWELVEDATA" is not configured or supported`) rather than silently falling back to a default crypto provider. Unprefixed symbols (`BTCUSDT`) continue to route to the default crypto provider.
+* **Synthetic Expressions (Planned):** If a user enters `BINANCE:BTCUSDT / BINANCE:ETHUSDT` or `YAHOO:SPY - YAHOO:QQQ`, the Go `SyntheticEngine` subscribes to both underlying feeds concurrently, aligns timestamps in memory, evaluates the expression, and streams the synthetic OHLCV bars to the chart.
 * **Custom Second & Tick Timeframes:** Because Go receives raw live trades from WebSockets, the `Aggregator` builds `1s`, `5s`, `10s`, `30s`, or custom tick-bar candles (`100T`, `500T`) locally—providing features that normally require expensive subscriptions for free.
 
 ### 4.3 The Custom Drawing Engine (`ISeriesPrimitive` Architecture)
@@ -145,6 +155,12 @@ We build a single **Interactive Drawing Manager** in TypeScript:
 3. **Hit-Testing & Selection Handles:** Each primitive implements a `hitTest(x, y)` method using point-to-line-segment distance math, displaying draggable resize handles when hovered or selected.
 4. **SQLite Auto-Save:** Every drag-end or creation event debounces a save call to Go, storing the drawing tied to `(symbol, layout_id)` in SQLite.
 
+### 4.4 Security, Credential Encryption & Network Isolation
+* **AES-256-GCM Credential Encryption:** API keys, secrets, and tokens stored in SQLite (`api_keys` table) are automatically encrypted using authenticated AES-256-GCM (`internal/security/crypto.go`). Raw credentials never touch disk in plaintext. A unique 32-byte master key is stored with strict `0600` permissions (`data/.ordercraft.key`) or derived from the `ORDERCRAFT_ENCRYPTION_KEY` environment variable.
+* **Loopback Host Isolation:** OrderCraft binds by default to `127.0.0.1` and restricts WebSocket / CORS origin patterns strictly to local loopback (`localhost`, `127.0.0.1`, `::1`).
+* **Non-Loopback Security Advisory:** Binding to non-loopback interfaces (e.g. `--host 0.0.0.0`) without authentication triggers an immediate high-visibility security warning banner at startup.
+* **Token Authentication:** For remote, headless, or Docker deployments, passing `--token=<secret>` or setting `ORDERCRAFT_AUTH_TOKEN` activates bearer token authentication on all `/api/` endpoints and `/ws` WebSocket streams (via header or `?token=<secret>`), permitting authenticated remote browser origins while keeping health probes accessible.
+
 ---
 
 ## 5. Step-by-Step Implementation Roadmap
@@ -156,6 +172,7 @@ We build a single **Interactive Drawing Manager** in TypeScript:
 - [x] **Step 1.4:** Build the Go `DataProvider` interface and implement the first free provider (**Binance Spot/Perps** REST historical klines).
 - [x] **Step 1.5:** Embed `lightweight-charts` v5 inside a `ChartPane` component with full OHLCV candlestick + volume histogram rendering, dynamic historical loading, and live crosshair HUD legend.
 - [x] **Step 1.6:** Build the global Command Palette (`Cmd/Ctrl + K` or typing directly on the chart) for instant symbol and timeframe switching (`1s`, `1m`, `5m`, `15m`, `1h`, `4h`, `1D`, `1W`).
+- [x] **Step 1.7:** Implement **AES-256-GCM Credential Encryption & Network Security Hardening** (transparent SQLite key encryption, startup auto-migration, non-loopback security warning banners, and optional token auth for remote/Docker setups).
 
 ### Phase 2: Multi-Chart Workspace Grids & Cross-Chart Sync (Weeks 3–4)
 - [x] **Step 2.1:** Implement dynamic multi-chart grid layouts (1x1, 2v, 2h, 3v, 3h, 3top, 3left, 4 grid, 4v, 4h, 6, 8) with focused active pane tracking and pane maximize/restore.
