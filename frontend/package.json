@@ -1,6 +1,6 @@
 {
   "name": "@ordercraft/terminal",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "type": "module",
   "description": "High-Performance Open-Source Financial Charting & Market Analysis Workstation",
   "homepage": "https://github.com/ordercraft-hq/terminal",

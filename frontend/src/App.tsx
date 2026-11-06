@@ -35,6 +35,15 @@ export const App: React.FC = () => {
   const isIndicatorsModalOpen = useSyncStore((s) => s.isIndicatorsModalOpen);
   const closeIndicatorsModal = useSyncStore((s) => s.closeIndicatorsModal);
   const activeSettingsIndicator = useSyncStore((s) => s.activeSettingsIndicator);
+  const checkForUpdates = useSyncStore((s) => s.checkForUpdates);
+
+  // Background non-blocking update check on application startup
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      checkForUpdates(false);
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [checkForUpdates]);
 
   // Global Keyboard Shortcuts (Capture Phase): Direct chart typing -> Symbol Search & Ctrl+K
   useEffect(() => {

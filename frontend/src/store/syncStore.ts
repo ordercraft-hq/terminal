@@ -4,6 +4,8 @@ import { isTimeframeSupported, getFallbackTimeframe } from '../utils/timeframeSu
 import type { IndicatorInstance, IndicatorType, IndicatorPlotStyle } from '../indicators/types';
 import { INDICATOR_REGISTRY } from '../indicators/registry';
 import { transport } from '../transport/client';
+import { checkGitHubUpdate, type UpdateCheckResult } from '../services/updateService';
+import { APP_VERSION } from '../version';
 
 export type MagnetMode = 'none' | 'weak' | 'strong';
 export type ChartType =
@@ -347,6 +349,8 @@ export interface ChartVisualSettings {
   canvasCrosshairStyle: 'solid' | 'dashed' | 'dotted';
   canvasCrosshairWidth: number;
   canvasWatermark: boolean;
+  canvasWatermarkTicker?: boolean;
+  canvasWatermarkInterval?: boolean;
   canvasWatermarkColor: string;
 
   // Scales Section (in Canvas Tab)
@@ -432,7 +436,9 @@ export const DEFAULT_CHART_SETTINGS: ChartVisualSettings = {
   canvasCrosshairStyle: 'dotted',
   canvasCrosshairWidth: 1,
   canvasWatermark: false,
-  canvasWatermarkColor: 'rgba(42, 46, 57, 0.3)',
+  canvasWatermarkTicker: false,
+  canvasWatermarkInterval: false,
+  canvasWatermarkColor: 'rgba(255, 255, 255, 0.08)',
 
   scalesTextColor: '#787b86',
   scalesTextSize: 11,
@@ -648,6 +654,11 @@ interface SyncStoreState {
   pushHistory: (description: string) => void;
   undo: () => void;
   redo: () => void;
+
+  // Version & Updates
+  updateCheckResult: UpdateCheckResult;
+  isCheckingUpdate: boolean;
+  checkForUpdates: (force?: boolean) => Promise<void>;
 }
 
 export const createDefaultVolumeIndicator = (paneId: string): IndicatorInstance => ({
@@ -749,6 +760,33 @@ function syncDrawingChangesToBackend(
 export const useSyncStore = create<SyncStoreState>()(
   persist(
     (set, get) => ({
+      // Version & Updates
+      updateCheckResult: {
+        status: 'idle',
+        currentVersion: APP_VERSION,
+      },
+      isCheckingUpdate: false,
+      checkForUpdates: async (force = false) => {
+        set({ isCheckingUpdate: true });
+        try {
+          let current = get().updateCheckResult.currentVersion || APP_VERSION;
+          try {
+            const vRes = await fetch('/api/version');
+            if (vRes.ok) {
+              const vData = await vRes.json();
+              if (vData && vData.version) {
+                current = vData.version;
+              }
+            }
+          } catch {}
+
+          const res = await checkGitHubUpdate(current, force);
+          set({ updateCheckResult: res, isCheckingUpdate: false });
+        } catch {
+          set({ isCheckingUpdate: false });
+        }
+      },
+
       // History & Undo / Redo
       canUndo: false,
       canRedo: false,

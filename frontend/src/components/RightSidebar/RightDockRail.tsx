@@ -27,6 +27,7 @@ export const RightDockRail: React.FC = () => {
   const activeTab = useSyncStore((s) => s.activeRightSidebarTab);
   const toggleTab = useSyncStore((s) => s.toggleRightSidebarTab);
   const alertLogs = useSyncStore((s) => s.alertLogs);
+  const isUpdateAvailable = useSyncStore((s) => s.updateCheckResult?.status === 'update_available');
   const [providerCount, setProviderCount] = React.useState<number>(3);
 
   React.useEffect(() => {
@@ -108,6 +109,8 @@ export const RightDockRail: React.FC = () => {
       id: 'help',
       label: 'Help & Keybindings',
       icon: <HelpCircle size={18} strokeWidth={1.75} />,
+      badge: isUpdateAvailable ? 'NEW' : undefined,
+      badgeColor: '#2962ff',
     },
   ];
 

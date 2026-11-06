@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import {
   createChart,
+  createTextWatermark,
   CandlestickSeries,
   BarSeries,
   LineSeries,
@@ -22,6 +23,8 @@ import type {
   HistogramData,
   WhitespaceData,
   IPriceLine,
+  ITextWatermarkPluginApi,
+  TextWatermarkLineOptions,
 } from 'lightweight-charts';
 import { useSyncStore, createDefaultVolumeIndicator } from '../../store/syncStore';
 import type { CrosshairSyncData, ChartType, ChartVisualSettings } from '../../store/syncStore';
@@ -338,6 +341,70 @@ export function getActiveSeries(
   return candleSeries;
 }
 
+function formatWatermarkInterval(tf: string): string {
+  if (!tf) return '';
+  const match = tf.match(/^(\d+)([smhDWM])$/i);
+  if (!match) return tf;
+  const num = match[1];
+  const unit = match[2];
+  if (unit.toLowerCase() === 'm') {
+    return num;
+  }
+  if (unit.toLowerCase() === 'h') {
+    return `${num}h`;
+  }
+  if (unit.toUpperCase() === 'D') {
+    return num === '1' ? '1D' : `${num}D`;
+  }
+  if (unit.toUpperCase() === 'W') {
+    return num === '1' ? '1W' : `${num}W`;
+  }
+  if (unit.toUpperCase() === 'M') {
+    return num === '1' ? '1M' : `${num}M`;
+  }
+  if (unit.toLowerCase() === 's') {
+    return `${num}s`;
+  }
+  return tf;
+}
+
+function getWatermarkLines(
+  cleanSymbol: string,
+  timeframe: string,
+  settings: ChartVisualSettings
+): { isVisible: boolean; lines: TextWatermarkLineOptions[] } {
+  const isTickerEnabled =
+    settings.canvasWatermarkTicker ?? (settings.canvasWatermark ? true : false);
+  const isIntervalEnabled =
+    settings.canvasWatermarkInterval ?? (settings.canvasWatermark ? true : false);
+  const isVisible =
+    Boolean(settings.canvasWatermark) && (isTickerEnabled || isIntervalEnabled);
+
+  const watermarkColor = settings.canvasWatermarkColor || 'rgba(255, 255, 255, 0.08)';
+
+  let lineText = '';
+  if (isTickerEnabled && isIntervalEnabled) {
+    lineText = `${cleanSymbol}, ${formatWatermarkInterval(timeframe)}`;
+  } else if (isTickerEnabled) {
+    lineText = cleanSymbol;
+  } else if (isIntervalEnabled) {
+    lineText = formatWatermarkInterval(timeframe);
+  }
+
+  const lines: TextWatermarkLineOptions[] = [];
+  if (lineText) {
+    lines.push({
+      text: lineText,
+      color: watermarkColor,
+      fontSize: 72,
+      fontFamily: "-apple-system, BlinkMacSystemFont, 'Trebuchet MS', Roboto, Ubuntu, sans-serif",
+      fontStyle: 'bold',
+    });
+  }
+
+  return { isVisible, lines };
+}
+
 export const ChartPane: React.FC<ChartPaneProps> = ({
   paneId = 'pane-1',
   isGrid = false,
@@ -345,6 +412,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
   const wrapperRef = useRef<HTMLDivElement>(null);
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartApiRef = useRef<IChartApi | null>(null);
+  const watermarkRef = useRef<ITextWatermarkPluginApi<Time> | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const barSeriesRef = useRef<ISeriesApi<'Bar'> | null>(null);
   const lineSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
@@ -2040,6 +2108,23 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
       (wrapperRef.current as any).__chart = chart;
     }
 
+    // Initialize professional lightweight-charts v5 text watermark on first pane
+    const firstPane = chart.panes()[0];
+    if (firstPane) {
+      try {
+        const cleanSym = symbol.includes(':') ? symbol.split(':')[1] : symbol;
+        const wm = getWatermarkLines(cleanSym, timeframe, chartSettings);
+        watermarkRef.current = createTextWatermark(firstPane, {
+          visible: wm.isVisible,
+          horzAlign: 'center',
+          vertAlign: 'center',
+          lines: wm.lines,
+        });
+      } catch (err) {
+        console.error('Failed to attach text watermark:', err);
+      }
+    }
+
     const initialPriceFormat = getPriceFormatConfig(pricePrecision, tickSize);
 
     // 1. Candlestick Series
@@ -2377,10 +2462,59 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
       areaSeriesRef.current = null;
       baselineSeriesRef.current = null;
       futureWhitespaceSeriesRef.current = null;
+      if (watermarkRef.current) {
+        try {
+          watermarkRef.current.detach();
+        } catch {}
+        watermarkRef.current = null;
+      }
       chart.remove();
       chartApiRef.current = null;
     };
   }, []);
+
+  // Reactive Watermark update
+  useEffect(() => {
+    const chart = chartApiRef.current;
+    if (!chart) return;
+
+    const cleanSym = symbol.includes(':') ? symbol.split(':')[1] : symbol;
+    const wm = getWatermarkLines(cleanSym, timeframe, chartSettings);
+
+    if (!watermarkRef.current) {
+      const firstPane = chart.panes()[0];
+      if (firstPane) {
+        try {
+          watermarkRef.current = createTextWatermark(firstPane, {
+            visible: wm.isVisible,
+            horzAlign: 'center',
+            vertAlign: 'center',
+            lines: wm.lines,
+          });
+        } catch (err) {
+          console.error('Failed to attach text watermark:', err);
+        }
+      }
+    } else {
+      try {
+        watermarkRef.current.applyOptions({
+          visible: wm.isVisible,
+          horzAlign: 'center',
+          vertAlign: 'center',
+          lines: wm.lines,
+        });
+      } catch (err) {
+        console.error('Failed to update text watermark:', err);
+      }
+    }
+  }, [
+    chartSettings.canvasWatermark,
+    chartSettings.canvasWatermarkTicker,
+    chartSettings.canvasWatermarkInterval,
+    chartSettings.canvasWatermarkColor,
+    symbol,
+    timeframe,
+  ]);
 
   // Update chart timeScale and localization formatters whenever timeframe or timezone changes
   useEffect(() => {
@@ -3204,17 +3338,6 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
           isGrid={isGrid}
         />
 
-        {/* Chart Watermark */}
-        {chartSettings.canvasWatermark && (
-          <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-0 select-none overflow-hidden">
-            <span
-              className="text-8xl font-black tracking-widest uppercase opacity-25"
-              style={{ color: chartSettings.canvasWatermarkColor || 'rgba(42, 46, 57, 0.4)' }}
-            >
-              {symbol}
-            </span>
-          </div>
-        )}
 
         {/* Synchronized Crosshair Vertical Line across panes (Direct DOM GPU accelerated) */}
         <div

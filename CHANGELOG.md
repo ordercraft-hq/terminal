@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.2] - 2026-11-06
+
+### Added
+- **Chart Watermark Customization:**
+  - Integrated native `createTextWatermark` into Chart Settings under the Canvas tab.
+  - Multi-option watermark display supporting Ticker, Interval, or both.
+  - Full color and opacity customization with live reactivity.
+- **Dynamic Versioning & Update Checker:**
+  - Automated compile-time version injection from `package.json` (`__APP_VERSION__`).
+  - Added backend version endpoint `/api/version` and health check version metadata.
+  - Non-blocking startup check against GitHub latest release API with 1-hour cache.
+  - Status indicator and manual check button in the Help & Shortcuts drawer, with 'NEW' notification badge.
+
+---
+
+## [0.1.1] - 2026-11-04
+
+### Security & Fixes
+- Added AES-256-GCM encryption for stored API keys in SQLite.
+- Local loopback network binding hardening.
+- Provider fallback stubs and validation improvements.
+
+---
+
 ## [0.1.0] - 2026-11-01
 
 ### Added

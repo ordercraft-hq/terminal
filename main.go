@@ -25,6 +25,9 @@ import (
 //go:embed all:frontend/dist
 var embeddedFrontend embed.FS
 
+// version is set at compile time via -ldflags="-X main.version=..." during releases
+var version = "v0.1.2"
+
 const defaultWorkstationPort = 8448
 
 func resolveDefaultPort() int {
@@ -65,7 +68,7 @@ func main() {
 	flag.Parse()
 
 	log.Println("==================================================")
-	log.Println("  ORDERCRAFT — Financial Workstation v0.1.0        ")
+	log.Printf("  ORDERCRAFT — Financial Workstation %s\n", version)
 	log.Println("==================================================")
 
 	// Security advisory check for network host binding
@@ -94,6 +97,7 @@ func main() {
 	log.Printf("[Storage] SQLite initialized at %s\n", *dbPath)
 
 	srv := server.NewServer(s)
+	srv.SetVersion(version)
 	srv.SetBindHost(*host)
 	if *tokenFlag != "" {
 		srv.SetAuthToken(*tokenFlag)

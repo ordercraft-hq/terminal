@@ -117,6 +117,79 @@ const ProSelect: React.FC<{
   </div>
 );
 
+const WatermarkSelect: React.FC<{
+  settings: ChartVisualSettings;
+  onUpdate: (partial: Partial<ChartVisualSettings>) => void;
+}> = ({ settings, onUpdate }) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const isTickerChecked =
+    settings.canvasWatermarkTicker ?? (settings.canvasWatermark ? true : false);
+  const isIntervalChecked =
+    settings.canvasWatermarkInterval ?? (settings.canvasWatermark ? true : false);
+
+  const selectedLabels: string[] = [];
+  if (isTickerChecked) selectedLabels.push('Ticker');
+  if (isIntervalChecked) selectedLabels.push('Interval');
+  const summary = selectedLabels.length > 0 ? selectedLabels.join(', ') : 'Hidden';
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [isOpen]);
+
+  const toggleOption = (option: 'ticker' | 'interval') => {
+    const nextTicker = option === 'ticker' ? !isTickerChecked : isTickerChecked;
+    const nextInterval = option === 'interval' ? !isIntervalChecked : isIntervalChecked;
+    const isAnyActive = nextTicker || nextInterval;
+
+    onUpdate({
+      canvasWatermark: isAnyActive,
+      canvasWatermarkTicker: nextTicker,
+      canvasWatermarkInterval: nextInterval,
+    });
+  };
+
+  return (
+    <div ref={containerRef} className="relative inline-block w-48">
+      <button
+        type="button"
+        onClick={() => setIsOpen((prev) => !prev)}
+        className="w-full flex items-center justify-between bg-[#1e222d] hover:bg-[#242835] border border-[#363a45] hover:border-[#434651] rounded-[4px] pl-2.5 pr-2.5 py-1.5 text-xs text-[#d1d4dc] transition-colors focus:border-[#2962ff] outline-none"
+      >
+        <span className="truncate">{summary}</span>
+        {isOpen ? (
+          <ChevronUp size={12} className="text-[#787b86] shrink-0 ml-1.5" />
+        ) : (
+          <ChevronDown size={12} className="text-[#787b86] shrink-0 ml-1.5" />
+        )}
+      </button>
+
+      {isOpen && (
+        <div className="absolute left-0 mt-1 w-full bg-[#1e222d] border border-[#363a45] rounded-[4px] shadow-xl z-50 py-2 px-2.5 space-y-2.5 select-none">
+          <ProCheckbox
+            checked={isTickerChecked}
+            onChange={() => toggleOption('ticker')}
+            label="Ticker"
+          />
+          <ProCheckbox
+            checked={isIntervalChecked}
+            onChange={() => toggleOption('interval')}
+            label="Interval"
+          />
+        </div>
+      )}
+    </div>
+  );
+};
+
 export const ChartSettingsModal: React.FC<ChartSettingsModalProps> = ({ isOpen, onClose }) => {
   const [activeTab, setActiveTab] = useState<SettingsTab>('symbol');
   const [isTemplateMenuOpen, setIsTemplateMenuOpen] = useState(false);
@@ -1239,16 +1312,18 @@ export const ChartSettingsModal: React.FC<ChartSettingsModalProps> = ({ isOpen, 
 
                     {/* Watermark */}
                     <div className="flex items-center justify-between">
-                      <ProCheckbox
-                        checked={localSettings.canvasWatermark}
-                        onChange={(val) => handleUpdate({ canvasWatermark: val })}
-                        label="Watermark"
-                      />
-                      <ProColorSwatch
-                        color={localSettings.canvasWatermarkColor || 'rgba(42, 46, 57, 0.35)'}
-                        onChange={(c) => handleUpdate({ canvasWatermarkColor: c })}
-                        title="Watermark color"
-                      />
+                      <span className="text-[#d1d4dc]">Watermark</span>
+                      <div className="flex items-center space-x-2">
+                        <WatermarkSelect
+                          settings={localSettings}
+                          onUpdate={handleUpdate}
+                        />
+                        <ProColorSwatch
+                          color={localSettings.canvasWatermarkColor || 'rgba(255, 255, 255, 0.08)'}
+                          onChange={(c) => handleUpdate({ canvasWatermarkColor: c })}
+                          title="Watermark color"
+                        />
+                      </div>
                     </div>
                   </div>
                 </div>

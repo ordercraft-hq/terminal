@@ -91,6 +91,17 @@ class TransportClient {
     }
   }
 
+  async getVersion(): Promise<string> {
+    try {
+      const res = await fetch(`${this.apiBase}/version`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.version) return data.version;
+      }
+    } catch {}
+    return 'v0.1.2';
+  }
+
   // Window Management (Wails fallback to no-op in web mode)
   minimizeWindow(): void {
     if (window.runtime?.WindowMinimise) {

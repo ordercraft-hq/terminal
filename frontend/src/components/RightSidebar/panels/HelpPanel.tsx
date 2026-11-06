@@ -1,10 +1,25 @@
 import React from 'react';
-import { HelpCircle, Keyboard, Code, GitBranch, ExternalLink } from 'lucide-react';
+import {
+  HelpCircle,
+  Keyboard,
+  Code,
+  GitBranch,
+  ExternalLink,
+  RefreshCw,
+  CheckCircle2,
+  Sparkles,
+  Download,
+} from 'lucide-react';
+import { APP_VERSION, REPO_HOMEPAGE_URL } from '../../../version';
+import { useSyncStore } from '../../../store/syncStore';
 
-export const APP_VERSION = 'v0.1.0';
-export const REPO_HOMEPAGE_URL = 'https://github.com/ordercraft-hq/terminal';
+export { APP_VERSION, REPO_HOMEPAGE_URL };
 
 export const HelpPanel: React.FC = () => {
+  const updateCheckResult = useSyncStore((s) => s.updateCheckResult);
+  const isCheckingUpdate = useSyncStore((s) => s.isCheckingUpdate);
+  const checkForUpdates = useSyncStore((s) => s.checkForUpdates);
+
   const shortcuts = [
     { key: 'Ctrl + K', desc: 'Open Command Palette' },
     { key: 'Alt + F', desc: 'Toggle Fullscreen Mode' },
@@ -54,7 +69,7 @@ export const HelpPanel: React.FC = () => {
               <span>ORDERCRAFT Terminal</span>
             </div>
             <span className="px-1.5 py-0.5 rounded bg-[#2962ff]/15 text-[#2962ff] font-mono text-[10px] font-semibold border border-[#2962ff]/30">
-              {APP_VERSION}
+              {updateCheckResult.currentVersion || APP_VERSION}
             </span>
           </div>
           <p className="text-[#787b86] text-[11px] leading-relaxed">
@@ -84,6 +99,64 @@ export const HelpPanel: React.FC = () => {
             <span>Repository Homepage</span>
             <ExternalLink size={12} className="text-[#787b86] group-hover:text-[#d1d4dc] transition-colors" />
           </a>
+
+          {/* Update Checker Section below Repository Homepage */}
+          <div className="pt-2 border-t border-[#2a2e39]/60">
+            {isCheckingUpdate ? (
+              <div className="flex items-center justify-center space-x-2 w-full py-2 px-3 rounded-md bg-[#131722] border border-[#2a2e39] text-[#787b86] text-[11px]">
+                <RefreshCw size={12} className="animate-spin text-[#2962ff]" />
+                <span>Checking for updates...</span>
+              </div>
+            ) : updateCheckResult.status === 'update_available' ? (
+              <div className="p-2.5 rounded-md bg-[#2962ff]/10 border border-[#2962ff]/30 space-y-2">
+                <div className="flex items-center justify-between text-xs font-semibold text-white">
+                  <div className="flex items-center space-x-1.5 text-[#2962ff]">
+                    <Sparkles size={13} />
+                    <span>Update Available</span>
+                  </div>
+                  <span className="font-mono text-[10px] bg-[#2962ff]/20 text-[#2962ff] px-1.5 py-0.5 rounded border border-[#2962ff]/40 font-bold">
+                    {updateCheckResult.currentVersion} → {updateCheckResult.latestVersion}
+                  </span>
+                </div>
+                <a
+                  href={updateCheckResult.releaseUrl || `${REPO_HOMEPAGE_URL}/releases/latest`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center justify-center space-x-2 w-full py-1.5 px-3 rounded bg-[#2962ff] hover:bg-[#1e53e5] text-white font-medium text-xs transition-colors shadow-sm cursor-pointer group"
+                >
+                  <Download size={13} />
+                  <span>Download {updateCheckResult.latestVersion}</span>
+                  <ExternalLink size={12} className="opacity-80 group-hover:opacity-100" />
+                </a>
+              </div>
+            ) : updateCheckResult.status === 'latest' ? (
+              <div className="flex items-center justify-between px-3 py-2 rounded-md bg-[#131722] border border-[#2a2e39] text-[11px]">
+                <div className="flex items-center space-x-1.5 text-[#089981]">
+                  <CheckCircle2 size={13} />
+                  <span className="font-medium">No Updates (Latest)</span>
+                </div>
+                <button
+                  onClick={() => checkForUpdates(true)}
+                  className="text-[#787b86] hover:text-[#d1d4dc] flex items-center space-x-1 hover:underline cursor-pointer"
+                  title="Check for updates again"
+                >
+                  <RefreshCw size={11} />
+                  <span>Check</span>
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center justify-between px-3 py-2 rounded-md bg-[#131722] border border-[#2a2e39] text-[11px] text-[#787b86]">
+                <span>Check for latest version</span>
+                <button
+                  onClick={() => checkForUpdates(true)}
+                  className="text-[#2962ff] hover:underline cursor-pointer flex items-center space-x-1 font-medium"
+                >
+                  <RefreshCw size={11} />
+                  <span>Check</span>
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>

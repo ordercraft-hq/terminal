@@ -38,6 +38,7 @@ type Server struct {
 	server       *http.Server
 	authToken    string
 	bindHost     string
+	version      string
 }
 
 func NewServer(s *storage.Storage) *Server {
@@ -180,6 +181,17 @@ func (s *Server) routes() {
 	// Chart Templates endpoints
 	s.mux.HandleFunc("/api/templates/charts", s.handleChartTemplates)
 
+	// Version check
+	s.mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
+		if !enableCORS(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"version": s.Version(),
+		})
+	})
+
 	// Health check
 	s.mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		if !enableCORS(w, r) {
@@ -189,6 +201,7 @@ func (s *Server) routes() {
 		resp := map[string]interface{}{
 			"status":       "ok",
 			"app":          "ORDERCRAFT",
+			"version":      s.Version(),
 			"auth_enabled": s.authToken != "",
 			"loopback":     IsLoopbackHost(s.bindHost),
 		}
@@ -1120,6 +1133,17 @@ func (s *Server) SetAuthToken(token string) {
 
 func (s *Server) SetBindHost(host string) {
 	s.bindHost = strings.TrimSpace(host)
+}
+
+func (s *Server) SetVersion(v string) {
+	s.version = strings.TrimSpace(v)
+}
+
+func (s *Server) Version() string {
+	if s.version != "" {
+		return s.version
+	}
+	return "v0.1.2"
 }
 
 func (s *Server) ValidateAuth(r *http.Request) bool {
