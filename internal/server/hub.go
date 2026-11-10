@@ -4,40 +4,50 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/ordercraft-hq/terminal/internal/datafeed"
+	"github.com/ordercraft-hq/terminal/internal/indicators/wickra"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
-	"github.com/ordercraft-hq/terminal/internal/datafeed"
 )
 
 // StreamHub coordinates WebSocket connections from frontend clients
 // and multiplexes subscriptions to underlying data providers.
 type StreamHub struct {
-	coordinator *datafeed.Coordinator
-	mu          sync.RWMutex
-	clients     map[*HubClient]bool
-	topics      map[string]map[*HubClient]bool
-	lastCandles map[string]datafeed.Candle
-	authToken   string
+	coordinator     *datafeed.Coordinator
+	indicatorEngine IndicatorEngine
+	mu              sync.RWMutex
+	clients         map[*HubClient]bool
+	topics          map[string]map[*HubClient]bool
+	lastCandles     map[string]datafeed.Candle
+	historyCandles  map[string][]wickra.CandleData
+	authToken       string
 }
 
 type HubClient struct {
-	hub   *StreamHub
-	conn  *websocket.Conn
-	subs  map[string]bool // topic keys
-	send  chan []byte
-	done  chan struct{}
-	closeOnce sync.Once
+	hub              *StreamHub
+	conn             *websocket.Conn
+	subs             map[string]bool // topic keys
+	indicatorMu      sync.Mutex
+	indicatorSubs    map[string]IndicatorSession
+	indicatorConfigs map[string][]wickra.EvalIndicatorInstance
+	send             chan []byte
+	done             chan struct{}
+	closeOnce        sync.Once
 }
 
 type ClientActionMessage struct {
-	Action     string `json:"action"` // "subscribe" or "unsubscribe"
-	Symbol     string `json:"symbol"`
-	Resolution string `json:"resolution"`
+	Action      string                         `json:"action"` // "subscribe", "unsubscribe", "indicator_subscribe", "indicator_unsubscribe"
+	Symbol      string                         `json:"symbol"`
+	Resolution  string                         `json:"resolution"`
+	Indicators  []wickra.EvalIndicatorInstance `json:"indicators,omitempty"`
+	InstanceIDs []string                       `json:"instanceIds,omitempty"`
+	Candles     []wickra.CandleData            `json:"candles,omitempty"`
 }
 
 type CandleBroadcastMessage struct {
@@ -49,10 +59,11 @@ type CandleBroadcastMessage struct {
 
 func NewStreamHub(coordinator *datafeed.Coordinator) *StreamHub {
 	return &StreamHub{
-		coordinator: coordinator,
-		clients:     make(map[*HubClient]bool),
-		topics:      make(map[string]map[*HubClient]bool),
-		lastCandles: make(map[string]datafeed.Candle),
+		coordinator:    coordinator,
+		clients:        make(map[*HubClient]bool),
+		topics:         make(map[string]map[*HubClient]bool),
+		lastCandles:    make(map[string]datafeed.Candle),
+		historyCandles: make(map[string][]wickra.CandleData),
 	}
 }
 
@@ -64,6 +75,12 @@ func (h *StreamHub) SetAuthToken(token string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.authToken = token
+}
+
+func (h *StreamHub) SetIndicatorEngine(eng IndicatorEngine) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.indicatorEngine = eng
 }
 
 func (h *StreamHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -105,11 +122,13 @@ func (h *StreamHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(64 * 1024)
 
 	client := &HubClient{
-		hub:  h,
-		conn: conn,
-		subs: make(map[string]bool),
-		send: make(chan []byte, 2048),
-		done: make(chan struct{}),
+		hub:              h,
+		conn:             conn,
+		subs:             make(map[string]bool),
+		indicatorSubs:    make(map[string]IndicatorSession),
+		indicatorConfigs: make(map[string][]wickra.EvalIndicatorInstance),
+		send:             make(chan []byte, 2048),
+		done:             make(chan struct{}),
 	}
 
 	h.mu.Lock()
@@ -125,6 +144,15 @@ func (c *HubClient) close() {
 	c.closeOnce.Do(func() {
 		close(c.done)
 		c.conn.Close(websocket.StatusNormalClosure, "client closed")
+		c.indicatorMu.Lock()
+		for _, s := range c.indicatorSubs {
+			if s != nil {
+				_ = s.Close(context.Background())
+			}
+		}
+		c.indicatorSubs = nil
+		c.indicatorConfigs = nil
+		c.indicatorMu.Unlock()
 		c.hub.removeClient(c)
 	})
 }
@@ -171,20 +199,228 @@ func (c *HubClient) readPump(ctx context.Context) {
 			res = "15m"
 		}
 
-		switch strings.ToLower(actionMsg.Action) {
-		case "subscribe":
+		action := strings.ToLower(actionMsg.Action)
+		switch action {
+		case "subscribe", "indicator_subscribe":
 			c.hub.subscribe(c, sym, res)
-		case "unsubscribe":
-			c.hub.unsubscribe(c, sym, res)
+			if len(actionMsg.Indicators) > 0 {
+				c.hub.subscribeIndicators(c, sym, res, actionMsg.Indicators, actionMsg.Candles)
+			}
+		case "unsubscribe", "indicator_unsubscribe":
+			if len(actionMsg.InstanceIDs) > 0 {
+				c.hub.unsubscribeIndicators(c, sym, res, actionMsg.InstanceIDs)
+			} else if action == "indicator_unsubscribe" {
+				c.hub.unsubscribeIndicators(c, sym, res, nil)
+			} else {
+				c.hub.unsubscribe(c, sym, res)
+			}
 		}
 	}
 }
 
+func (h *StreamHub) subscribeIndicators(client *HubClient, symbol, resolution string, configs []wickra.EvalIndicatorInstance, clientCandles []wickra.CandleData) {
+	select {
+	case <-client.done:
+		return
+	default:
+	}
+
+	key := h.topicKey(symbol, resolution)
+
+	h.mu.RLock()
+	eng := h.indicatorEngine
+	h.mu.RUnlock()
+
+	if eng == nil {
+		return
+	}
+
+	client.indicatorMu.Lock()
+	if client.indicatorSubs == nil {
+		client.indicatorMu.Unlock()
+		return
+	}
+
+	// Merge new configs with existing configs by InstanceID
+	mergedConfigs := make([]wickra.EvalIndicatorInstance, 0)
+	configMap := make(map[string]wickra.EvalIndicatorInstance)
+	var order []string
+
+	if existing, ok := client.indicatorConfigs[key]; ok {
+		for _, cfg := range existing {
+			configMap[cfg.InstanceID] = cfg
+			order = append(order, cfg.InstanceID)
+		}
+	}
+
+	for _, cfg := range configs {
+		if _, exists := configMap[cfg.InstanceID]; !exists {
+			order = append(order, cfg.InstanceID)
+		}
+		configMap[cfg.InstanceID] = cfg
+	}
+
+	for _, id := range order {
+		mergedConfigs = append(mergedConfigs, configMap[id])
+	}
+	client.indicatorConfigs[key] = mergedConfigs
+	client.indicatorMu.Unlock()
+
+	session, err := eng.CreateSession(context.Background(), symbol, resolution, mergedConfigs)
+	if err == nil {
+		client.indicatorMu.Lock()
+		if client.indicatorSubs != nil {
+			if prev := client.indicatorSubs[key]; prev != nil {
+				_ = prev.Close(context.Background())
+			}
+			client.indicatorSubs[key] = session
+		}
+		client.indicatorMu.Unlock()
+	}
+
+	// Pre-load recent candle history for decoupled accurate indicator evaluations
+	h.mu.Lock()
+	if len(clientCandles) > 0 {
+		h.historyCandles[key] = clientCandles
+	} else if len(h.historyCandles[key]) < 50 && h.coordinator != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		rawHistory, err := h.coordinator.GetCandles(ctx, symbol, resolution, 0, 0, 1000)
+		cancel()
+		if err == nil && len(rawHistory) > 0 {
+			var cList []wickra.CandleData
+			for _, rc := range rawHistory {
+				cList = append(cList, wickra.CandleData{
+					Time: rc.Time, Open: rc.Open, High: rc.High, Low: rc.Low, Close: rc.Close, Volume: rc.Volume,
+				})
+			}
+			h.historyCandles[key] = cList
+		}
+	}
+	h.mu.Unlock()
+}
+
+func (h *StreamHub) unsubscribeIndicators(client *HubClient, symbol, resolution string, instanceIDs []string) {
+	select {
+	case <-client.done:
+		return
+	default:
+	}
+
+	key := h.topicKey(symbol, resolution)
+
+	h.mu.RLock()
+	eng := h.indicatorEngine
+	h.mu.RUnlock()
+
+	client.indicatorMu.Lock()
+	if client.indicatorSubs == nil {
+		client.indicatorMu.Unlock()
+		return
+	}
+
+	// If no specific instance IDs were requested, unsubscribe ALL indicators on this topic
+	if len(instanceIDs) == 0 {
+		if session := client.indicatorSubs[key]; session != nil {
+			_ = session.Close(context.Background())
+			delete(client.indicatorSubs, key)
+		}
+		if client.indicatorConfigs != nil {
+			delete(client.indicatorConfigs, key)
+		}
+		client.indicatorMu.Unlock()
+		return
+	}
+
+	existing, exists := client.indicatorConfigs[key]
+	if !exists || len(existing) == 0 {
+		if session := client.indicatorSubs[key]; session != nil {
+			_ = session.Close(context.Background())
+			delete(client.indicatorSubs, key)
+		}
+		client.indicatorMu.Unlock()
+		return
+	}
+
+	removeSet := make(map[string]bool, len(instanceIDs))
+	for _, id := range instanceIDs {
+		removeSet[id] = true
+	}
+
+	var remaining []wickra.EvalIndicatorInstance
+	for _, cfg := range existing {
+		if !removeSet[cfg.InstanceID] {
+			remaining = append(remaining, cfg)
+		}
+	}
+
+	if len(remaining) == 0 {
+		if session := client.indicatorSubs[key]; session != nil {
+			_ = session.Close(context.Background())
+			delete(client.indicatorSubs, key)
+		}
+		if client.indicatorConfigs != nil {
+			delete(client.indicatorConfigs, key)
+		}
+		client.indicatorMu.Unlock()
+		return
+	}
+
+	if len(remaining) == len(existing) {
+		client.indicatorMu.Unlock()
+		return
+	}
+
+	client.indicatorMu.Unlock()
+
+	if eng == nil {
+		return
+	}
+
+	newSession, err := eng.CreateSession(context.Background(), symbol, resolution, remaining)
+	if err != nil {
+		log.Printf("[StreamHub] Failed to recreate indicator session after selective unsubscribe for %s: %v", key, err)
+		return
+	}
+
+	client.indicatorMu.Lock()
+	defer client.indicatorMu.Unlock()
+
+	select {
+	case <-client.done:
+		_ = newSession.Close(context.Background())
+		return
+	default:
+	}
+
+	if client.indicatorSubs == nil {
+		_ = newSession.Close(context.Background())
+		return
+	}
+
+	if prev := client.indicatorSubs[key]; prev != nil {
+		_ = prev.Close(context.Background())
+	}
+	client.indicatorSubs[key] = newSession
+	if client.indicatorConfigs != nil {
+		client.indicatorConfigs[key] = remaining
+	}
+}
+
 func (h *StreamHub) subscribe(client *HubClient, symbol, resolution string) {
+	select {
+	case <-client.done:
+		return
+	default:
+	}
+
 	key := h.topicKey(symbol, resolution)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	if !h.clients[client] {
+		return
+	}
 
 	client.subs[key] = true
 
@@ -232,8 +468,6 @@ func (h *StreamHub) unsubscribe(client *HubClient, symbol, resolution string) {
 	key := h.topicKey(symbol, resolution)
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	delete(client.subs, key)
 
 	subscribers, exists := h.topics[key]
@@ -253,6 +487,19 @@ func (h *StreamHub) unsubscribe(client *HubClient, symbol, resolution string) {
 			}
 		}
 	}
+	h.mu.Unlock()
+
+	client.indicatorMu.Lock()
+	if client.indicatorSubs != nil {
+		if session, ok := client.indicatorSubs[key]; ok && session != nil {
+			_ = session.Close(context.Background())
+			delete(client.indicatorSubs, key)
+		}
+	}
+	if client.indicatorConfigs != nil {
+		delete(client.indicatorConfigs, key)
+	}
+	client.indicatorMu.Unlock()
 }
 
 func (h *StreamHub) removeClient(client *HubClient) {
@@ -305,6 +552,46 @@ func (h *StreamHub) Broadcast(symbol, resolution string, candle datafeed.Candle)
 	}
 	h.lastCandles[key] = candle
 
+	// Update recent candle history in sliding window (ring buffer)
+	cData := wickra.CandleData{
+		Time:   candle.Time,
+		Open:   candle.Open,
+		High:   candle.High,
+		Low:    candle.Low,
+		Close:  candle.Close,
+		Volume: candle.Volume,
+	}
+	if h.historyCandles == nil {
+		h.historyCandles = make(map[string][]wickra.CandleData)
+	}
+	history := h.historyCandles[key]
+	if len(history) == 0 {
+		history = []wickra.CandleData{cData}
+	} else if cData.Time == history[len(history)-1].Time {
+		// Same in-progress bar: update current bar with latest tick while preserving authentic OHLC bounds & volume
+		last := history[len(history)-1]
+		if last.Open != 0 {
+			cData.Open = last.Open
+		}
+		if last.High > cData.High {
+			cData.High = last.High
+		}
+		if last.Low < cData.Low && last.Low > 0 {
+			cData.Low = last.Low
+		}
+		if last.Volume > cData.Volume {
+			cData.Volume = last.Volume
+		}
+		history[len(history)-1] = cData
+	} else if cData.Time > history[len(history)-1].Time {
+		// New bar opened: append and cap
+		history = append(history, cData)
+		if len(history) > 2000 {
+			history = history[len(history)-2000:]
+		}
+	}
+	h.historyCandles[key] = history
+
 	subscribers, exists := h.topics[key]
 	if !exists || len(subscribers) == 0 {
 		h.mu.Unlock()
@@ -315,6 +602,7 @@ func (h *StreamHub) Broadcast(symbol, resolution string, candle datafeed.Candle)
 	for cl := range subscribers {
 		clientsList = append(clientsList, cl)
 	}
+	eng := h.indicatorEngine
 	h.mu.Unlock()
 
 	for _, cl := range clientsList {
@@ -322,6 +610,62 @@ func (h *StreamHub) Broadcast(symbol, resolution string, candle datafeed.Candle)
 		case cl.send <- data:
 		default:
 			// Buffer full, drop or close
+		}
+	}
+
+	// 2. Compute and broadcast indicator updates
+	// Using the true rolling history ensures technical indicators never collapse or stick to candle close.
+	if len(history) >= 2 && eng != nil {
+		evalHistory := history
+		if len(evalHistory) > 2000 {
+			evalHistory = evalHistory[len(evalHistory)-2000:]
+		}
+
+		for _, cl := range clientsList {
+			cl.indicatorMu.Lock()
+			cfgs := cl.indicatorConfigs[key]
+			cl.indicatorMu.Unlock()
+
+			if len(cfgs) == 0 {
+				continue
+			}
+
+			evalResults, err := eng.Evaluate(context.Background(), evalHistory, cfgs)
+			if err != nil || len(evalResults) == 0 {
+				continue
+			}
+
+			sanitizedPlots := make(map[string]map[string]float64)
+			for _, res := range evalResults {
+				pMap := make(map[string]float64)
+				for pID, points := range res.Plots {
+					if len(points) > 0 {
+						lastPt := points[len(points)-1]
+						if !math.IsNaN(lastPt.Value) && !math.IsInf(lastPt.Value, 0) {
+							pMap[pID] = lastPt.Value
+						}
+					}
+				}
+				if len(pMap) > 0 {
+					sanitizedPlots[res.InstanceID] = pMap
+				}
+			}
+
+			if len(sanitizedPlots) > 0 {
+				indMsg := IndicatorBroadcastMessage{
+					Type:       "indicator_update",
+					Symbol:     symbol,
+					Resolution: resolution,
+					Time:       candle.Time,
+					Plots:      sanitizedPlots,
+				}
+				if indData, err := json.Marshal(indMsg); err == nil {
+					select {
+					case cl.send <- indData:
+					default:
+					}
+				}
+			}
 		}
 	}
 }

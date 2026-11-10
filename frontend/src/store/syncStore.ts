@@ -1,11 +1,24 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { isTimeframeSupported, getFallbackTimeframe } from '../utils/timeframeSupport';
-import type { IndicatorInstance, IndicatorType, IndicatorPlotStyle } from '../indicators/types';
+import type {
+  IndicatorInstance,
+  IndicatorType,
+  IndicatorPlotStyle,
+  IndicatorInputValue,
+  IndicatorBandStyle,
+  IndicatorLevelStyle,
+} from '../indicators/types';
 import { INDICATOR_REGISTRY } from '../indicators/registry';
+import {
+  migrateIndicatorsRecord,
+  migrateFavoriteIndicators,
+  normalizeIndicatorId,
+} from '../indicators/migration';
 import { transport } from '../transport/client';
 import { checkGitHubUpdate, type UpdateCheckResult } from '../services/updateService';
 import { APP_VERSION } from '../version';
+import { DEFAULT_SCRIPT_TEMPLATE } from '../components/BottomDrawer/templates';
 
 export type MagnetMode = 'none' | 'weak' | 'strong';
 export type ChartType =
@@ -607,8 +620,11 @@ interface SyncStoreState {
   addIndicatorToPane: (paneId: string, type: IndicatorType) => IndicatorInstance;
   removeIndicatorFromPane: (paneId: string, indicatorId: string) => void;
   clearIndicatorsFromPane: (paneId: string) => void;
-  updateIndicatorInputs: (paneId: string, indicatorId: string, inputs: Record<string, any>) => void;
+  updateIndicatorInputs: (paneId: string, indicatorId: string, inputs: Record<string, IndicatorInputValue>) => void;
   updateIndicatorStyles: (paneId: string, indicatorId: string, styles: Record<string, IndicatorPlotStyle>) => void;
+  updateIndicatorBands: (paneId: string, indicatorId: string, bands: IndicatorBandStyle[]) => void;
+  updateIndicatorLevels: (paneId: string, indicatorId: string, levels: IndicatorLevelStyle[]) => void;
+  updateIndicatorMeta: (paneId: string, indicatorId: string, meta: Partial<IndicatorInstance>) => void;
   toggleIndicatorVisibility: (paneId: string, indicatorId: string) => void;
   swapIndicators: (paneId: string, id1: string, id2: string) => void;
   toggleFavoriteIndicator: (type: string) => void;
@@ -619,6 +635,20 @@ interface SyncStoreState {
   setActiveRightSidebarTab: (tab: RightSidebarTab) => void;
   toggleRightSidebarTab: (tab: RightSidebarTab) => void;
   setRightSidebarWidth: (width: number) => void;
+
+  // Bottom Drawer & OrderScript Editor
+  isBottomDrawerOpen: boolean;
+  bottomDrawerHeight: number;
+  bottomDrawerTab: 'editor' | 'console';
+  activeScriptCode: string;
+  scriptConsoleLogs: string[];
+  toggleBottomDrawer: () => void;
+  setBottomDrawerOpen: (open: boolean) => void;
+  setBottomDrawerHeight: (height: number) => void;
+  setBottomDrawerTab: (tab: 'editor' | 'console') => void;
+  setActiveScriptCode: (code: string) => void;
+  addScriptConsoleLog: (msg: string) => void;
+  clearScriptConsoleLogs: () => void;
 
   // Watchlists
   watchlists: Watchlist[];
@@ -663,7 +693,7 @@ interface SyncStoreState {
 
 export const createDefaultVolumeIndicator = (paneId: string): IndicatorInstance => ({
   id: `default_vol_${paneId}`,
-  type: 'volume',
+  type: 'wickra.volume',
   paneId,
   name: 'Vol',
   category: 'overlay',
@@ -1499,9 +1529,12 @@ export const useSyncStore = create<SyncStoreState>()(
                 get().setActivePaneId(parsed.activePaneId);
               }
 
-              // 3. Indicators (All Panes)
+              // 3. Indicators (All Panes) — Migrated losslessly for multi-state regime lines
               if (parsed.indicators && typeof parsed.indicators === 'object') {
-                set({ indicators: parsed.indicators });
+                const migrated = migrateIndicatorsRecord(
+                  parsed.indicators as Record<string, IndicatorInstance[]>
+                );
+                set({ indicators: migrated });
               }
 
               // 4. Chart Visual Settings
@@ -1733,14 +1766,15 @@ export const useSyncStore = create<SyncStoreState>()(
       closeIndicatorSettings: () => set({ activeSettingsIndicator: null }),
 
       addIndicatorToPane: (paneId: string, type: IndicatorType) => {
-        const def = INDICATOR_REGISTRY[type];
+        const normalizedType = normalizeIndicatorId(type) as IndicatorType;
+        const def = INDICATOR_REGISTRY[normalizedType] || INDICATOR_REGISTRY[type];
         if (!def) throw new Error(`Unknown indicator type: ${type}`);
 
         get().pushHistory('add indicator');
-        const instanceId = `ind_${type}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+        const instanceId = `ind_${normalizedType}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
         const instance: IndicatorInstance = {
           id: instanceId,
-          type,
+          type: normalizedType,
           paneId,
           name: def.shortName,
           category: def.category,
@@ -1813,7 +1847,7 @@ export const useSyncStore = create<SyncStoreState>()(
         });
       },
 
-      updateIndicatorInputs: (paneId: string, indicatorId: string, inputs: Record<string, any>) => {
+      updateIndicatorInputs: (paneId: string, indicatorId: string, inputs: Record<string, IndicatorInputValue>) => {
         get().pushHistory('modify indicator settings');
         set((state) => {
           const currentList = state.indicators[paneId] || [];
@@ -1835,6 +1869,54 @@ export const useSyncStore = create<SyncStoreState>()(
           const currentList = state.indicators[paneId] || [];
           const updated = currentList.map((ind) =>
             ind.id === indicatorId ? { ...ind, styles: { ...ind.styles, ...styles } } : ind
+          );
+          return {
+            indicators: {
+              ...state.indicators,
+              [paneId]: updated,
+            },
+          };
+        });
+      },
+
+      updateIndicatorBands: (paneId: string, indicatorId: string, bands: IndicatorBandStyle[]) => {
+        get().pushHistory('modify indicator bands');
+        set((state) => {
+          const currentList = state.indicators[paneId] || [];
+          const updated = currentList.map((ind) =>
+            ind.id === indicatorId ? { ...ind, bands } : ind
+          );
+          return {
+            indicators: {
+              ...state.indicators,
+              [paneId]: updated,
+            },
+          };
+        });
+      },
+
+      updateIndicatorLevels: (paneId: string, indicatorId: string, levels: IndicatorLevelStyle[]) => {
+        get().pushHistory('modify indicator levels');
+        set((state) => {
+          const currentList = state.indicators[paneId] || [];
+          const updated = currentList.map((ind) =>
+            ind.id === indicatorId ? { ...ind, levels } : ind
+          );
+          return {
+            indicators: {
+              ...state.indicators,
+              [paneId]: updated,
+            },
+          };
+        });
+      },
+
+      updateIndicatorMeta: (paneId: string, indicatorId: string, meta: Partial<IndicatorInstance>) => {
+        get().pushHistory('modify indicator meta');
+        set((state) => {
+          const currentList = state.indicators[paneId] || [];
+          const updated = currentList.map((ind) =>
+            ind.id === indicatorId ? { ...ind, ...meta } : ind
           );
           return {
             indicators: {
@@ -1880,6 +1962,27 @@ export const useSyncStore = create<SyncStoreState>()(
         })),
       setRightSidebarWidth: (width: number) =>
         set({ rightSidebarWidth: Math.max(280, Math.min(600, width)) }),
+
+      // Bottom Drawer & OrderScript Editor
+      isBottomDrawerOpen: false,
+      bottomDrawerHeight: 320,
+      bottomDrawerTab: 'editor',
+      activeScriptCode: DEFAULT_SCRIPT_TEMPLATE,
+      scriptConsoleLogs: [],
+      toggleBottomDrawer: () => set((state) => ({ isBottomDrawerOpen: !state.isBottomDrawerOpen })),
+      setBottomDrawerOpen: (open: boolean) => set({ isBottomDrawerOpen: open }),
+      setBottomDrawerHeight: (height: number) =>
+        set({
+          bottomDrawerHeight: Math.max(
+            160,
+            Math.min(typeof window !== 'undefined' ? window.innerHeight * 0.85 : 600, height)
+          ),
+        }),
+      setBottomDrawerTab: (tab: 'editor' | 'console') => set({ bottomDrawerTab: tab }),
+      setActiveScriptCode: (code: string) => set({ activeScriptCode: code }),
+      addScriptConsoleLog: (msg: string) =>
+        set((state) => ({ scriptConsoleLogs: [...state.scriptConsoleLogs.slice(-200), msg] })),
+      clearScriptConsoleLogs: () => set({ scriptConsoleLogs: [] }),
 
       // Watchlists
       watchlists: DEFAULT_WATCHLISTS,
@@ -2066,20 +2169,42 @@ export const useSyncStore = create<SyncStoreState>()(
     }),
     {
       name: 'ordercraft_workspace_sync_v2',
-      version: 2,
+      version: 3,
       migrate: (persistedState: unknown, version: number) => {
         const state = persistedState as Record<string, unknown>;
-        if (version < 2 && state) {
-          if (state.timezone === 'UTC+5:30') {
-            state.timezone = 'UTC-4';
-          }
-          const panes = state.panes as Record<string, ChartPaneConfig> | undefined;
-          if (panes && typeof panes === 'object') {
-            for (const key of Object.keys(panes)) {
-              if (panes[key]?.timezone === 'UTC+5:30') {
-                panes[key] = { ...panes[key], timezone: 'UTC-4' };
+        if (state) {
+          if (version < 2) {
+            if (state.timezone === 'UTC+5:30') {
+              state.timezone = 'UTC-4';
+            }
+            const panes = state.panes as Record<string, ChartPaneConfig> | undefined;
+            if (panes && typeof panes === 'object') {
+              for (const key of Object.keys(panes)) {
+                if (panes[key]?.timezone === 'UTC+5:30') {
+                  panes[key] = { ...panes[key], timezone: 'UTC-4' };
+                }
               }
             }
+          }
+          if (version < 3) {
+            // Version 3: Migrate all single-line trend indicators to multi-color regime plots (up/down)
+            if (state.indicators && typeof state.indicators === 'object') {
+              state.indicators = migrateIndicatorsRecord(
+                state.indicators as Record<string, IndicatorInstance[]>
+              );
+            }
+          } else {
+            // General safety migration
+            if (state.indicators && typeof state.indicators === 'object') {
+              state.indicators = migrateIndicatorsRecord(
+                state.indicators as Record<string, IndicatorInstance[]>
+              );
+            }
+          }
+          if (state.favoriteIndicators && Array.isArray(state.favoriteIndicators)) {
+            state.favoriteIndicators = migrateFavoriteIndicators(
+              state.favoriteIndicators as string[]
+            );
           }
         }
         return state as unknown as SyncStoreState;
@@ -2111,6 +2236,10 @@ export const useSyncStore = create<SyncStoreState>()(
         indicators: state.indicators,
         favoriteIndicators: state.favoriteIndicators,
         rightSidebarWidth: state.rightSidebarWidth,
+        isBottomDrawerOpen: state.isBottomDrawerOpen,
+        bottomDrawerHeight: state.bottomDrawerHeight,
+        bottomDrawerTab: state.bottomDrawerTab,
+        activeScriptCode: state.activeScriptCode,
         watchlists: state.watchlists,
         activeWatchlistId: state.activeWatchlistId,
         watchlistTableSettings: state.watchlistTableSettings,

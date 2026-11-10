@@ -12,6 +12,7 @@ import {
   Check,
   Undo2,
   Redo2,
+  Code,
 } from 'lucide-react';
 import { useSyncStore, getTimeframeSeconds } from '../../store/syncStore';
 import { transport } from '../../transport/client';
@@ -109,6 +110,8 @@ export const TopToolbar: React.FC = () => {
   const currentTimeframe = useSyncStore((s) => (s.activePaneId && s.panes[s.activePaneId]?.timeframe) || s.timeframe);
   const currentChartType = useSyncStore((s) => (s.activePaneId && s.panes[s.activePaneId]?.chartType) || s.chartType);
   const openIndicatorsModal = useSyncStore((s) => s.openIndicatorsModal);
+  const isBottomDrawerOpen = useSyncStore((s) => s.isBottomDrawerOpen);
+  const toggleBottomDrawer = useSyncStore((s) => s.toggleBottomDrawer);
 
   const canUndo = useSyncStore((s) => s.canUndo);
   const canRedo = useSyncStore((s) => s.canRedo);
@@ -580,6 +583,21 @@ export const TopToolbar: React.FC = () => {
         >
           <Sparkles size={13} className="text-[#089981]" />
           <span>Indicators</span>
+        </button>
+
+        {/* OrderScript Editor Button */}
+        <button
+          onClick={toggleBottomDrawer}
+          className={`flex items-center space-x-1.5 px-2.5 py-1 rounded transition-colors cursor-pointer ${
+            isBottomDrawerOpen
+              ? 'bg-[#2962ff]/20 text-[#2962ff] font-medium'
+              : 'hover:bg-[#1e222d] text-[#d1d4dc]'
+          }`}
+          title="Beta Script Editor & Console"
+        >
+          <Code size={13} className={isBottomDrawerOpen ? 'text-[#2962ff]' : 'text-[#787b86]'} />
+          <span className="text-[9px] font-bold px-1 py-0.5 bg-[#2962ff]/20 text-[#2962ff] rounded border border-[#2962ff]/30 leading-none">BETA</span>
+          <span>Script Editor</span>
         </button>
 
         <div className="h-4 w-[1px] bg-[#2a2e39] mx-1" />

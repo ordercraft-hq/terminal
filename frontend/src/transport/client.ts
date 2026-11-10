@@ -54,6 +54,37 @@ export interface ChartTemplateData {
   created_at?: number;
 }
 
+export interface IndicatorEvalInstanceConfig {
+  instanceId: string;
+  indicatorId: string;
+  inputs?: Record<string, unknown>;
+}
+
+export interface IndicatorEvalRequestPayload {
+  symbol: string;
+  resolution: string;
+  candles?: Candle[];
+  indicators: IndicatorEvalInstanceConfig[];
+}
+
+export interface IndicatorEvalResultPlotPoint {
+  time: number;
+  value: number;
+  color?: string;
+}
+
+export interface IndicatorEvalResultItem {
+  instanceId: string;
+  indicatorId: string;
+  plots: Record<string, IndicatorEvalResultPlotPoint[]>;
+}
+
+export interface IndicatorEvalResponsePayload {
+  symbol: string;
+  resolution: string;
+  results: IndicatorEvalResultItem[];
+}
+
 declare global {
   interface Window {
     runtime?: {
@@ -99,7 +130,7 @@ class TransportClient {
         if (data && data.version) return data.version;
       }
     } catch {}
-    return 'v0.1.2';
+    return 'v0.2.0';
   }
 
   // Window Management (Wails fallback to no-op in web mode)
@@ -205,6 +236,23 @@ class TransportClient {
     }
     const data = await res.json();
     return Array.isArray(data) ? data : [];
+  }
+
+  // Technical Indicator Evaluation API (AGENTS.md Invariant 2.1)
+  async evaluateIndicators(
+    payload: IndicatorEvalRequestPayload
+  ): Promise<IndicatorEvalResponsePayload> {
+    const res = await fetch(`${this.apiBase}/indicators/eval`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      throw new Error(`Failed to evaluate indicators: ${res.statusText} (${res.status})`);
+    }
+    return await res.json();
   }
 
   // Layout Persistence APIs

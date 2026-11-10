@@ -18,6 +18,8 @@ import (
 	"github.com/ordercraft-hq/terminal/internal/calendar"
 	"github.com/ordercraft-hq/terminal/internal/datafeed"
 	"github.com/ordercraft-hq/terminal/internal/datafeed/providers"
+	"github.com/ordercraft-hq/terminal/internal/indicators/scripting"
+	"github.com/ordercraft-hq/terminal/internal/indicators/wickra"
 	"github.com/ordercraft-hq/terminal/internal/news"
 	"github.com/ordercraft-hq/terminal/internal/screener"
 	"github.com/ordercraft-hq/terminal/internal/storage"
@@ -25,20 +27,22 @@ import (
 )
 
 type Server struct {
-	storage      *storage.Storage
-	coordinator  *datafeed.Coordinator
-	streamHub    *StreamHub
-	calendarSvc  *calendar.Service
-	newsSvc      *news.Service
-	screenerSvc  *screener.Service
-	watchlistSvc *watchlist.Service
-	alpacaProv   *providers.AlpacaProvider
-	oandaProv    *providers.OandaProvider
-	mux          *http.ServeMux
-	server       *http.Server
-	authToken    string
-	bindHost     string
-	version      string
+	storage         *storage.Storage
+	coordinator     *datafeed.Coordinator
+	streamHub       *StreamHub
+	calendarSvc     *calendar.Service
+	newsSvc         *news.Service
+	screenerSvc     *screener.Service
+	watchlistSvc    *watchlist.Service
+	alpacaProv      *providers.AlpacaProvider
+	oandaProv       *providers.OandaProvider
+	indicatorEngine IndicatorEngine
+	scriptingEngine *scripting.Engine
+	mux             *http.ServeMux
+	server          *http.Server
+	authToken       string
+	bindHost        string
+	version         string
 }
 
 func NewServer(s *storage.Storage) *Server {
@@ -93,8 +97,26 @@ func NewServer(s *storage.Storage) *Server {
 		mux:          http.NewServeMux(),
 	}
 
+	var wEng *wickra.Engine
+	if eng, err := wickra.NewEngine(context.Background()); err == nil {
+		wEng = eng
+	}
+	srv.scriptingEngine = scripting.NewEngine(wEng)
+
+	unifiedEngine := NewUnifiedIndicatorEngine(wEng, srv.scriptingEngine, s)
+	srv.indicatorEngine = unifiedEngine
+	srv.streamHub.SetIndicatorEngine(unifiedEngine)
+
 	srv.routes()
 	return srv
+}
+
+// SetScriptingEngine attaches an OrderScript engine to the server.
+func (s *Server) SetScriptingEngine(engine *scripting.Engine) {
+	s.scriptingEngine = engine
+	if u, ok := s.indicatorEngine.(*UnifiedIndicatorEngine); ok {
+		u.SetScriptingEngine(engine)
+	}
 }
 
 // SetStaticFS mounts an embedded or disk filesystem as the root SPA handler with fallback to index.html.
@@ -105,7 +127,7 @@ func (s *Server) SetStaticFS(staticFS fs.FS) {
 	fileServer := http.FileServer(http.FS(staticFS))
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// Never intercept API, WS, or docs endpoints
-		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/ws" || strings.HasPrefix(r.URL.Path, "/docs/") {
+		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/ws" || r.URL.Path == "/ws/indicators" || strings.HasPrefix(r.URL.Path, "/docs/") {
 			return
 		}
 
@@ -150,6 +172,14 @@ func (s *Server) routes() {
 
 	// Unified real-time WebSocket stream relay
 	s.mux.HandleFunc("/ws", s.streamHub.ServeHTTP)
+	s.mux.HandleFunc("/ws/indicators", s.streamHub.ServeHTTP)
+
+	// Indicator Engine REST endpoints
+	s.mux.HandleFunc("/api/indicators/catalog", s.handleIndicatorsCatalog)
+	s.mux.HandleFunc("/api/indicators/eval", s.handleIndicatorsEval)
+	s.mux.HandleFunc("/api/indicators/script/eval", s.handleIndicatorScriptEval)
+	s.mux.HandleFunc("/api/indicators/user", s.handleUserIndicators)
+	s.mux.HandleFunc("/api/indicators/user/", s.handleUserIndicators)
 
 	// Watchlist batch quotes and search
 	s.mux.HandleFunc("/api/watchlist/quotes", s.handleWatchlistQuotes)
@@ -1143,7 +1173,7 @@ func (s *Server) Version() string {
 	if s.version != "" {
 		return s.version
 	}
-	return "v0.1.2"
+	return "v0.2.0"
 }
 
 func (s *Server) ValidateAuth(r *http.Request) bool {

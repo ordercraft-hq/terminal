@@ -1,6 +1,9 @@
 import React, { useMemo } from 'react';
 import { useSyncStore } from '../../store/syncStore';
 import type { IndicatorInstance, IndicatorCategory } from '../../indicators/types';
+import { INDICATOR_REGISTRY } from '../../indicators/registry';
+import { normalizeIndicatorId } from '../../indicators/migration';
+import { isVolumeIndicatorType } from '../../indicators/UniversalIndicatorConnector';
 import { Eye, EyeOff, Settings, X } from 'lucide-react';
 import { isLightColor } from '../../utils/colorUtils';
 
@@ -42,17 +45,32 @@ export const IndicatorLegendItem: React.FC<IndicatorLegendItemProps> = ({
   const statusTextSize = chartSettings?.scalesTextSize || 11;
   const primaryColor = Object.values(ind.styles)[0]?.color || '#2962ff';
 
+  const def = INDICATOR_REGISTRY[ind.type] || INDICATOR_REGISTRY[normalizeIndicatorId(ind.type)];
+  const displayName = def?.shortName || ind.name;
+
+  const effectivePrecision =
+    ind.precision !== undefined && ind.precision !== 'default'
+      ? Number(ind.precision)
+      : precision;
+
   const paramsSummary =
-    ind.type === 'volume'
+    isVolumeIndicatorType(ind.type)
       ? ind.styles?.ma?.visible
         ? String(ind.inputs?.maLength || 20)
         : ''
-      : Object.values(ind.inputs || {})
-          .filter((v) => typeof v !== 'boolean' || v === true)
+      : Object.entries(ind.inputs || {})
+          .filter(
+            ([k, v]) =>
+              k !== 'code' &&
+              k !== 'script' &&
+              k !== 'permissions' &&
+              (typeof v !== 'boolean' || v === true)
+          )
+          .map(([, v]) => v)
           .join(' ');
 
   const formatPlotValue = (val: number, plotId: string) => {
-    if (ind.type === 'volume' && plotId === 'vol') {
+    if (isVolumeIndicatorType(ind.type) && plotId === 'vol') {
       if (Math.abs(val) >= 1_000_000) {
         return (val / 1_000_000).toFixed(2) + 'M';
       }
@@ -61,7 +79,7 @@ export const IndicatorLegendItem: React.FC<IndicatorLegendItemProps> = ({
       }
       return Math.round(val).toLocaleString();
     }
-    return val.toFixed(precision);
+    return val.toFixed(effectivePrecision);
   };
 
   const showBg = chartSettings?.statusShowIndicatorBackground !== false;
@@ -114,10 +132,10 @@ export const IndicatorLegendItem: React.FC<IndicatorLegendItemProps> = ({
           }}
           onClick={() => openIndicatorSettings(paneId, ind.id)}
         >
-          {ind.name}
+          {displayName}
         </span>
       )}
-      {chartSettings?.statusShowIndicatorInputs !== false && paramsSummary && (
+      {chartSettings?.statusShowIndicatorInputs !== false && ind.showInputsInStatusLine !== false && paramsSummary && (
         <span
           className="font-mono font-medium"
           style={{
@@ -130,14 +148,14 @@ export const IndicatorLegendItem: React.FC<IndicatorLegendItemProps> = ({
       )}
 
       {/* Readout Values */}
-      {chartSettings?.statusShowIndicatorValues !== false && ind.visible && (
+      {chartSettings?.statusShowIndicatorValues !== false && ind.showValuesInStatusLine !== false && ind.visible && (
         <div
           className="flex items-center gap-1.5 font-mono tabular-nums font-semibold ml-1"
           style={{ fontSize: `${statusTextSize}px` }}
         >
           {Object.entries(values).map(([plotId, val]) => {
             if (val === null || val === undefined || isNaN(val)) return null;
-            const isVolPlot = ind.type === 'volume' && plotId === 'vol';
+            const isVolPlot = isVolumeIndicatorType(ind.type) && plotId === 'vol';
             const color = isVolPlot
               ? (ind.styles[plotId]?.colorUp || '#089981')
               : (ind.styles[plotId]?.color || primaryColor || textColor);

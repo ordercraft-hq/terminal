@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,7 +27,7 @@ import (
 var embeddedFrontend embed.FS
 
 // version is set at compile time via -ldflags="-X main.version=..." during releases
-var version = "v0.1.2"
+var version = "v0.2.0"
 
 const defaultWorkstationPort = 8448
 
@@ -56,7 +57,33 @@ func bindWithFallback(host string, startPort int, maxAttempts int) (net.Listener
 	return nil, 0, fmt.Errorf("failed to bind to ports %d-%d after %d attempts", startPort, startPort+maxAttempts-1, maxAttempts)
 }
 
+// loadDotEnv parses key-value pairs from .env files and injects them into os.Environ
+// without overriding any environment variables already set in the current process.
+func loadDotEnv(paths ...string) {
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				key := strings.TrimSpace(parts[0])
+				val := strings.Trim(strings.TrimSpace(parts[1]), "\"'")
+				if _, exists := os.LookupEnv(key); !exists && key != "" {
+					_ = os.Setenv(key, val)
+				}
+			}
+		}
+	}
+}
+
 func main() {
+	loadDotEnv(".env")
 	defaultPort := resolveDefaultPort()
 	port := flag.Int("port", defaultPort, "Port for the HTTP and WebSocket server (supports PORT env var)")
 	host := flag.String("host", "127.0.0.1", "Host address to bind the server")

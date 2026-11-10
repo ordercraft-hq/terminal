@@ -1,0 +1,222 @@
+package datafeed
+
+import (
+	"math"
+	"sort"
+)
+
+// SpreadOp defines the arithmetic operator applied between series.
+type SpreadOp string
+
+const (
+	SpreadOpSub SpreadOp = "-" // A - B (Difference / Arbitrage basis)
+	SpreadOpDiv SpreadOp = "/" // A / B (Ratio / Relative strength)
+	SpreadOpAdd SpreadOp = "+" // A + B (Sum)
+	SpreadOpMul SpreadOp = "*" // A * B (Product / Cross rate)
+)
+
+// AlignmentMode determines how timestamp discrepancies are handled.
+type AlignmentMode string
+
+const (
+	AlignIntersection AlignmentMode = "inner" // Only timestamps present in both series
+	AlignForwardFill  AlignmentMode = "outer" // All timestamps; carry forward prior close
+)
+
+// SpreadSub performs contiguous vector subtraction a[i] - b[i].
+func SpreadSub(a, b []float64) []float64 {
+	n := min(len(a), len(b))
+	out := make([]float64, n)
+	for i := 0; i < n; i++ {
+		out[i] = a[i] - b[i]
+	}
+	return out
+}
+
+// SpreadAdd performs contiguous vector addition a[i] + b[i].
+func SpreadAdd(a, b []float64) []float64 {
+	n := min(len(a), len(b))
+	out := make([]float64, n)
+	for i := 0; i < n; i++ {
+		out[i] = a[i] + b[i]
+	}
+	return out
+}
+
+// SpreadDiv performs contiguous vector division a[i] / b[i] with zero-division safety.
+func SpreadDiv(a, b []float64) []float64 {
+	n := min(len(a), len(b))
+	out := make([]float64, n)
+	for i := 0; i < n; i++ {
+		if b[i] == 0 || math.IsNaN(b[i]) {
+			out[i] = math.NaN()
+		} else {
+			out[i] = a[i] / b[i]
+		}
+	}
+	return out
+}
+
+// SpreadMul performs contiguous vector multiplication a[i] * b[i].
+func SpreadMul(a, b []float64) []float64 {
+	n := min(len(a), len(b))
+	out := make([]float64, n)
+	for i := 0; i < n; i++ {
+		out[i] = a[i] * b[i]
+	}
+	return out
+}
+
+// LinearCombination computes sum(w[k] * series[k][i]) across multiple time-series vectors.
+func LinearCombination(series [][]float64, weights []float64) []float64 {
+	if len(series) == 0 || len(series) != len(weights) {
+		return nil
+	}
+	minLen := len(series[0])
+	for _, s := range series[1:] {
+		if len(s) < minLen {
+			minLen = len(s)
+		}
+	}
+
+	out := make([]float64, minLen)
+	for i := 0; i < minLen; i++ {
+		var sum float64
+		for k := range series {
+			sum += weights[k] * series[k][i]
+		}
+		out[i] = sum
+	}
+	return out
+}
+
+// SynthesizeSpreadCandles combines two candle series into synthetic OHLCV bars.
+func SynthesizeSpreadCandles(a, b []Candle, op SpreadOp, mode AlignmentMode) []Candle {
+	if len(a) == 0 || len(b) == 0 {
+		return nil
+	}
+
+	// Build map for series B
+	bMap := make(map[int64]Candle, len(b))
+	for _, cb := range b {
+		bMap[cb.Time] = cb
+	}
+
+	// Union of sorted timestamps
+	timeSet := make(map[int64]bool)
+	for _, ca := range a {
+		timeSet[ca.Time] = true
+	}
+	if mode == AlignForwardFill {
+		for _, cb := range b {
+			timeSet[cb.Time] = true
+		}
+	}
+
+	times := make([]int64, 0, len(timeSet))
+	for t := range timeSet {
+		times = append(times, t)
+	}
+	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
+
+	aMap := make(map[int64]Candle, len(a))
+	for _, ca := range a {
+		aMap[ca.Time] = ca
+	}
+
+	var out []Candle
+	var lastA, lastB *Candle
+
+	for _, t := range times {
+		ca, hasA := aMap[t]
+		cb, hasB := bMap[t]
+
+		if mode == AlignIntersection {
+			if !hasA || !hasB {
+				continue
+			}
+		} else { // AlignForwardFill
+			if hasA {
+				lastA = &ca
+			} else if lastA != nil {
+				ca = Candle{Time: t, Open: lastA.Close, High: lastA.Close, Low: lastA.Close, Close: lastA.Close, Volume: 0}
+				hasA = true
+			}
+			if hasB {
+				lastB = &cb
+			} else if lastB != nil {
+				cb = Candle{Time: t, Open: lastB.Close, High: lastB.Close, Low: lastB.Close, Close: lastB.Close, Volume: 0}
+				hasB = true
+			}
+			if !hasA || !hasB {
+				continue
+			}
+		}
+
+		var synth Candle
+		synth.Time = t
+
+		switch op {
+		case SpreadOpSub:
+			synth.Open = ca.Open - cb.Open
+			synth.Close = ca.Close - cb.Close
+			// Max possible spread difference in bar: ca.High - cb.Low
+			hDiff := ca.High - cb.Low
+			// Min possible spread difference in bar: ca.Low - cb.High
+			lDiff := ca.Low - cb.High
+			synth.High = math.Max(synth.Open, math.Max(synth.Close, hDiff))
+			synth.Low = math.Min(synth.Open, math.Min(synth.Close, lDiff))
+			synth.Volume = ca.Volume + cb.Volume
+
+		case SpreadOpDiv:
+			if cb.Open == 0 || cb.Close == 0 || cb.Low == 0 || cb.High == 0 || (cb.Low <= 0 && cb.High >= 0) {
+				continue // Skip zero-division and zero-crossing bars
+			}
+			synth.Open = ca.Open / cb.Open
+			synth.Close = ca.Close / cb.Close
+			r1 := ca.High / cb.High
+			r2 := ca.High / cb.Low
+			r3 := ca.Low / cb.High
+			r4 := ca.Low / cb.Low
+			maxR := math.Max(r1, math.Max(r2, math.Max(r3, r4)))
+			minR := math.Min(r1, math.Min(r2, math.Min(r3, r4)))
+			synth.High = math.Max(synth.Open, math.Max(synth.Close, maxR))
+			synth.Low = math.Min(synth.Open, math.Min(synth.Close, minR))
+			synth.Volume = ca.Volume
+
+		case SpreadOpAdd:
+			synth.Open = ca.Open + cb.Open
+			synth.Close = ca.Close + cb.Close
+			synth.High = math.Max(synth.Open, math.Max(synth.Close, ca.High+cb.High))
+			synth.Low = math.Min(synth.Open, math.Min(synth.Close, ca.Low+cb.Low))
+			synth.Volume = ca.Volume + cb.Volume
+
+		case SpreadOpMul:
+			synth.Open = ca.Open * cb.Open
+			synth.Close = ca.Close * cb.Close
+			p1 := ca.High * cb.High
+			p2 := ca.High * cb.Low
+			p3 := ca.Low * cb.High
+			p4 := ca.Low * cb.Low
+			maxP := math.Max(p1, math.Max(p2, math.Max(p3, p4)))
+			minP := math.Min(p1, math.Min(p2, math.Min(p3, p4)))
+			synth.High = math.Max(synth.Open, math.Max(synth.Close, maxP))
+			synth.Low = math.Min(synth.Open, math.Min(synth.Close, minP))
+			synth.Volume = ca.Volume
+		}
+
+		// Enforce candle geometric invariant: High >= Low, High >= max(Open, Close), Low <= min(Open, Close)
+		if synth.High < synth.Low {
+			synth.High, synth.Low = synth.Low, synth.High
+		}
+
+		if math.IsNaN(synth.Open) || math.IsNaN(synth.High) || math.IsNaN(synth.Low) || math.IsNaN(synth.Close) ||
+			math.IsInf(synth.Open, 0) || math.IsInf(synth.High, 0) || math.IsInf(synth.Low, 0) || math.IsInf(synth.Close, 0) {
+			continue
+		}
+
+		out = append(out, synth)
+	}
+
+	return out
+}

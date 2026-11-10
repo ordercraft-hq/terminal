@@ -3,13 +3,14 @@ package storage
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
 func TestStorageLifecycle(t *testing.T) {
-	tmpDB := "test_ordercraft.db"
+	tmpDB := filepath.Join(t.TempDir(), "test_ordercraft.db")
 	defer os.Remove(tmpDB)
 
 	s, err := NewStorage(tmpDB)
@@ -180,10 +181,8 @@ func TestStorageLifecycle(t *testing.T) {
 }
 
 func TestStorage_APIKeyEncryption(t *testing.T) {
-	tmpDB := "test_ordercraft_keys.db"
-	keyFile := ".ordercraft.key"
-	defer os.Remove(tmpDB)
-	defer os.Remove(keyFile)
+	tmpDir := t.TempDir()
+	tmpDB := filepath.Join(tmpDir, "test_ordercraft_keys.db")
 
 	s, err := NewStorage(tmpDB)
 	if err != nil {
@@ -260,4 +259,68 @@ func TestStorage_APIKeyEncryption(t *testing.T) {
 		t.Fatalf("Expected empty string for deleted key, got: %q", deletedKey)
 	}
 }
+
+func TestStorage_UserIndicators(t *testing.T) {
+	tmpDB := filepath.Join(t.TempDir(), "test_user_ind.db")
+
+	s, err := NewStorage(tmpDB)
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	ind := &UserIndicator{
+		ID:          "script_fast_hma",
+		Name:        "Fast HMA + Slow EMA",
+		Description: "Trend cross strategy with delta",
+		Code:        "def main(ctx):\n    return []",
+		Permissions: []string{"network:api.binance.com"},
+	}
+
+	if err := s.SaveUserIndicator(ctx, ind); err != nil {
+		t.Fatalf("SaveUserIndicator failed: %v", err)
+	}
+
+	fetched, err := s.GetUserIndicator(ctx, "script_fast_hma")
+	if err != nil {
+		t.Fatalf("GetUserIndicator failed: %v", err)
+	}
+	if fetched == nil || fetched.Name != ind.Name || len(fetched.Permissions) != 1 {
+		t.Fatalf("Unexpected fetched indicator: %+v", fetched)
+	}
+
+	list, err := s.GetUserIndicators(ctx)
+	if err != nil {
+		t.Fatalf("GetUserIndicators failed: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("Expected 1 indicator, got %d", len(list))
+	}
+
+	// Update indicator
+	ind.Name = "Fast HMA Updated"
+	if err := s.SaveUserIndicator(ctx, ind); err != nil {
+		t.Fatalf("SaveUserIndicator update failed: %v", err)
+	}
+
+	fetchedUpdated, _ := s.GetUserIndicator(ctx, "script_fast_hma")
+	if fetchedUpdated.Name != "Fast HMA Updated" {
+		t.Fatalf("Expected updated name, got %s", fetchedUpdated.Name)
+	}
+
+	// Delete
+	if err := s.DeleteUserIndicator(ctx, "script_fast_hma"); err != nil {
+		t.Fatalf("DeleteUserIndicator failed: %v", err)
+	}
+	deleted, err := s.GetUserIndicator(ctx, "script_fast_hma")
+	if err != nil {
+		t.Fatalf("GetUserIndicator after delete returned error: %v", err)
+	}
+	if deleted != nil {
+		t.Fatalf("Expected nil after delete, got %+v", deleted)
+	}
+}
+
 

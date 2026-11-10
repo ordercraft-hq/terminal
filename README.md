@@ -17,9 +17,9 @@
 
 ## ⚡ What is OrderCraft?
 
-**OrderCraft** is a 100% original, permissive open-source financial charting workstation built from first principles with **Go**, **React 19**, **TypeScript**, and **Lightweight Charts v5** (Apache-2.0). 
+**OrderCraft** is a 100% original, permissive open-source financial charting and quantitative analysis workstation built from first principles with **Go**, **React 19**, **TypeScript**, and **Lightweight Charts v5** (Apache-2.0). 
 
-Designed for active discretionary traders, quantitative developers, and financial analysts, OrderCraft runs as a **single standalone binary with an embedded high-speed frontend** (`//go:embed`), a local **Docker container**, or a **PWA app**. It features sub-millisecond multi-exchange WebSocket streams, multi-chart synchronized workspaces, pixel-perfect drawing primitives, vectorized indicator math, and complete local SQLite persistence.
+Designed for active discretionary traders, quantitative developers, and financial analysts, OrderCraft runs as a **single standalone binary with an embedded high-speed frontend** (`//go:embed`), a local **Docker container**, or a **PWA app**. It features sub-millisecond multi-exchange WebSocket streams, 500+ streaming WebAssembly technical indicators, an in-app Python/Starlark custom indicator scripting environment (**OrderScript**), multi-chart synchronized workspaces, pixel-perfect drawing primitives, and complete local SQLite persistence.
 
 ---
 
@@ -27,14 +27,15 @@ Designed for active discretionary traders, quantitative developers, and financia
 
 | Capability | Highlights |
 |---|---|
+| **500+ Streaming Indicators (v0.2.0)** | Powered by pure-Go WebAssembly runtime (Wazero). Offloads 100% of time-series math from the browser UI thread to Go at ~35M updates/sec. Includes full Volume Suite (VWAP with multi-period session/weekly/monthly resets and customizable standard deviation & percentage bands, OBV, ADL, FRVP, Anchored VWAP), MultiColor Trend indicators with continuous slope color transitions, Volatility bands, Oscillators, and Orderflow delta. |
+| **OrderScript Studio (Beta)** | Embedded bottom drawer hosting Monaco Editor for authoring custom indicators using familiar Python/Starlark syntax. Features instant AST validation, execution time HUD, capability-gated security sandbox, and real-time chart plot directives (`plot.line`, `plot.histogram`, `plot.band`). |
+| **High-Precision Charting & Primitives** | Coordinate-invariant drawings persisted in logical `(time, price)` space. Custom canvas primitives: semi-transparent band ribbons (`BandFillPrimitive`), bid/ask volume footprint clusters (`FootprintPrimitive`), subpane auto-scaling with last-value visibility on price axes, high-contrast overbought/oversold levels, and 20+ interactive geometric tools. |
 | **Multi-Provider Data Feeds** | Zero-config out-of-the-box public streams (**Binance Spot & Futures**, **Bybit v5**, **Coinbase Advanced**) and BYOK broker integrations (**Alpaca Markets**, **OANDA v20**). |
 | **Unified Single Binary** | Go backend embeds the React SPA (`//go:embed`) and runs standalone with `--app-mode`, `--port`, and `--host` CLI flags. |
-| **High-Precision Drawings** | Coordinate-invariant drawings persisted in logical `(time, price)` space. Includes Trendline, Ray, Horizontal Line/Ray, Parallel Channel, Fib Retracement & Extension, Anchored VWAP, and Risk/Reward Position Tool. |
 | **Pro Volume Profile (FRVP)** | Fixed Range Volume Profile with 24-row histogram, Point of Control (POC), 70% Value Area (VAH/VAL), and live streaming bar extensions. |
-| **Vectorized Technical Indicators** | Vectorized indicator calculations computed off-thread: SMA, EMA, WMA, HMA, VWAP, Bollinger Bands, Keltner Channels, SuperTrend, RSI, MACD, Stochastic RSI, ATR, CCI, and more. |
 | **Multi-Chart Workspace Sync** | Dynamic 1x1, 2-split, 3-split, 4-grid layouts with crosshair synchronization, symbol linking, and timeframe alignment. |
 | **Command Palette & Type-to-Search** | Instant symbol and timeframe switching by typing directly on the chart canvas or via `Ctrl + K`. |
-| **Local-First & Zero Telemetry** | All layouts, drawings, watchlists, and encrypted API credentials remain 100% private in local SQLite (`data/ordercraft.db`). |
+| **Local-First & Zero Telemetry** | All layouts, drawings, custom scripts, watchlists, and encrypted API credentials remain 100% private in local SQLite (`data/ordercraft.db`). |
 
 ---
 
@@ -118,14 +119,17 @@ github.com/ordercraft-hq/terminal/
 │   │   ├── aggregator.go       # High-frequency tick-to-custom-timeframe bucketing
 │   │   ├── coordinator.go      # Multi-exchange subscription router & memory cache
 │   │   └── providers/          # Binance, Bybit, Coinbase, Alpaca, OANDA adapters
+│   ├── indicators/             # High-performance indicators & execution engines
+│   │   ├── wickra/             # Pure-Go Wazero WebAssembly streaming runtime (500+ indicators)
+│   │   └── scripting/          # OrderScript Starlark-Go hermetic compiler & execution sandbox
 │   ├── server/                 # REST APIs, real-time WebSocket relay hub, static SPA server
-│   ├── indicators/             # Vectorized technical indicator mathematical routines
+│   ├── security/               # Capability-based SSRF/IPC gating & AES-256-GCM encryption
 │   └── storage/                # Pure-Go SQLite persistence layer (modernc.org/sqlite)
 ├── frontend/
 │   ├── src/
 │   │   ├── components/         # WorkspaceGrid, ChartPane, Titlebar, LeftDrawingBar, Modals
 │   │   ├── drawings/           # Coordinate-invariant ISeriesPrimitive tools & renderers
-│   │   ├── indicators/         # Indicator types, parameter models & presets
+│   │   ├── indicators/         # UniversalIndicatorConnector, BandFillPrimitive, FootprintPrimitive
 │   │   ├── store/              # Zustand state management
 │   │   └── transport/          # Dual-mode client abstraction
 └── docs/                       # Architecture, specifications & integration guides
@@ -142,11 +146,11 @@ github.com/ordercraft-hq/terminal/
 
 The software is provided **"AS IS"**, without warranty of any kind. Maintainers and contributors assume zero liability for trading losses, calculation discrepancies, market data latency, or execution errors.
 
-For complete terms, review **[DISCLAIMER.md](DISCLAIMER.md)** and **[NOTICE](NOTICE)**.
+For complete terms, review **[DISCLAIMER.md](DISCLAIMER.md)**.
 
 ---
 
 ## 📄 License & Attribution
 
 - **Source Code:** Released under the permissive **[MIT License](LICENSE)**.
-- **Third-Party Attribution:** Incorporates `lightweight-charts` (Apache-2.0, Copyright TradingView, Inc.). Complete attribution and non-affiliation statements are documented in **[NOTICE](NOTICE)**.
+- **Third-Party Attribution:** Incorporates `lightweight-charts` under the Apache-2.0 license.

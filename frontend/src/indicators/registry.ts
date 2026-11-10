@@ -1,6 +1,26 @@
-import type { IndicatorDefinition, IndicatorType } from './types';
+// ORDERCRAFT Dynamic Indicator Registry & Catalog Service
+// Manages 500+ streaming technical indicators with offline fallback caching.
+// Strictly adheres to AGENTS.md § 3.2: strict: true, ZERO any types allowed.
 
-export const SOURCE_OPTIONS = [
+import type {
+  IndicatorDefinition,
+  IndicatorDescriptor,
+  IndicatorCatalogResponse,
+  IndicatorInputValues,
+  IndicatorPlotStyle,
+  IndicatorPlotDirective,
+  IndicatorBandStyle,
+  IndicatorLevelStyle,
+  IndicatorSelectOption,
+  IndicatorPlotType,
+  IndicatorCategory,
+} from './types';
+import { LEGACY_INDICATOR_MAP, normalizeIndicatorId, registerSubpaneChecker } from './migration';
+
+export { LEGACY_INDICATOR_MAP };
+export const LEGACY_MIGRATION_MAP = LEGACY_INDICATOR_MAP;
+
+export const SOURCE_OPTIONS: IndicatorSelectOption[] = [
   { label: 'Close', value: 'close' },
   { label: 'Open', value: 'open' },
   { label: 'High', value: 'high' },
@@ -10,407 +30,909 @@ export const SOURCE_OPTIONS = [
   { label: 'OHLC/4 (Weighted)', value: 'ohlc4' },
 ];
 
-export const INDICATOR_REGISTRY: Record<IndicatorType, IndicatorDefinition> = {
-  // ===================== OVERLAYS =====================
-  volume: {
-    type: 'volume',
+/**
+ * Converts a raw backend IndicatorDescriptor into a fully resolved IndicatorDefinition.
+ */
+export function descriptorToDefinition(desc: IndicatorDescriptor): IndicatorDefinition {
+  const defaultInputs: IndicatorInputValues = {};
+  for (const input of desc.inputs || []) {
+    defaultInputs[input.id] = input.default;
+  }
+
+  const defaultStyles: Record<string, IndicatorPlotStyle> = {};
+  const plotLabels: Record<string, string> = {};
+  for (const plot of desc.plots || []) {
+    defaultStyles[plot.id] = {
+      color: plot.color,
+      colorUp: plot.colorUp,
+      colorDown: plot.colorDown,
+      lineWidth: plot.lineWidth || 1,
+      lineStyle: plot.lineStyle || 'solid',
+      plotType: plot.type as IndicatorPlotType,
+      visible: plot.visible !== false,
+      visibleUp: plot.visibleUp,
+      visibleDown: plot.visibleDown,
+      lastValueVisible: plot.lastValueVisible !== false,
+      priceLineVisible: Boolean(plot.priceLineVisible),
+    };
+    plotLabels[plot.id] = plot.title || plot.id;
+  }
+
+  const defaultBands: IndicatorBandStyle[] = (desc.bands || []).map((b) => ({
+    id: b.id,
+    title: b.title,
+    upperPlotId: b.upperPlotId,
+    lowerPlotId: b.lowerPlotId,
+    fillColor: b.fillColor,
+    visible: b.visible !== false,
+  }));
+
+  const defaultLevels: IndicatorLevelStyle[] = (desc.levels || []).map((l) => ({
+    value: l.value,
+    color: l.color,
+    lineStyle: l.lineStyle || 'dashed',
+    lineWidth: l.lineWidth || 1,
+    label: l.label,
+    visible: l.visible !== false,
+  }));
+
+  const paneCategory: IndicatorCategory = desc.overlay ? 'overlay' : 'subpane';
+
+  return {
+    id: desc.id,
+    type: desc.id,
+    wasmClass: desc.wasmClass,
+    name: desc.name,
+    shortName: desc.shortName,
+    family: desc.family,
+    category: paneCategory,
+    catalogCategory: desc.category,
+    overlay: desc.overlay,
+    description: desc.description,
+    inputs: desc.inputs || [],
+    inputSchemas: desc.inputs || [],
+    defaultInputs,
+    plots: desc.plots || [],
+    defaultStyles,
+    plotLabels,
+    defaultBands: defaultBands.length > 0 ? defaultBands : undefined,
+    defaultLevels: defaultLevels.length > 0 ? defaultLevels : undefined,
+    warmupPeriod: desc.warmupPeriod,
+    priceSources: desc.priceSources,
+  };
+}
+
+// ============================================================================
+// Built-in Fallback Cache for Common Core Indicators
+// Ensures instantaneous zero-latency render while asynchronous catalog loads.
+// ============================================================================
+const CORE_FALLBACK_DESCRIPTORS: IndicatorDescriptor[] = [
+  {
+    id: 'wickra.volume',
+    wasmClass: 'Volume',
     name: 'Volume',
     shortName: 'Vol',
-    category: 'overlay',
-    description: 'Displays the trading volume for each bar as colored histogram bars with optional moving average.',
-    defaultInputs: { maLength: 20, showMa: true },
-    inputSchemas: [
-      { id: 'maLength', name: 'MA Length', type: 'number', default: 20, min: 1, max: 200 },
+    family: 'Volume',
+    category: 'Volume',
+    overlay: true,
+    description: 'Displays trading volume for each bar as colored histogram bars with optional moving average.',
+    inputs: [
+      { id: 'maLength', name: 'MA Length', type: 'integer', default: 20, min: 1, max: 200 },
+      { id: 'showMa', name: 'Show MA', type: 'boolean', default: true },
     ],
-    defaultStyles: {
-      vol: {
-        color: '#089981',
-        colorUp: '#089981',
-        colorDown: '#f23645',
-        lineWidth: 1,
-        lineStyle: 'solid',
-        plotType: 'histogram',
-        visible: true,
-        lastValueVisible: false,
-        priceLineVisible: false,
-      },
-      ma: {
-        color: '#2962FF',
-        lineWidth: 1,
-        lineStyle: 'solid',
-        plotType: 'line',
-        visible: false,
-        lastValueVisible: false,
-        priceLineVisible: false,
-      },
-    },
-    plotLabels: { vol: 'Volume', ma: 'Volume MA' },
+    plots: [
+      { id: 'vol', type: 'histogram', title: 'Volume', color: '#089981', colorUp: '#089981', colorDown: '#f23645', lineWidth: 1, visible: true, lastValueVisible: false, priceLineVisible: false },
+      { id: 'ma', type: 'line', title: 'Volume MA', color: '#2962FF', lineWidth: 1, visible: false, lastValueVisible: false, priceLineVisible: false },
+    ],
   },
-
-  sma: {
-    type: 'sma',
+  {
+    id: 'wickra.sma',
+    wasmClass: 'SMA',
     name: 'Simple Moving Average (SMA)',
     shortName: 'SMA',
-    category: 'overlay',
+    family: 'Moving Averages',
+    category: 'Trend & Overlays',
+    overlay: true,
     description: 'Calculates the unweighted mean of the previous N price bars.',
-    defaultInputs: { length: 20, source: 'close' },
-    inputSchemas: [
-      { id: 'length', name: 'Length', type: 'number', default: 20, min: 1, max: 1000 },
+    inputs: [
+      { id: 'period', name: 'Period', type: 'integer', default: 20, min: 1, max: 1000 },
       { id: 'source', name: 'Source', type: 'source', default: 'close', options: SOURCE_OPTIONS },
     ],
-    defaultStyles: {
-      plot: { color: '#2962FF', lineWidth: 2, lineStyle: 'solid', plotType: 'line', visible: true },
-    },
-    plotLabels: { plot: 'SMA' },
+    plots: [
+      { id: 'plot', type: 'line', title: 'SMA', color: '#2962FF', lineWidth: 2, lineStyle: 'solid', visible: true },
+    ],
   },
-
-  ema: {
-    type: 'ema',
-    name: 'Exponential Moving Average (EMA)',
+  {
+    id: 'wickra.ema',
+    wasmClass: 'EMA',
+    name: 'Exponential Moving Average',
     shortName: 'EMA',
-    category: 'overlay',
-    description: 'Places greater weight and significance on the most recent price data points.',
-    defaultInputs: { length: 20, source: 'close' },
-    inputSchemas: [
-      { id: 'length', name: 'Length', type: 'number', default: 20, min: 1, max: 1000 },
+    family: 'Moving Averages',
+    category: 'Trend & Overlays',
+    overlay: true,
+    description: 'Calculates Exponential Moving Average (EMA) technical indicator.',
+    inputs: [
+      { id: 'period', name: 'Length', type: 'integer', default: 9, min: 1, max: 1000 },
       { id: 'source', name: 'Source', type: 'source', default: 'close', options: SOURCE_OPTIONS },
+      { id: 'offset', name: 'Offset', type: 'integer', default: 0, min: -1000, max: 1000 },
     ],
-    defaultStyles: {
-      plot: { color: '#FF9800', lineWidth: 2, lineStyle: 'solid', plotType: 'line', visible: true },
-    },
-    plotLabels: { plot: 'EMA' },
+    plots: [
+      { id: 'plot', type: 'line', title: 'EMA', color: '#2962FF', lineWidth: 2, lineStyle: 'solid', visible: true },
+    ],
   },
-
-  wma: {
-    type: 'wma',
+  {
+    id: 'wickra.wma',
+    wasmClass: 'WMA',
     name: 'Weighted Moving Average (WMA)',
     shortName: 'WMA',
-    category: 'overlay',
+    family: 'Moving Averages',
+    category: 'Trend & Overlays',
+    overlay: true,
     description: 'Assigns a heavier weighting to more current data points linearly.',
-    defaultInputs: { length: 20, source: 'close' },
-    inputSchemas: [
-      { id: 'length', name: 'Length', type: 'number', default: 20, min: 1, max: 1000 },
+    inputs: [
+      { id: 'period', name: 'Period', type: 'integer', default: 20, min: 1, max: 1000 },
       { id: 'source', name: 'Source', type: 'source', default: 'close', options: SOURCE_OPTIONS },
     ],
-    defaultStyles: {
-      plot: { color: '#9C27B0', lineWidth: 2, lineStyle: 'solid', plotType: 'line', visible: true },
-    },
-    plotLabels: { plot: 'WMA' },
+    plots: [
+      { id: 'plot', type: 'line', title: 'WMA', color: '#9C27B0', lineWidth: 2, lineStyle: 'solid', visible: true },
+    ],
   },
-
-  hma: {
-    type: 'hma',
-    name: 'Hull Moving Average (HMA)',
+  {
+    id: 'wickra.hma',
+    wasmClass: 'HMA',
+    name: 'Hull Moving Average',
     shortName: 'HMA',
-    category: 'overlay',
-    description: 'Extremely responsive moving average that almost eliminates lag while smoothing.',
-    defaultInputs: { length: 20, source: 'close' },
-    inputSchemas: [
-      { id: 'length', name: 'Length', type: 'number', default: 20, min: 2, max: 1000 },
+    family: 'Moving Averages',
+    category: 'Trend & Overlays',
+    overlay: true,
+    description: "Hull's near-zero-lag WMA(2·WMA(n/2) − WMA(n), √n).",
+    inputs: [
+      { id: 'period', name: 'Period', type: 'integer', default: 14, min: 1, max: 500 },
       { id: 'source', name: 'Source', type: 'source', default: 'close', options: SOURCE_OPTIONS },
     ],
-    defaultStyles: {
-      plot: { color: '#00BCD4', lineWidth: 2, lineStyle: 'solid', plotType: 'line', visible: true },
-    },
-    plotLabels: { plot: 'HMA' },
+    plots: [
+      { id: 'up', type: 'line', title: 'Up Trend', color: '#089981', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'down', type: 'line', title: 'Down Trend', color: '#F23645', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'value', type: 'line', title: 'Value', color: '#2962FF', lineWidth: 1, lineStyle: 'solid', visible: false },
+      { id: 'direction', type: 'line', title: 'Direction', color: '#2962FF', lineWidth: 1, lineStyle: 'solid', visible: false },
+    ],
   },
-
-  vwap: {
-    type: 'vwap',
+  {
+    id: 'wickra.t3',
+    wasmClass: 'T3',
+    name: 'Tillson T3',
+    shortName: 'T3',
+    family: 'Moving Averages',
+    category: 'Trend & Overlays',
+    overlay: true,
+    description: "Tillson's six-EMA cascade recombined with a volume factor v.",
+    inputs: [
+      { id: 'period', name: 'Period', type: 'integer', default: 14, min: 1, max: 500 },
+      { id: 'v', name: 'V', type: 'float', default: 1.0, min: 0.01, max: 1000.0, step: 0.1 },
+      { id: 'source', name: 'Source', type: 'source', default: 'close', options: SOURCE_OPTIONS },
+    ],
+    plots: [
+      { id: 'up', type: 'line', title: 'Up Trend', color: '#089981', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'down', type: 'line', title: 'Down Trend', color: '#F23645', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'value', type: 'line', title: 'Value', color: '#2962FF', lineWidth: 1, lineStyle: 'solid', visible: false },
+      { id: 'direction', type: 'line', title: 'Direction', color: '#2962FF', lineWidth: 1, lineStyle: 'solid', visible: false },
+    ],
+  },
+  {
+    id: 'wickra.vwap',
+    wasmClass: 'VWAP',
     name: 'Volume Weighted Average Price (VWAP)',
     shortName: 'VWAP',
-    category: 'overlay',
-    description: 'Ratio of the value traded to total volume traded over a session period.',
-    defaultInputs: { anchor: 'session' },
-    inputSchemas: [
+    family: 'Volume',
+    category: 'Volume',
+    overlay: true,
+    description: 'Volume Weighted Average Price with periodic session anchor resets and standard deviation bands.',
+    inputs: [
       {
-        id: 'anchor',
+        id: 'anchor_period',
         name: 'Anchor Period',
         type: 'select',
         default: 'session',
         options: [
-          { label: 'Session (Auto / Exchange Open)', value: 'session' },
-          { label: 'Session (UTC 00:00)', value: 'session_utc' },
+          { label: 'Session', value: 'session' },
           { label: 'Week', value: 'week' },
           { label: 'Month', value: 'month' },
+          { label: 'Quarter', value: 'quarter' },
           { label: 'Year', value: 'year' },
+          { label: 'Decade', value: 'decade' },
+          { label: 'Century', value: 'century' },
         ],
       },
+      { id: 'source', name: 'Source', type: 'source', default: 'hlc3', options: SOURCE_OPTIONS },
+      { id: 'offset', name: 'Offset', type: 'integer', default: 0, min: -500, max: 500 },
+      {
+        id: 'bands_calculation_mode',
+        name: 'Bands Calculation Mode',
+        type: 'select',
+        default: 'stdev',
+        options: [
+          { label: 'Standard Deviation', value: 'stdev' },
+          { label: 'Percentage', value: 'percentage' },
+        ],
+      },
+      { id: 'bands_multiplier_1', name: 'Bands Multiplier #1', type: 'float', default: 1.0, min: 0.1, max: 50.0, step: 0.1 },
+      { id: 'bands_multiplier_2', name: 'Bands Multiplier #2', type: 'float', default: 2.0, min: 0.1, max: 50.0, step: 0.1 },
+      { id: 'bands_multiplier_3', name: 'Bands Multiplier #3', type: 'float', default: 3.0, min: 0.1, max: 50.0, step: 0.1 },
     ],
-    defaultStyles: {
-      plot: { color: '#E91E63', lineWidth: 2, lineStyle: 'solid', plotType: 'line', visible: true },
-    },
-    plotLabels: { plot: 'VWAP' },
+    plots: [
+      { id: 'plot', type: 'line', title: 'VWAP', color: '#2962FF', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'upper_1', type: 'line', title: 'Upper Band #1', color: '#089981', lineWidth: 1, lineStyle: 'solid', visible: true },
+      { id: 'lower_1', type: 'line', title: 'Lower Band #1', color: '#089981', lineWidth: 1, lineStyle: 'solid', visible: true },
+      { id: 'upper_2', type: 'line', title: 'Upper Band #2', color: '#089981', lineWidth: 1, lineStyle: 'solid', visible: false },
+      { id: 'lower_2', type: 'line', title: 'Lower Band #2', color: '#089981', lineWidth: 1, lineStyle: 'solid', visible: false },
+      { id: 'upper_3', type: 'line', title: 'Upper Band #3', color: '#089981', lineWidth: 1, lineStyle: 'solid', visible: false },
+      { id: 'lower_3', type: 'line', title: 'Lower Band #3', color: '#089981', lineWidth: 1, lineStyle: 'solid', visible: false },
+    ],
+    bands: [
+      { id: 'vwap_band_1', title: 'Bands Fill #1', upperPlotId: 'upper_1', lowerPlotId: 'lower_1', fillColor: 'rgba(41, 98, 255, 0.08)', visible: true },
+      { id: 'vwap_band_2', title: 'Bands Fill #2', upperPlotId: 'upper_2', lowerPlotId: 'lower_2', fillColor: 'rgba(41, 98, 255, 0.04)', visible: false },
+      { id: 'vwap_band_3', title: 'Bands Fill #3', upperPlotId: 'upper_3', lowerPlotId: 'lower_3', fillColor: 'rgba(41, 98, 255, 0.04)', visible: false },
+    ],
   },
-
-  bollinger_bands: {
-    type: 'bollinger_bands',
+  {
+    id: 'wickra.bollinger_bands',
+    wasmClass: 'BollingerBands',
     name: 'Bollinger Bands (BB)',
     shortName: 'BB',
-    category: 'overlay',
+    family: 'Bands & Channels',
+    category: 'Volatility & Bands',
+    overlay: true,
     description: 'Volatility bands placed above and below a moving average by standard deviation.',
-    defaultInputs: { length: 20, multiplier: 2.0, source: 'close' },
-    inputSchemas: [
-      { id: 'length', name: 'Length', type: 'number', default: 20, min: 1, max: 500 },
-      { id: 'multiplier', name: 'StdDev Multiplier', type: 'number', default: 2.0, min: 0.1, max: 10, step: 0.1 },
+    inputs: [
+      { id: 'period', name: 'Length', type: 'integer', default: 20, min: 1, max: 500 },
+      { id: 'multiplier', name: 'StdDev Multiplier', type: 'float', default: 2.0, min: 0.1, max: 10, step: 0.1 },
       { id: 'source', name: 'Source', type: 'source', default: 'close', options: SOURCE_OPTIONS },
     ],
-    defaultStyles: {
-      upper: { color: '#2962FF', lineWidth: 1, lineStyle: 'solid', plotType: 'line', visible: true },
-      basis: { color: '#FF6D00', lineWidth: 1, lineStyle: 'solid', plotType: 'line', visible: true },
-      lower: { color: '#2962FF', lineWidth: 1, lineStyle: 'solid', plotType: 'line', visible: true },
-    },
-    plotLabels: { upper: 'Upper Band', basis: 'Basis (SMA)', lower: 'Lower Band' },
-    defaultBands: [
-      { id: 'bb_fill', upperPlotId: 'upper', lowerPlotId: 'lower', fillColor: 'rgba(41, 98, 255, 0.08)', visible: true },
+    plots: [
+      { id: 'upper', type: 'line', title: 'Upper Band', color: '#00897B', lineWidth: 1, lineStyle: 'solid', visible: true },
+      { id: 'middle', type: 'line', title: 'Middle (Basis)', color: '#26A69A', lineWidth: 1, lineStyle: 'solid', visible: true },
+      { id: 'lower', type: 'line', title: 'Lower Band', color: '#00897B', lineWidth: 1, lineStyle: 'solid', visible: true },
+    ],
+    bands: [
+      { id: 'bollingerbands_fill', upperPlotId: 'upper', lowerPlotId: 'lower', fillColor: 'rgba(41, 98, 255, 0.08)', visible: true },
     ],
   },
-
-  keltner_channels: {
-    type: 'keltner_channels',
+  {
+    id: 'wickra.keltner',
+    wasmClass: 'Keltner',
     name: 'Keltner Channels (KC)',
     shortName: 'KC',
-    category: 'overlay',
-    description: 'Volatility-based envelopes set above and below an EMA using Average True Range.',
-    defaultInputs: { emaLength: 20, atrLength: 10, multiplier: 2.0, source: 'close' },
-    inputSchemas: [
-      { id: 'emaLength', name: 'EMA Length', type: 'number', default: 20, min: 1, max: 500 },
-      { id: 'atrLength', name: 'ATR Length', type: 'number', default: 10, min: 1, max: 500 },
-      { id: 'multiplier', name: 'ATR Multiplier', type: 'number', default: 2.0, min: 0.1, max: 10, step: 0.1 },
-      { id: 'source', name: 'Source', type: 'source', default: 'close', options: SOURCE_OPTIONS },
+    family: 'Bands & Channels',
+    category: 'Volatility & Bands',
+    overlay: true,
+    description: 'Volatility-based envelopes set above and below an EMA using ATR bands.',
+    inputs: [
+      { id: 'ema_period', name: 'EMA Period', type: 'integer', default: 20, min: 1, max: 500 },
+      { id: 'atr_period', name: 'ATR Period', type: 'integer', default: 10, min: 1, max: 200 },
+      { id: 'multiplier', name: 'ATR Multiplier', type: 'float', default: 2.0, min: 0.1, max: 10, step: 0.1 },
     ],
-    defaultStyles: {
-      upper: { color: '#00897B', lineWidth: 1, lineStyle: 'solid', plotType: 'line', visible: true },
-      basis: { color: '#26A69A', lineWidth: 1, lineStyle: 'solid', plotType: 'line', visible: true },
-      lower: { color: '#00897B', lineWidth: 1, lineStyle: 'solid', plotType: 'line', visible: true },
-    },
-    plotLabels: { upper: 'Upper Channel', basis: 'Basis (EMA)', lower: 'Lower Channel' },
-    defaultBands: [
-      { id: 'kc_fill', upperPlotId: 'upper', lowerPlotId: 'lower', fillColor: 'rgba(0, 137, 123, 0.08)', visible: true },
+    plots: [
+      { id: 'upper', type: 'line', title: 'Upper Channel', color: '#00897B', lineWidth: 1, lineStyle: 'solid', visible: true },
+      { id: 'middle', type: 'line', title: 'Middle (Basis)', color: '#26A69A', lineWidth: 1, lineStyle: 'solid', visible: true },
+      { id: 'lower', type: 'line', title: 'Lower Channel', color: '#00897B', lineWidth: 1, lineStyle: 'solid', visible: true },
+    ],
+    bands: [
+      { id: 'keltner_fill', upperPlotId: 'upper', lowerPlotId: 'lower', fillColor: 'rgba(0, 137, 123, 0.08)', visible: true },
     ],
   },
-
-  supertrend: {
-    type: 'supertrend',
+  {
+    id: 'wickra.super_trend',
+    wasmClass: 'SuperTrend',
     name: 'SuperTrend',
-    shortName: 'SuperTrend',
-    category: 'overlay',
-    description: 'Trend-following indicator based on Average True Range with dynamic trailing stop flips.',
-    defaultInputs: { atrPeriod: 10, multiplier: 3.0 },
-    inputSchemas: [
-      { id: 'atrPeriod', name: 'ATR Period', type: 'number', default: 10, min: 1, max: 200 },
-      { id: 'multiplier', name: 'Multiplier', type: 'number', default: 3.0, min: 0.1, max: 20, step: 0.1 },
+    shortName: 'ST',
+    family: 'Trailing Stops',
+    category: 'Trend & Overlays',
+    overlay: true,
+    description: 'ATR-banded trailing stop with explicit flip logic.',
+    inputs: [
+      { id: 'atr_period', name: 'Atr Period', type: 'integer', default: 14, min: 1, max: 500 },
+      { id: 'multiplier', name: 'Multiplier', type: 'float', default: 2.0, min: 0.1, max: 10.0, step: 0.1 },
     ],
-    defaultStyles: {
-      trend: { color: '#089981', lineWidth: 2, lineStyle: 'solid', plotType: 'line', visible: true },
-    },
-    plotLabels: { trend: 'SuperTrend' },
-  },
-
-  parabolic_sar: {
-    type: 'parabolic_sar',
-    name: 'Parabolic SAR (PSAR)',
-    shortName: 'PSAR',
-    category: 'overlay',
-    description: 'Highlights trend direction and potential reversal points with trailing dots.',
-    defaultInputs: { start: 0.02, increment: 0.02, maximum: 0.2 },
-    inputSchemas: [
-      { id: 'start', name: 'Start AF', type: 'number', default: 0.02, min: 0.001, max: 1, step: 0.005 },
-      { id: 'increment', name: 'Increment AF', type: 'number', default: 0.02, min: 0.001, max: 1, step: 0.005 },
-      { id: 'maximum', name: 'Maximum AF', type: 'number', default: 0.2, min: 0.01, max: 1, step: 0.01 },
+    plots: [
+      { id: 'up', type: 'line', title: 'Up Trend', color: '#089981', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'down', type: 'line', title: 'Down Trend', color: '#F23645', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'value', type: 'line', title: 'Value', color: '#2962FF', lineWidth: 1, lineStyle: 'solid', visible: false },
+      { id: 'direction', type: 'line', title: 'Direction', color: '#2962FF', lineWidth: 1, lineStyle: 'solid', visible: false },
     ],
-    defaultStyles: {
-      sar: { color: '#2196F3', lineWidth: 2, lineStyle: 'solid', plotType: 'circles', visible: true },
-    },
-    plotLabels: { sar: 'Parabolic SAR' },
   },
-
-  // ===================== SUB-PANES (OSCILLATORS) =====================
-  rsi: {
-    type: 'rsi',
+  {
+    id: 'wickra.atr_ratchet',
+    wasmClass: 'AtrRatchet',
+    name: 'ATR Ratchet',
+    shortName: 'AR',
+    family: 'Trailing Stops',
+    category: 'Trend & Overlays',
+    overlay: true,
+    description: "Perry Kaufman's time-based volatility stop — it tightens by a fixed fraction of ATR every bar, so a stalled trade is squeezed out even in a flat market.",
+    inputs: [
+      { id: 'atr_period', name: 'Atr Period', type: 'integer', default: 14, min: 1, max: 500 },
+      { id: 'start_mult', name: 'Start Mult', type: 'float', default: 2.0, min: 0.1, max: 10.0, step: 0.1 },
+      { id: 'increment', name: 'Increment', type: 'float', default: 1.0, min: 0.01, max: 1000.0, step: 0.1 },
+    ],
+    plots: [
+      { id: 'up', type: 'line', title: 'Up Trend', color: '#089981', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'down', type: 'line', title: 'Down Trend', color: '#F23645', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'value', type: 'line', title: 'Value', color: '#2962FF', lineWidth: 1, lineStyle: 'solid', visible: false },
+      { id: 'direction', type: 'line', title: 'Direction', color: '#2962FF', lineWidth: 1, lineStyle: 'solid', visible: false },
+    ],
+  },
+  {
+    id: 'wickra.elder_safe_zone',
+    wasmClass: 'ElderSafeZone',
+    name: 'Elder SafeZone Stop',
+    shortName: 'ESZ',
+    family: 'Trailing Stops',
+    category: 'Trend & Overlays',
+    overlay: true,
+    description: "Alexander Elder's trailing stop placed a multiple of the average market noise away from price — wide enough to survive normal pullbacks, tight enough to exit a real reversal.",
+    inputs: [
+      { id: 'period', name: 'Period', type: 'integer', default: 14, min: 1, max: 500 },
+      { id: 'coeff', name: 'Coeff', type: 'float', default: 1.0, min: 0.01, max: 1000.0, step: 0.1 },
+    ],
+    plots: [
+      { id: 'up', type: 'line', title: 'Up Trend', color: '#089981', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'down', type: 'line', title: 'Down Trend', color: '#F23645', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'value', type: 'line', title: 'Value', color: '#2962FF', lineWidth: 1, lineStyle: 'solid', visible: false },
+      { id: 'direction', type: 'line', title: 'Direction', color: '#2962FF', lineWidth: 1, lineStyle: 'solid', visible: false },
+    ],
+  },
+  {
+    id: 'wickra.kase_dev_stop',
+    wasmClass: 'KaseDevStop',
+    name: 'Kase DevStop',
+    shortName: 'KDS',
+    family: 'Trailing Stops',
+    category: 'Trend & Overlays',
+    overlay: true,
+    description: "Cynthia Kase's volatility trailing stop, built on the standard deviation of the two-bar true range — it ratchets in the trend's favour and flips on a close through the line.",
+    inputs: [
+      { id: 'period', name: 'Period', type: 'integer', default: 14, min: 1, max: 500 },
+      { id: 'dev', name: 'Dev', type: 'float', default: 1.0, min: 0.01, max: 1000.0, step: 0.1 },
+    ],
+    plots: [
+      { id: 'up', type: 'line', title: 'Up Trend', color: '#089981', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'down', type: 'line', title: 'Down Trend', color: '#F23645', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'value', type: 'line', title: 'Value', color: '#2962FF', lineWidth: 1, lineStyle: 'solid', visible: false },
+      { id: 'direction', type: 'line', title: 'Direction', color: '#2962FF', lineWidth: 1, lineStyle: 'solid', visible: false },
+    ],
+  },
+  {
+    id: 'wickra.modified_ma_stop',
+    wasmClass: 'ModifiedMaStop',
+    name: 'Modified Ma Stop',
+    shortName: 'MMS',
+    family: 'Trailing Stops',
+    category: 'Trend & Overlays',
+    overlay: true,
+    description: "A trailing stop riding the Modified Moving Average (SMMA / Wilder's RMA), ratcheted so it only moves in the trend's favour and flips on a decisive cross.",
+    inputs: [
+      { id: 'period', name: 'Period', type: 'integer', default: 14, min: 1, max: 500 },
+    ],
+    plots: [
+      { id: 'up', type: 'line', title: 'Up Trend', color: '#089981', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'down', type: 'line', title: 'Down Trend', color: '#F23645', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'value', type: 'line', title: 'Value', color: '#2962FF', lineWidth: 1, lineStyle: 'solid', visible: false },
+      { id: 'direction', type: 'line', title: 'Direction', color: '#2962FF', lineWidth: 1, lineStyle: 'solid', visible: false },
+    ],
+  },
+  {
+    id: 'wickra.nrtr',
+    wasmClass: 'Nrtr',
+    name: 'Nick Rypock Trailing Reverse',
+    shortName: 'Nrtr',
+    family: 'Price Statistics',
+    category: 'Statistics & Risk',
+    overlay: false,
+    description: 'Nick Rypock Trailing Reverse — a scale-free percentage trailing-reverse stop that follows the trend extreme and flips when price retraces by a fixed percentage.',
+    inputs: [
+      { id: 'pct', name: 'Pct', type: 'float', default: 1.0, min: 0.01, max: 1000.0, step: 0.1 },
+    ],
+    plots: [
+      { id: 'up', type: 'line', title: 'Up Trend', color: '#089981', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'down', type: 'line', title: 'Down Trend', color: '#F23645', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'value', type: 'line', title: 'Value', color: '#2962FF', lineWidth: 1, lineStyle: 'solid', visible: false },
+      { id: 'direction', type: 'line', title: 'Direction', color: '#2962FF', lineWidth: 1, lineStyle: 'solid', visible: false },
+    ],
+  },
+  {
+    id: 'wickra.psar',
+    wasmClass: 'PSAR',
+    name: 'Parabolic SAR',
+    shortName: 'SAR',
+    family: 'Trailing Stops',
+    category: 'Trend & Overlays',
+    overlay: true,
+    description: 'Trailing stop and reverse method to identify potential trend reversals.',
+    inputs: [
+      { id: 'af_start', name: 'Start', type: 'float', default: 0.02, min: 0.001, max: 1, step: 0.005 },
+      { id: 'af_step', name: 'Increment', type: 'float', default: 0.02, min: 0.001, max: 1, step: 0.005 },
+      { id: 'af_max', name: 'Maximum', type: 'float', default: 0.2, min: 0.01, max: 1, step: 0.01 },
+    ],
+    plots: [
+      { id: 'plot', type: 'circles', title: 'SAR', color: '#2962FF', lineWidth: 2, visible: true },
+    ],
+  },
+  {
+    id: 'wickra.rsi',
+    wasmClass: 'RSI',
     name: 'Relative Strength Index (RSI)',
     shortName: 'RSI',
-    category: 'subpane',
-    description: 'Momentum oscillator that measures the speed and change of price movements.',
-    defaultInputs: { length: 14, source: 'close' },
-    inputSchemas: [
-      { id: 'length', name: 'Length', type: 'number', default: 14, min: 1, max: 500 },
+    family: 'Momentum Oscillators',
+    category: 'Oscillators',
+    overlay: false,
+    description: 'Momentum oscillator measuring the speed and change of price movements.',
+    inputs: [
+      { id: 'period', name: 'Period', type: 'integer', default: 14, min: 1, max: 500 },
       { id: 'source', name: 'Source', type: 'source', default: 'close', options: SOURCE_OPTIONS },
     ],
-    defaultStyles: {
-      rsi: { color: '#7E57C2', lineWidth: 2, lineStyle: 'solid', plotType: 'line', visible: true },
-    },
-    plotLabels: { rsi: 'RSI' },
-    defaultLevels: [
-      { value: 70, color: '#787B86', lineStyle: 'dashed', lineWidth: 1, label: 'Overbought (70)', visible: true },
-      { value: 50, color: '#434651', lineStyle: 'dotted', lineWidth: 1, label: 'Midline (50)', visible: true },
-      { value: 30, color: '#787B86', lineStyle: 'dashed', lineWidth: 1, label: 'Oversold (30)', visible: true },
+    plots: [
+      { id: 'plot', type: 'line', title: 'RSI', color: '#7E57C2', lineWidth: 2, lineStyle: 'solid', visible: true },
+    ],
+    levels: [
+      { value: 70, color: '#F23645', lineStyle: 'dashed', lineWidth: 1, label: 'Overbought', visible: true },
+      { value: 50, color: '#787B86', lineStyle: 'dotted', lineWidth: 1, label: 'Midline', visible: true },
+      { value: 30, color: '#089981', lineStyle: 'dashed', lineWidth: 1, label: 'Oversold', visible: true },
     ],
   },
-
-  macd: {
-    type: 'macd',
+  {
+    id: 'wickra.macd',
+    wasmClass: 'MACD',
     name: 'Moving Average Convergence Divergence (MACD)',
     shortName: 'MACD',
-    category: 'subpane',
-    description: 'Trend-following momentum indicator showing relationship between two exponential averages.',
-    defaultInputs: { fastLength: 12, slowLength: 26, signalLength: 9, source: 'close' },
-    inputSchemas: [
-      { id: 'fastLength', name: 'Fast Length', type: 'number', default: 12, min: 1, max: 500 },
-      { id: 'slowLength', name: 'Slow Length', type: 'number', default: 26, min: 1, max: 500 },
-      { id: 'signalLength', name: 'Signal Smoothing', type: 'number', default: 9, min: 1, max: 200 },
+    family: 'Trend & Directional',
+    category: 'Trend & Overlays',
+    overlay: false,
+    description: 'Trend-following momentum indicator showing the relationship between two exponential moving averages.',
+    inputs: [
+      { id: 'fast', name: 'Fast Length', type: 'integer', default: 12, min: 1, max: 500 },
+      { id: 'slow', name: 'Slow Length', type: 'integer', default: 26, min: 1, max: 500 },
+      { id: 'signal', name: 'Signal Smoothing', type: 'integer', default: 9, min: 1, max: 200 },
       { id: 'source', name: 'Source', type: 'source', default: 'close', options: SOURCE_OPTIONS },
     ],
-    defaultStyles: {
-      macd: { color: '#2962FF', lineWidth: 1.5, lineStyle: 'solid', plotType: 'line', visible: true },
-      signal: { color: '#FF6D00', lineWidth: 1.5, lineStyle: 'solid', plotType: 'line', visible: true },
-      hist: { color: '#089981', lineWidth: 2, lineStyle: 'solid', plotType: 'histogram', visible: true },
-    },
-    plotLabels: { macd: 'MACD Line', signal: 'Signal Line', hist: 'Histogram' },
-    defaultLevels: [
+    plots: [
+      { id: 'macd', type: 'line', title: 'MACD Line', color: '#2962FF', lineWidth: 1.5, lineStyle: 'solid', visible: true },
+      { id: 'signal', type: 'line', title: 'Signal Line', color: '#FF6D00', lineWidth: 1.5, lineStyle: 'solid', visible: true },
+      { id: 'histogram', type: 'histogram', title: 'Histogram', color: '#089981', lineWidth: 2, lineStyle: 'solid', visible: true },
+    ],
+    levels: [
       { value: 0, color: '#434651', lineStyle: 'solid', lineWidth: 1, label: 'Zero', visible: true },
     ],
   },
-
-  stochastic: {
-    type: 'stochastic',
-    name: 'Stochastic Oscillator (Stoch)',
+  {
+    id: 'wickra.stochastic',
+    wasmClass: 'Stochastic',
+    name: 'Stochastic Oscillator',
     shortName: 'Stoch',
-    category: 'subpane',
+    family: 'Momentum Oscillators',
+    category: 'Oscillators',
+    overlay: false,
     description: 'Compares a particular closing price to a range of prices over a given period of time.',
-    defaultInputs: { kLength: 14, kSmoothing: 1, dSmoothing: 3 },
-    inputSchemas: [
-      { id: 'kLength', name: '%K Length', type: 'number', default: 14, min: 1, max: 500 },
-      { id: 'kSmoothing', name: '%K Smoothing', type: 'number', default: 1, min: 1, max: 100 },
-      { id: 'dSmoothing', name: '%D Smoothing', type: 'number', default: 3, min: 1, max: 100 },
+    inputs: [
+      { id: 'k_period', name: '%K Period', type: 'integer', default: 14, min: 1, max: 500 },
+      { id: 'd_period', name: '%D Period', type: 'integer', default: 3, min: 1, max: 100 },
     ],
-    defaultStyles: {
-      k: { color: '#2962FF', lineWidth: 1.5, lineStyle: 'solid', plotType: 'line', visible: true },
-      d: { color: '#FF6D00', lineWidth: 1.5, lineStyle: 'solid', plotType: 'line', visible: true },
-    },
-    plotLabels: { k: '%K Line', d: '%D Line' },
-    defaultLevels: [
-      { value: 80, color: '#787B86', lineStyle: 'dashed', lineWidth: 1, label: 'Upper (80)', visible: true },
-      { value: 20, color: '#787B86', lineStyle: 'dashed', lineWidth: 1, label: 'Lower (20)', visible: true },
+    plots: [
+      { id: 'k', type: 'line', title: '%K Line', color: '#2962FF', lineWidth: 1.5, lineStyle: 'solid', visible: true },
+      { id: 'd', type: 'line', title: '%D Line', color: '#FF6D00', lineWidth: 1.5, lineStyle: 'solid', visible: true },
+    ],
+    levels: [
+      { value: 80, color: '#F23645', lineStyle: 'dashed', lineWidth: 1, label: 'Upper', visible: true },
+      { value: 20, color: '#089981', lineStyle: 'dashed', lineWidth: 1, label: 'Lower', visible: true },
     ],
   },
-
-  stoch_rsi: {
-    type: 'stoch_rsi',
-    name: 'Stochastic RSI (Stoch RSI)',
-    shortName: 'Stoch RSI',
-    category: 'subpane',
-    description: 'Applies the Stochastic formula to RSI values rather than standard price data.',
-    defaultInputs: { rsiLength: 14, stochLength: 14, k: 3, d: 3, source: 'close' },
-    inputSchemas: [
-      { id: 'rsiLength', name: 'RSI Length', type: 'number', default: 14, min: 1, max: 500 },
-      { id: 'stochLength', name: 'Stochastic Length', type: 'number', default: 14, min: 1, max: 500 },
-      { id: 'k', name: '%K Smoothing', type: 'number', default: 3, min: 1, max: 100 },
-      { id: 'd', name: '%D Smoothing', type: 'number', default: 3, min: 1, max: 100 },
+  {
+    id: 'wickra.stoch_rsi',
+    wasmClass: 'StochRSI',
+    name: 'Stochastic RSI',
+    shortName: 'StochRSI',
+    family: 'Momentum Oscillators',
+    category: 'Oscillators',
+    overlay: false,
+    description: 'Applies Stochastic formula to RSI values rather than standard price data.',
+    inputs: [
+      { id: 'rsi_period', name: 'RSI Period', type: 'integer', default: 14, min: 1, max: 500 },
+      { id: 'stoch_period', name: 'Stochastic Period', type: 'integer', default: 14, min: 1, max: 500 },
       { id: 'source', name: 'Source', type: 'source', default: 'close', options: SOURCE_OPTIONS },
     ],
-    defaultStyles: {
-      k: { color: '#2962FF', lineWidth: 1.5, lineStyle: 'solid', plotType: 'line', visible: true },
-      d: { color: '#FF6D00', lineWidth: 1.5, lineStyle: 'solid', plotType: 'line', visible: true },
-    },
-    plotLabels: { k: '%K Line', d: '%D Line' },
-    defaultLevels: [
-      { value: 80, color: '#787B86', lineStyle: 'dashed', lineWidth: 1, label: 'Upper (80)', visible: true },
-      { value: 20, color: '#787B86', lineStyle: 'dashed', lineWidth: 1, label: 'Lower (20)', visible: true },
+    plots: [
+      { id: 'k', type: 'line', title: '%K Line', color: '#2962FF', lineWidth: 1.5, lineStyle: 'solid', visible: true },
+      { id: 'd', type: 'line', title: '%D Line', color: '#FF6D00', lineWidth: 1.5, lineStyle: 'solid', visible: true },
+    ],
+    levels: [
+      { value: 80, color: '#F23645', lineStyle: 'dashed', lineWidth: 1, label: 'Upper', visible: true },
+      { value: 20, color: '#089981', lineStyle: 'dashed', lineWidth: 1, label: 'Lower', visible: true },
     ],
   },
-
-  atr: {
-    type: 'atr',
+  {
+    id: 'wickra.atr',
+    wasmClass: 'ATR',
     name: 'Average True Range (ATR)',
     shortName: 'ATR',
-    category: 'subpane',
+    family: 'Volatility & Bands',
+    category: 'Volatility & Bands',
+    overlay: false,
     description: 'Technical analysis volatility indicator that measures market volatility over a period.',
-    defaultInputs: { length: 14 },
-    inputSchemas: [
-      { id: 'length', name: 'Length', type: 'number', default: 14, min: 1, max: 500 },
+    inputs: [
+      { id: 'period', name: 'Length', type: 'integer', default: 14, min: 1, max: 500 },
     ],
-    defaultStyles: {
-      atr: { color: '#AB47BC', lineWidth: 2, lineStyle: 'solid', plotType: 'line', visible: true },
-    },
-    plotLabels: { atr: 'ATR' },
+    plots: [
+      { id: 'plot', type: 'line', title: 'ATR', color: '#AB47BC', lineWidth: 2, lineStyle: 'solid', visible: true },
+    ],
   },
-
-  cci: {
-    type: 'cci',
+  {
+    id: 'wickra.cci',
+    wasmClass: 'CCI',
     name: 'Commodity Channel Index (CCI)',
     shortName: 'CCI',
-    category: 'subpane',
-    description: 'Versatile momentum-based oscillator to identify cyclic trends and overbought/oversold levels.',
-    defaultInputs: { length: 20 },
-    inputSchemas: [
-      { id: 'length', name: 'Length', type: 'number', default: 20, min: 1, max: 500 },
+    family: 'Momentum Oscillators',
+    category: 'Oscillators',
+    overlay: false,
+    description: 'Versatile indicator that can be used to identify a new trend or warn of extreme conditions.',
+    inputs: [
+      { id: 'period', name: 'Length', type: 'integer', default: 20, min: 1, max: 500 },
     ],
-    defaultStyles: {
-      cci: { color: '#FF9800', lineWidth: 1.5, lineStyle: 'solid', plotType: 'line', visible: true },
-    },
-    plotLabels: { cci: 'CCI' },
-    defaultLevels: [
-      { value: 100, color: '#787B86', lineStyle: 'dashed', lineWidth: 1, label: '+100 Level', visible: true },
-      { value: -100, color: '#787B86', lineStyle: 'dashed', lineWidth: 1, label: '-100 Level', visible: true },
+    plots: [
+      { id: 'plot', type: 'line', title: 'CCI', color: '#FF6D00', lineWidth: 2, lineStyle: 'solid', visible: true },
+    ],
+    levels: [
+      { value: 100, color: '#F23645', lineStyle: 'dashed', lineWidth: 1, label: 'Overbought', visible: true },
+      { value: -100, color: '#089981', lineStyle: 'dashed', lineWidth: 1, label: 'Oversold', visible: true },
     ],
   },
-
-  williams_r: {
-    type: 'williams_r',
-    name: 'Williams %R',
+  {
+    id: 'wickra.williams_r',
+    wasmClass: 'WilliamsR',
+    name: '%R (Williams Percent Range)',
     shortName: 'Williams %R',
-    category: 'subpane',
-    description: 'Negative momentum oscillator moving between 0 and -100 to gauge market exhaustion.',
-    defaultInputs: { length: 14 },
-    inputSchemas: [
-      { id: 'length', name: 'Length', type: 'number', default: 14, min: 1, max: 500 },
+    family: 'Momentum Oscillators',
+    category: 'Oscillators',
+    overlay: false,
+    description: 'Momentum indicator that measures overbought and oversold levels, oscillating from 0 to -100.',
+    inputs: [
+      { id: 'period', name: 'Length', type: 'integer', default: 14, min: 1, max: 500 },
     ],
-    defaultStyles: {
-      williams: { color: '#26C6DA', lineWidth: 1.5, lineStyle: 'solid', plotType: 'line', visible: true },
-    },
-    plotLabels: { williams: 'Williams %R' },
-    defaultLevels: [
-      { value: -20, color: '#787B86', lineStyle: 'dashed', lineWidth: 1, label: 'Overbought (-20)', visible: true },
-      { value: -80, color: '#787B86', lineStyle: 'dashed', lineWidth: 1, label: 'Oversold (-80)', visible: true },
+    plots: [
+      { id: 'plot', type: 'line', title: '%R', color: '#26A69A', lineWidth: 2, lineStyle: 'solid', visible: true },
+    ],
+    levels: [
+      { value: -20, color: '#F23645', lineStyle: 'dashed', lineWidth: 1, label: 'Overbought', visible: true },
+      { value: -80, color: '#089981', lineStyle: 'dashed', lineWidth: 1, label: 'Oversold', visible: true },
     ],
   },
-
-  adx: {
-    type: 'adx',
-    name: 'Average Directional Index (ADX / DMI)',
+  {
+    id: 'wickra.adx',
+    wasmClass: 'ADX',
+    name: 'Average Directional Index (ADX)',
     shortName: 'ADX',
-    category: 'subpane',
-    description: 'Measures the overall strength of a trend irrespective of upward or downward direction.',
-    defaultInputs: { adxLength: 14, diLength: 14 },
-    inputSchemas: [
-      { id: 'adxLength', name: 'ADX Smoothing', type: 'number', default: 14, min: 1, max: 200 },
-      { id: 'diLength', name: 'DI Length', type: 'number', default: 14, min: 1, max: 200 },
+    family: 'Trend & Directional',
+    category: 'Trend & Overlays',
+    overlay: false,
+    description: 'Quantifies trend strength without regard to trend direction.',
+    inputs: [
+      { id: 'period', name: 'Length', type: 'integer', default: 14, min: 1, max: 500 },
     ],
-    defaultStyles: {
-      adx: { color: '#E91E63', lineWidth: 2, lineStyle: 'solid', plotType: 'line', visible: true },
-      plusDi: { color: '#089981', lineWidth: 1, lineStyle: 'solid', plotType: 'line', visible: true },
-      minusDi: { color: '#F23645', lineWidth: 1, lineStyle: 'solid', plotType: 'line', visible: true },
-    },
-    plotLabels: { adx: 'ADX', plusDi: '+DI Line', minusDi: '-DI Line' },
-    defaultLevels: [
-      { value: 25, color: '#787B86', lineStyle: 'dotted', lineWidth: 1, label: 'Trend Level (25)', visible: true },
+    plots: [
+      { id: 'adx', type: 'line', title: 'ADX', color: '#F23645', lineWidth: 2, lineStyle: 'solid', visible: true },
+      { id: 'plusDi', type: 'line', title: '+DI', color: '#089981', lineWidth: 1.5, lineStyle: 'solid', visible: true },
+      { id: 'minusDi', type: 'line', title: '-DI', color: '#F23645', lineWidth: 1.5, lineStyle: 'solid', visible: true },
+    ],
+    levels: [
+      { value: 25, color: '#787B86', lineStyle: 'dashed', lineWidth: 1, label: 'Strong Trend (25)', visible: true },
     ],
   },
-
-  obv: {
-    type: 'obv',
+  {
+    id: 'wickra.obv',
+    wasmClass: 'OBV',
     name: 'On-Balance Volume (OBV)',
     shortName: 'OBV',
-    category: 'subpane',
-    description: 'Uses volume flow to predict changes in stock price, measuring buying and selling pressure.',
-    defaultInputs: {},
-    inputSchemas: [],
-    defaultStyles: {
-      obv: { color: '#2962FF', lineWidth: 1.5, lineStyle: 'solid', plotType: 'line', visible: true },
-    },
-    plotLabels: { obv: 'OBV' },
+    family: 'Volume',
+    category: 'Volume',
+    overlay: false,
+    description: 'Uses volume flow to predict changes in stock price.',
+    inputs: [],
+    plots: [
+      { id: 'plot', type: 'line', title: 'OBV', color: '#2962FF', lineWidth: 2, lineStyle: 'solid', visible: true },
+    ],
   },
-};
+  {
+    id: 'wickra.adl',
+    wasmClass: 'ADL',
+    name: 'Accumulation/Distribution Line (ADL)',
+    shortName: 'ADL',
+    family: 'Volume',
+    category: 'Volume',
+    overlay: false,
+    description: 'Cumulative range-weighted volume measuring accumulation and distribution flow.',
+    inputs: [],
+    plots: [
+      { id: 'plot', type: 'line', title: 'ADL', color: '#089981', lineWidth: 2, lineStyle: 'solid', visible: true },
+    ],
+  },
+  {
+    id: 'wickra.anchored_vwap',
+    wasmClass: 'AnchoredVWAP',
+    name: 'Anchored VWAP',
+    shortName: 'AVWAP',
+    family: 'Volume',
+    category: 'Volume',
+    overlay: true,
+    description: 'Cumulative VWAP from a user-set anchor bar (event-anchored fair price).',
+    inputs: [],
+    plots: [
+      { id: 'plot', type: 'line', title: 'Anchored VWAP', color: '#089981', lineWidth: 2, lineStyle: 'solid', visible: true },
+    ],
+  },
+];
 
-export const ALL_INDICATOR_TYPES: IndicatorType[] = Object.keys(INDICATOR_REGISTRY) as IndicatorType[];
+// Initialize registry dictionary with core fallbacks (supporting both legacy and wickra IDs)
+function buildInitialRegistry(): Record<string, IndicatorDefinition> {
+  const map: Record<string, IndicatorDefinition> = {};
+  for (const desc of CORE_FALLBACK_DESCRIPTORS) {
+    const def = descriptorToDefinition(desc);
+    map[def.id] = def;
+    // Map legacy alias (e.g. 'sma' -> 'wickra.sma')
+    for (const [legacyId, wickraId] of Object.entries(LEGACY_INDICATOR_MAP)) {
+      if (wickraId === def.id) {
+        map[legacyId] = def;
+      }
+    }
+  }
+  return map;
+}
+
+const registryMap: Record<string, IndicatorDefinition> = buildInitialRegistry();
+
+/**
+ * Global synchronous dictionary accessor. Maintained for 100% backward compatibility.
+ * Augments in-place as soon as fetchCatalog() resolves.
+ */
+export const INDICATOR_REGISTRY: Record<string, IndicatorDefinition> = registryMap;
+registerSubpaneChecker((id) => (INDICATOR_REGISTRY[id] ? !INDICATOR_REGISTRY[id].overlay : undefined));
+
+/**
+ * Array of available distinct indicator identifiers for UI catalog display.
+ * Updated in-place when catalog is fetched.
+ */
+function buildDistinctTypes(map: Record<string, IndicatorDefinition>): string[] {
+  const seen = new Set<string>();
+  const list: string[] = [];
+  for (const def of Object.values(map)) {
+    if (def.id === 'wickra.vwap_std_dev_bands') {
+      continue;
+    }
+    if (!seen.has(def.id)) {
+      seen.add(def.id);
+      list.push(def.id);
+    }
+  }
+  return list;
+}
+
+export const ALL_INDICATOR_TYPES: string[] = buildDistinctTypes(registryMap);
+
+// ============================================================================
+// Dynamic Catalog Service
+// ============================================================================
+
+let isCatalogLoaded = false;
+let catalogLoadingPromise: Promise<IndicatorDefinition[]> | null = null;
+const catalogListeners = new Set<() => void>();
+
+/**
+ * Subscribes a callback to catalog updates (invoked when backend fetch completes).
+ */
+export function subscribeCatalog(listener: () => void): () => void {
+  catalogListeners.add(listener);
+  return () => {
+    catalogListeners.delete(listener);
+  };
+}
+
+/**
+ * Indicates whether the complete 500+ indicator catalog has been loaded from the backend.
+ */
+export function isLoaded(): boolean {
+  return isCatalogLoaded;
+}
+
+/**
+ * Synchronous lookup for an indicator definition by ID.
+ * Resolves directly or via legacy normalization map (e.g. 'sma' -> 'wickra.sma').
+ */
+export function getIndicator(id: string): IndicatorDefinition | undefined {
+  if (registryMap[id]) {
+    return registryMap[id];
+  }
+  const norm = normalizeIndicatorId(id);
+  if (registryMap[norm]) {
+    return registryMap[norm];
+  }
+  return undefined;
+}
+
+/**
+ * Returns all distinct loaded indicator definitions.
+ * Filters out duplicate alias keys to ensure exact count.
+ */
+export function getAllIndicators(): IndicatorDefinition[] {
+  const seen = new Set<string>();
+  const list: IndicatorDefinition[] = [];
+  for (const def of Object.values(registryMap)) {
+    if (def.id === 'wickra.vwap_std_dev_bands') {
+      continue;
+    }
+    if (!seen.has(def.id)) {
+      seen.add(def.id);
+      list.push(def);
+    }
+  }
+  return list;
+}
+
+/**
+ * Returns all distinct indicator categories currently available in the catalog.
+ */
+export function getCategories(): string[] {
+  const set = new Set<string>();
+  for (const def of Object.values(registryMap)) {
+    if (def.catalogCategory) {
+      set.add(def.catalogCategory);
+    } else if (def.category) {
+      set.add(def.category);
+    }
+  }
+  return Array.from(set).sort();
+}
+
+/**
+ * Fetches the complete indicator catalog from the Go backend REST API (GET /api/indicators/catalog).
+ * Deduplicates in-flight requests and notifies subscribers upon completion.
+ */
+export async function fetchCatalog(options?: {
+  force?: boolean;
+  category?: string;
+  query?: string;
+}): Promise<IndicatorDefinition[]> {
+  if (isCatalogLoaded && !options?.force && !options?.category && !options?.query) {
+    return getAllIndicators();
+  }
+
+  if (catalogLoadingPromise && !options?.force) {
+    return catalogLoadingPromise;
+  }
+
+  catalogLoadingPromise = (async () => {
+    try {
+      const params = new URLSearchParams();
+      if (options?.category) params.set('category', options.category);
+      if (options?.query) params.set('q', options.query);
+      const qs = params.toString();
+      const url = `/api/indicators/catalog${qs ? `?${qs}` : ''}`;
+
+      const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error(`Catalog fetch failed with status ${res.status}: ${res.statusText}`);
+      }
+
+      const data: IndicatorCatalogResponse = await res.json();
+      if (data && Array.isArray(data.indicators)) {
+        for (const desc of data.indicators) {
+          const def = descriptorToDefinition(desc);
+          registryMap[def.id] = def;
+          for (const [legacyId, wickraId] of Object.entries(LEGACY_INDICATOR_MAP)) {
+            if (wickraId === def.id) {
+              registryMap[legacyId] = def;
+            }
+          }
+        }
+
+        // Update ALL_INDICATOR_TYPES in-place with distinct canonical IDs
+        ALL_INDICATOR_TYPES.length = 0;
+        ALL_INDICATOR_TYPES.push(...buildDistinctTypes(registryMap));
+        isCatalogLoaded = true;
+
+        // Notify UI subscribers
+        catalogListeners.forEach((fn) => {
+          try {
+            fn();
+          } catch (err) {
+            console.error('[IndicatorCatalog] Listener error:', err);
+          }
+        });
+      }
+    } catch (err) {
+      console.warn('[IndicatorCatalog] Unable to load dynamic catalog, using fallback cache:', err);
+    } finally {
+      catalogLoadingPromise = null;
+    }
+    return getAllIndicators();
+  })();
+
+  return catalogLoadingPromise;
+}
+
+/**
+ * Dynamically registers or updates a user-script indicator in the runtime registry.
+ */
+export function registerCustomIndicator(def: IndicatorDefinition): void {
+  registryMap[def.id] = def;
+  if (!def.id.startsWith('wickra.')) {
+    registryMap[`wickra.${def.id}`] = def;
+  }
+  if (!ALL_INDICATOR_TYPES.includes(def.id)) {
+    ALL_INDICATOR_TYPES.push(def.id);
+  }
+  catalogListeners.forEach((fn) => {
+    try {
+      fn();
+    } catch (err) {
+      console.error('[IndicatorCatalog] Custom indicator registration listener error:', err);
+    }
+  });
+}
+
+// ============================================================================
+// Multi-State & Regime Helpers
+// ============================================================================
+
+/**
+ * List of canonical multi-state indicator IDs.
+ */
+export const MULTI_STATE_INDICATOR_IDS = [
+  'wickra.super_trend',
+  'wickra.t3',
+  'wickra.hma',
+  'wickra.atr_ratchet',
+  'wickra.elder_safe_zone',
+  'wickra.kase_dev_stop',
+  'wickra.modified_ma_stop',
+  'wickra.nrtr',
+] as const;
+
+/**
+ * Determines whether an indicator has trend-dependent or regime-dependent multi-color plots ('up' and 'down').
+ * Accepts an indicator ID string, an IndicatorDefinition, or an IndicatorDescriptor.
+ */
+export function isMultiStateIndicator(
+  target: string | IndicatorDefinition | IndicatorDescriptor | null | undefined
+): boolean {
+  if (!target) return false;
+  if (typeof target === 'string') {
+    const def = getIndicator(target);
+    if (!def) {
+      const norm = normalizeIndicatorId(target);
+      return (MULTI_STATE_INDICATOR_IDS as readonly string[]).includes(norm);
+    }
+    return Boolean(
+      def.plots &&
+      def.plots.some((p) => p.id === 'up') &&
+      def.plots.some((p) => p.id === 'down')
+    );
+  }
+
+  const plots = target.plots;
+  return Boolean(
+    plots &&
+    plots.some((p) => p.id === 'up') &&
+    plots.some((p) => p.id === 'down')
+  );
+}
+
+/**
+ * Retrieves the displayable plot directives for an indicator in user-facing settings.
+ * For multi-state indicators, returns ['up', 'down'] and any user-configured plots,
+ * filtering out internal auxiliary channels ('value', 'direction').
+ */
+export function getDisplayPlots(def: IndicatorDefinition): IndicatorPlotDirective[] {
+  if (!isMultiStateIndicator(def)) {
+    return def.plots;
+  }
+  return def.plots.filter((p) => p.id !== 'value' && p.id !== 'direction');
+}
+
+

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.0] - 2026-11-07
+
+### Added
+- **Wickra WebAssembly Streaming Runtime:**
+  - Integrated pure-Go Wazero WASM runtime executing `wickra.wasm` with O(1) streaming updates in linear memory (~34.8M updates/sec).
+  - Comprehensive suite of 515 indicators across 24 indicator families, completely offloading time-series math from the browser UI thread to the Go backend.
+  - Extended market datafeed models: `TickData`, `DeltaBar`, and `FootprintBar` for real-time bid/ask orderflow delta computation.
+  - New transport endpoints: `GET /api/indicators/catalog` (indicator schema metadata), `POST /api/indicators/eval` (historical batch coordinate calculation), and `/ws/indicators` (live tick streaming coordinate broadcast).
+- **Universal Indicator Connector & Custom Primitives:**
+  - Decoupled `UniversalIndicatorConnector.ts` managing multi-series rendering on `lightweight-charts` v5.
+  - Custom Canvas primitives implementing `ISeriesPrimitive<Time>`:
+    - `BandFillPrimitive`: HiDPI anti-aliased semi-transparent ribbon fills between dynamic bounds (e.g., Bollinger Bands, Keltner Channels, Donchian Channels).
+    - `FootprintPrimitive`: Bid/ask volume cluster footprint and POC (Point of Control) visualization with customizable color gradients.
+  - Support for multi-output indicators rendering combinations of lines, histograms, bands, and signal markers.
+- **Virtualized Indicators Modal & Dynamic Settings:**
+  - Upgraded `IndicatorsModal.tsx` featuring 8 category tabs, instant fuzzy filtering, category badges, and smooth virtualization for 500+ items.
+  - Upgraded `IndicatorSettingsModal.tsx` dynamically rendering configuration inputs (integers, decimals, dropdowns, sources, colors, and line widths) directly driven by backend indicator schemas.
+- **Monaco OrderScript Bottom Drawer & Hermetic Sandbox:**
+  - Integrated docked bottom drawer hosting Monaco Editor with syntax highlighting, auto-completion, and live error diagnostics for custom Python-syntax OrderScript indicators.
+  - Pure-Go hermetic execution sandbox using Google Starlark-Go with builtins for technical analysis (`ta.*`), execution context (`ctx.*`), and plot definitions (`plot.line`, `plot.histogram`, `plot.band`).
+  - Capability-gated security validator restricting access to external networks (`ctx.http`) or IPC (`ctx.ipc`) with explicit permission enforcement.
+  - Local SQLite persistence for custom user indicator scripts in `user_indicators` table.
+
+### Changed
+- **Legacy Indicator Deprecation & Migration:**
+  - Completely deprecated and removed legacy client-side indicator calculation engine (`frontend/src/indicators/calculator.ts`).
+  - Replaced static 19-indicator union with dynamic string identifiers and asynchronous backend catalog querying in `frontend/src/indicators/registry.ts`.
+  - Added deterministic migration mapping in `frontend/src/store/syncStore.ts` automatically migrating legacy saved chart indicators to their corresponding `wickra.*` equivalents without layout loss.
+
+---
+
 ## [0.1.2] - 2026-11-06
 
 ### Added

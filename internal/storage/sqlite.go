@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -45,6 +46,16 @@ type ChartTemplate struct {
 	Name      string `json:"name"`
 	Settings  string `json:"settings"`
 	CreatedAt int64  `json:"created_at"`
+}
+
+type UserIndicator struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Code        string   `json:"code"`
+	Permissions []string `json:"permissions"`
+	CreatedAt   int64    `json:"createdAt"`
+	UpdatedAt   int64    `json:"updatedAt"`
 }
 
 type Storage struct {
@@ -171,6 +182,17 @@ func (s *Storage) initSchema() error {
 		settings TEXT NOT NULL,
 		created_at INTEGER NOT NULL
 	);
+
+	CREATE TABLE IF NOT EXISTS user_indicators (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		description TEXT NOT NULL DEFAULT '',
+		code TEXT NOT NULL,
+		permissions TEXT NOT NULL DEFAULT '[]',
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_user_indicators_updated ON user_indicators (updated_at DESC);
 	`
 	_, err := s.db.Exec(query)
 	if err != nil {
@@ -494,4 +516,89 @@ func (s *Storage) migrateLegacyKeys(ctx context.Context) error {
 	}
 	return nil
 }
+
+// UserIndicator operations
+
+func (s *Storage) GetUserIndicators(ctx context.Context) ([]UserIndicator, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT id, name, description, code, permissions, created_at, updated_at FROM user_indicators ORDER BY updated_at DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []UserIndicator
+	for rows.Next() {
+		var ind UserIndicator
+		var permsJSON string
+		if err := rows.Scan(&ind.ID, &ind.Name, &ind.Description, &ind.Code, &permsJSON, &ind.CreatedAt, &ind.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if permsJSON != "" {
+			_ = json.Unmarshal([]byte(permsJSON), &ind.Permissions)
+		}
+		if ind.Permissions == nil {
+			ind.Permissions = []string{}
+		}
+		result = append(result, ind)
+	}
+	return result, rows.Err()
+}
+
+func (s *Storage) GetUserIndicator(ctx context.Context, id string) (*UserIndicator, error) {
+	var ind UserIndicator
+	var permsJSON string
+	err := s.db.QueryRowContext(ctx, "SELECT id, name, description, code, permissions, created_at, updated_at FROM user_indicators WHERE id = ?", id).
+		Scan(&ind.ID, &ind.Name, &ind.Description, &ind.Code, &permsJSON, &ind.CreatedAt, &ind.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if permsJSON != "" {
+		_ = json.Unmarshal([]byte(permsJSON), &ind.Permissions)
+	}
+	if ind.Permissions == nil {
+		ind.Permissions = []string{}
+	}
+	return &ind, nil
+}
+
+func (s *Storage) SaveUserIndicator(ctx context.Context, ind *UserIndicator) error {
+	now := time.Now().Unix()
+	if ind.ID == "" {
+		ind.ID = fmt.Sprintf("user_ind_%d", time.Now().UnixNano())
+	}
+	if ind.CreatedAt == 0 {
+		ind.CreatedAt = now
+	}
+	ind.UpdatedAt = now
+
+	if ind.Permissions == nil {
+		ind.Permissions = []string{}
+	}
+	permsBytes, err := json.Marshal(ind.Permissions)
+	if err != nil {
+		return fmt.Errorf("failed to marshal permissions: %w", err)
+	}
+
+	query := `
+	INSERT INTO user_indicators (id, name, description, code, permissions, created_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(id) DO UPDATE SET
+		name = excluded.name,
+		description = excluded.description,
+		code = excluded.code,
+		permissions = excluded.permissions,
+		updated_at = excluded.updated_at
+	`
+	_, err = s.db.ExecContext(ctx, query, ind.ID, ind.Name, ind.Description, ind.Code, string(permsBytes), ind.CreatedAt, ind.UpdatedAt)
+	return err
+}
+
+func (s *Storage) DeleteUserIndicator(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, "DELETE FROM user_indicators WHERE id = ?", id)
+	return err
+}
+
 

@@ -1,9 +1,17 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { useSyncStore } from '../../store/syncStore';
-import { INDICATOR_REGISTRY } from '../../indicators/registry';
-import type { IndicatorPlotStyle } from '../../indicators/types';
-import { X, ChevronDown } from 'lucide-react';
+import { INDICATOR_REGISTRY, SOURCE_OPTIONS } from '../../indicators/registry';
+import { normalizeIndicatorId } from '../../indicators/migration';
+import type {
+  IndicatorPlotStyle,
+  IndicatorInputValues,
+  IndicatorInputValue,
+  IndicatorBandStyle,
+  IndicatorLevelStyle,
+  IndicatorPlotType,
+} from '../../indicators/types';
+import { X, ChevronDown, Layers, Sliders, Info, HelpCircle } from 'lucide-react';
 import { ColorPickerPopover } from '../Common/ColorPickerPopover';
 
 type TabType = 'inputs' | 'style' | 'visibility';
@@ -14,59 +22,161 @@ export const IndicatorSettingsModal: React.FC = () => {
   const indicatorsMap = useSyncStore((s) => s.indicators);
   const updateIndicatorInputs = useSyncStore((s) => s.updateIndicatorInputs);
   const updateIndicatorStyles = useSyncStore((s) => s.updateIndicatorStyles);
+  const updateIndicatorBands = useSyncStore((s) => s.updateIndicatorBands);
+  const updateIndicatorLevels = useSyncStore((s) => s.updateIndicatorLevels);
+  const updateIndicatorMeta = useSyncStore((s) => s.updateIndicatorMeta);
 
   const paneId = activeSettings?.paneId ?? '';
   const indicatorId = activeSettings?.indicatorId ?? '';
   const indicator = indicatorsMap[paneId]?.find((ind) => ind.id === indicatorId);
-  const def = indicator ? INDICATOR_REGISTRY[indicator.type] : null;
+  const def = indicator
+    ? INDICATOR_REGISTRY[indicator.type] ||
+      INDICATOR_REGISTRY[normalizeIndicatorId(indicator.type)] ||
+      null
+    : null;
 
   const [activeTab, setActiveTab] = useState<TabType>('inputs');
-  const [localInputs, setLocalInputs] = useState<Record<string, any>>({});
+  const [localInputs, setLocalInputs] = useState<IndicatorInputValues>({});
   const [localStyles, setLocalStyles] = useState<Record<string, IndicatorPlotStyle>>({});
+  const [localBands, setLocalBands] = useState<IndicatorBandStyle[]>([]);
+  const [localLevels, setLocalLevels] = useState<IndicatorLevelStyle[]>([]);
+  const [localPrecision, setLocalPrecision] = useState<string>('default');
+  const [localTimeframe, setLocalTimeframe] = useState<string>('chart');
+  const [localWaitForClose, setLocalWaitForClose] = useState<boolean>(true);
+  const [localLabelsOnPriceScale, setLocalLabelsOnPriceScale] = useState<boolean>(true);
+  const [localValuesInStatusLine, setLocalValuesInStatusLine] = useState<boolean>(true);
+  const [localInputsInStatusLine, setLocalInputsInStatusLine] = useState<boolean>(true);
   const [showTemplateMenu, setShowTemplateMenu] = useState(false);
+  const [plotTypeDropdownPlotId, setPlotTypeDropdownPlotId] = useState<string | null>(null);
 
   // Snapshot original inputs & styles when modal opens to allow instant revert on Cancel
   const originalSnapshotRef = useRef<{
-    inputs: Record<string, any>;
+    inputs: IndicatorInputValues;
     styles: Record<string, IndicatorPlotStyle>;
+    bands?: IndicatorBandStyle[];
+    levels?: IndicatorLevelStyle[];
+    precision?: number | 'default';
+    timeframe?: string;
+    waitForClose?: boolean;
+    showLabelsOnPriceScale?: boolean;
+    showValuesInStatusLine?: boolean;
+    showInputsInStatusLine?: boolean;
   } | null>(null);
 
   // Sync draft when incoming indicator changes or modal opens
   useEffect(() => {
     if (indicator && activeSettings) {
+      // Build robust base styles ensuring all declared plots exist
+      const baseStyles: Record<string, IndicatorPlotStyle> = {};
+      if (def?.defaultStyles) {
+        for (const [k, v] of Object.entries(def.defaultStyles)) {
+          baseStyles[k] = { ...v };
+        }
+      }
+      if (indicator.styles) {
+        for (const [k, v] of Object.entries(indicator.styles)) {
+          baseStyles[k] = { ...v };
+        }
+      }
+
+      // Backfill up/down from legacy plot (value/plot/trend) if indicator was saved with legacy schema
+      const hasUpAndDown = def?.plotLabels && 'up' in def.plotLabels && 'down' in def.plotLabels;
+      if (hasUpAndDown) {
+        const legacy = indicator.styles?.value || indicator.styles?.plot || indicator.styles?.trend;
+        if (!baseStyles.up) {
+          baseStyles.up = {
+            color: legacy?.colorUp || def?.defaultStyles?.up?.color || '#089981',
+            lineWidth: legacy?.lineWidth || def?.defaultStyles?.up?.lineWidth || 2,
+            lineStyle: legacy?.lineStyle || def?.defaultStyles?.up?.lineStyle || 'solid',
+            plotType: legacy?.plotType || def?.defaultStyles?.up?.plotType || 'line',
+            visible: legacy?.visible !== false,
+            lastValueVisible: legacy?.lastValueVisible !== false,
+            priceLineVisible: false,
+          };
+        }
+        if (!baseStyles.down) {
+          baseStyles.down = {
+            color: legacy?.colorDown || def?.defaultStyles?.down?.color || '#f23645',
+            lineWidth: legacy?.lineWidth || def?.defaultStyles?.down?.lineWidth || 2,
+            lineStyle: legacy?.lineStyle || def?.defaultStyles?.down?.lineStyle || 'solid',
+            plotType: legacy?.plotType || def?.defaultStyles?.down?.plotType || 'line',
+            visible: legacy?.visible !== false,
+            lastValueVisible: legacy?.lastValueVisible !== false,
+            priceLineVisible: false,
+          };
+        }
+      }
+
+      // Backfill missing bands or styles in store if indicator was created without them
+      if (!indicator.bands && def?.defaultBands && def.defaultBands.length > 0) {
+        updateIndicatorBands(paneId, indicatorId, def.defaultBands);
+      }
+      if (def?.defaultStyles) {
+        let hasMissingStyles = false;
+        for (const k of Object.keys(def.defaultStyles)) {
+          if (!indicator.styles?.[k]) {
+            hasMissingStyles = true;
+            break;
+          }
+        }
+        if (hasMissingStyles) {
+          updateIndicatorStyles(paneId, indicatorId, baseStyles);
+        }
+      }
+
       const snap = {
-        inputs: JSON.parse(JSON.stringify(indicator.inputs)),
-        styles: JSON.parse(JSON.stringify(indicator.styles)),
+        inputs: JSON.parse(JSON.stringify(indicator.inputs || {})),
+        styles: baseStyles,
+        bands: indicator.bands ? JSON.parse(JSON.stringify(indicator.bands)) : (def?.defaultBands ? JSON.parse(JSON.stringify(def.defaultBands)) : undefined),
+        levels: indicator.levels ? JSON.parse(JSON.stringify(indicator.levels)) : undefined,
+        precision: indicator.precision,
+        timeframe: indicator.timeframe,
+        waitForClose: indicator.waitForClose,
+        showLabelsOnPriceScale: indicator.showLabelsOnPriceScale,
+        showValuesInStatusLine: indicator.showValuesInStatusLine,
+        showInputsInStatusLine: indicator.showInputsInStatusLine,
       };
       originalSnapshotRef.current = snap;
       setLocalInputs(snap.inputs);
       setLocalStyles(snap.styles);
+      setLocalBands(snap.bands || (def?.defaultBands ? JSON.parse(JSON.stringify(def.defaultBands)) : []));
+      const rawLevels = snap.levels || (def?.defaultLevels ? JSON.parse(JSON.stringify(def.defaultLevels)) : []);
+      const effectiveLevels = (rawLevels as IndicatorLevelStyle[]).map((lvl) => {
+        let color = lvl.color;
+        const rawLabel = (lvl.label || '').trim();
+        const isOverbought = /overbought|upper/i.test(rawLabel) || lvl.value === 70 || lvl.value === 80;
+        const isOversold = /oversold|lower/i.test(rawLabel) || lvl.value === 30 || lvl.value === 20;
+        if (!color || color === '#787B86' || color === '#787b86' || color === '#434651') {
+          if (isOverbought) color = '#F23645';
+          else if (isOversold) color = '#089981';
+        }
+        const cleanLabel = rawLabel.replace(/\s*\(\s*[-+]?\d*\.?\d+\s*\)\s*$/, '');
+        return {
+          ...lvl,
+          color,
+          label: cleanLabel || lvl.label,
+        };
+      });
+      setLocalLevels(effectiveLevels);
+      setLocalPrecision(snap.precision !== undefined ? String(snap.precision) : 'default');
+      setLocalTimeframe(snap.timeframe || 'chart');
+      setLocalWaitForClose(snap.waitForClose !== false);
+      setLocalLabelsOnPriceScale(snap.showLabelsOnPriceScale !== false);
+      setLocalValuesInStatusLine(snap.showValuesInStatusLine !== false);
+      setLocalInputsInStatusLine(snap.showInputsInStatusLine !== false);
       setActiveTab('inputs');
+      setShowTemplateMenu(false);
+      setPlotTypeDropdownPlotId(null);
     }
-  }, [indicator?.id, activeSettings?.indicatorId]);
+  }, [indicator?.id, activeSettings?.indicatorId, def?.defaultBands, def?.defaultLevels]);
 
-  // Viewport clamping & position logic (identical to DrawingSettingsModal)
+  // Viewport clamping & position logic
   const modalRef = useRef<HTMLDivElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
 
-  const getClampedPos = (x: number, y: number) => {
-    const modalW = modalRef.current?.offsetWidth || 370;
-    const modalH = modalRef.current?.offsetHeight || 500;
-    const winW = typeof window !== 'undefined' ? window.innerWidth : 1200;
-    const winH = typeof window !== 'undefined' ? window.innerHeight : 800;
-    const minX = 8;
-    const minY = 8;
-    const maxX = Math.max(minX, winW - modalW - 8);
-    const maxY = Math.max(minY, winH - modalH - 8);
-    return {
-      x: Math.max(minX, Math.min(maxX, x)),
-      y: Math.max(minY, Math.min(maxY, y)),
-    };
-  };
-
   const getInitialCenterPos = () => {
-    const w = 370;
-    const h = 500;
+    const w = 380;
+    const h = 520;
     const winW = typeof window !== 'undefined' ? window.innerWidth : 1200;
     const winH = typeof window !== 'undefined' ? window.innerHeight : 800;
     const left = Math.max(8, Math.min(winW - w - 8, Math.round((winW - w) / 2)));
@@ -98,132 +208,127 @@ export const IndicatorSettingsModal: React.FC = () => {
     wasOpenRef.current = isOpen;
   }, [isOpen]);
 
-  // Keep within boundaries on resize
+  // Drag listeners
   useEffect(() => {
     if (!isOpen) return;
-    const clampPos = () => {
-      setPos((prev) => {
-        const clamped = getClampedPos(prev.x, prev.y);
-        if (clamped.x !== prev.x || clamped.y !== prev.y) {
-          currentPosRef.current = clamped;
-          if (modalRef.current) {
-            modalRef.current.style.left = `${clamped.x}px`;
-            modalRef.current.style.top = `${clamped.y}px`;
-          }
-          return clamped;
-        }
-        return prev;
-      });
-    };
-    const timer = setTimeout(clampPos, 20);
-    window.addEventListener('resize', clampPos);
-    return () => {
-      clearTimeout(timer);
-      window.removeEventListener('resize', clampPos);
-    };
-  }, [isOpen]);
 
-  const rafIdRef = useRef<number | null>(null);
-
-  const handleDragStart = (e: React.PointerEvent) => {
-    const target = e.target as HTMLElement;
-    if (
-      target.tagName === 'INPUT' ||
-      target.tagName === 'BUTTON' ||
-      target.tagName === 'SELECT' ||
-      target.closest('button') ||
-      target.closest('input') ||
-      target.closest('select')
-    ) {
-      return;
-    }
-    e.preventDefault();
-    e.stopPropagation();
-    try {
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    } catch {}
-    setIsDragging(true);
-    isDraggingRef.current = true;
-    dragStartMouseRef.current = { x: e.clientX, y: e.clientY };
-    dragStartPosRef.current = { ...currentPosRef.current };
-  };
-
-  // Fluid pointer movement with rAF batching & pointer capture (eliminates lag across monitors)
-  useEffect(() => {
-    if (!isDragging) return;
-    const onMove = (e: PointerEvent) => {
+    const onPointerMove = (e: PointerEvent) => {
       if (!isDraggingRef.current) return;
       const dx = e.clientX - dragStartMouseRef.current.x;
       const dy = e.clientY - dragStartMouseRef.current.y;
-      const clamped = getClampedPos(dragStartPosRef.current.x + dx, dragStartPosRef.current.y + dy);
-      currentPosRef.current = clamped;
-      if (!rafIdRef.current) {
-        rafIdRef.current = requestAnimationFrame(() => {
-          rafIdRef.current = null;
-          if (modalRef.current) {
-            modalRef.current.style.left = `${currentPosRef.current.x}px`;
-            modalRef.current.style.top = `${currentPosRef.current.y}px`;
-          }
-        });
-      }
-    };
+      const nextX = dragStartPosRef.current.x + dx;
+      const nextY = dragStartPosRef.current.y + dy;
 
-    const onUp = (e: PointerEvent) => {
-      if (rafIdRef.current) {
-        cancelAnimationFrame(rafIdRef.current);
-        rafIdRef.current = null;
-      }
-      try {
-        if (headerRef.current && headerRef.current.hasPointerCapture(e.pointerId)) {
-          headerRef.current.releasePointerCapture(e.pointerId);
-        }
-        (e.target as HTMLElement)?.releasePointerCapture?.(e.pointerId);
-      } catch {}
-      isDraggingRef.current = false;
-      setIsDragging(false);
-      setPos({ x: currentPosRef.current.x, y: currentPosRef.current.y });
+      const modalW = modalRef.current?.offsetWidth || 380;
+      const modalH = modalRef.current?.offsetHeight || 520;
+      const winW = window.innerWidth;
+      const winH = window.innerHeight;
+      const clampedX = Math.max(8, Math.min(winW - modalW - 8, nextX));
+      const clampedY = Math.max(8, Math.min(winH - modalH - 8, nextY));
+
+      currentPosRef.current = { x: clampedX, y: clampedY };
       if (modalRef.current) {
-        modalRef.current.style.left = `${currentPosRef.current.x}px`;
-        modalRef.current.style.top = `${currentPosRef.current.y}px`;
+        modalRef.current.style.left = `${clampedX}px`;
+        modalRef.current.style.top = `${clampedY}px`;
       }
     };
 
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
+    const onPointerUp = () => {
+      if (isDraggingRef.current) {
+        isDraggingRef.current = false;
+        setIsDragging(false);
+        setPos(currentPosRef.current);
+      }
+    };
+
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
     return () => {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-      if (rafIdRef.current) {
-        cancelAnimationFrame(rafIdRef.current);
-        rafIdRef.current = null;
-      }
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
     };
-  }, [isDragging]);
+  }, [isOpen]);
 
-  // Live update inputs on chart
-  const handleInputChange = (key: string, value: any) => {
-    const next = { ...localInputs, [key]: value };
+  const handleHeaderPointerDown = (e: React.PointerEvent) => {
+    if ((e.target as HTMLElement).closest('button')) return;
+    isDraggingRef.current = true;
+    setIsDragging(true);
+    dragStartMouseRef.current = { x: e.clientX, y: e.clientY };
+    dragStartPosRef.current = { ...pos };
+  };
+
+  if (!isOpen || !indicator || !def) return null;
+
+  // Real-time live update for instant interactive preview
+  const handleInputChange = (key: string, value: IndicatorInputValue) => {
+    const next: IndicatorInputValues = { ...localInputs, [key]: value };
     setLocalInputs(next);
     updateIndicatorInputs(paneId, indicatorId, next);
   };
 
-  // Live update styles on chart
-  const handleStyleChange = (plotId: string, updates: Partial<IndicatorPlotStyle>) => {
-    const current = localStyles[plotId] || def?.defaultStyles[plotId] || { color: '#2962ff', lineWidth: 2 };
-    const nextPlot = { ...current, ...updates };
-    const nextStyles = { ...localStyles, [plotId]: nextPlot };
+  const handleStyleChange = (plotId: string, partial: Partial<IndicatorPlotStyle>) => {
+    const defaultColor =
+      plotId === 'up' ? '#089981' : plotId === 'down' ? '#f23645' : '#2962ff';
+    const existing = localStyles[plotId] || def?.defaultStyles[plotId] || {
+      color: defaultColor,
+      lineWidth: 2,
+      visible: true,
+      priceLineVisible: false,
+    };
+    const nextStyles: Record<string, IndicatorPlotStyle> = {
+      ...localStyles,
+      [plotId]: { ...existing, ...partial, priceLineVisible: false },
+    };
     setLocalStyles(nextStyles);
     updateIndicatorStyles(paneId, indicatorId, nextStyles);
   };
 
-  // Toggle price scale labels across all plots (does NOT draw horizontal lines across chart)
-  const handleGlobalPriceScaleLabelToggle = (visible: boolean) => {
-    if (!def) return;
+  const handleBandChange = (bandIndex: number, partial: Partial<IndicatorBandStyle>) => {
+    const nextBands = localBands.map((b, idx) =>
+      idx === bandIndex ? { ...b, ...partial } : b
+    );
+    setLocalBands(nextBands);
+    updateIndicatorBands(paneId, indicatorId, nextBands);
+  };
+
+  const handleLevelChange = (levelIndex: number, partial: Partial<IndicatorLevelStyle>) => {
+    const nextLevels = localLevels.map((l, idx) =>
+      idx === levelIndex ? { ...l, ...partial } : l
+    );
+    setLocalLevels(nextLevels);
+    updateIndicatorLevels(paneId, indicatorId, nextLevels);
+  };
+
+  const handleTimeframeChange = (tf: string) => {
+    setLocalTimeframe(tf);
+    updateIndicatorMeta(paneId, indicatorId, { timeframe: tf });
+  };
+
+  const handleWaitForCloseChange = (wait: boolean) => {
+    setLocalWaitForClose(wait);
+    updateIndicatorMeta(paneId, indicatorId, { waitForClose: wait });
+  };
+
+  const handlePrecisionChange = (p: string) => {
+    setLocalPrecision(p);
+    updateIndicatorMeta(paneId, indicatorId, {
+      precision: p === 'default' ? 'default' : parseInt(p, 10),
+    });
+  };
+
+  const handleLabelsOnPriceScaleToggle = (visible: boolean) => {
+    setLocalLabelsOnPriceScale(visible);
+    updateIndicatorMeta(paneId, indicatorId, { showLabelsOnPriceScale: visible });
+    // Also sync to plot styles lastValueVisible
     const nextStyles: Record<string, IndicatorPlotStyle> = {};
     for (const plotId of Object.keys(def.plotLabels)) {
-      const current = localStyles[plotId] || def.defaultStyles[plotId] || { color: '#2962ff', lineWidth: 2 };
+      const existing = localStyles[plotId] || def.defaultStyles[plotId] || {
+        color: '#2962ff',
+        lineWidth: 2,
+        visible: true,
+      };
       nextStyles[plotId] = {
-        ...current,
+        ...existing,
         lastValueVisible: visible,
         priceLineVisible: false,
       };
@@ -232,308 +337,567 @@ export const IndicatorSettingsModal: React.FC = () => {
     updateIndicatorStyles(paneId, indicatorId, nextStyles);
   };
 
-  // Revert changes on cancel
+  const handleValuesInStatusLineToggle = (visible: boolean) => {
+    setLocalValuesInStatusLine(visible);
+    updateIndicatorMeta(paneId, indicatorId, { showValuesInStatusLine: visible });
+  };
+
+  const handleInputsInStatusLineToggle = (visible: boolean) => {
+    setLocalInputsInStatusLine(visible);
+    updateIndicatorMeta(paneId, indicatorId, { showInputsInStatusLine: visible });
+  };
+
+  const handleOk = () => {
+    closeIndicatorSettings();
+  };
+
   const handleCancel = () => {
     if (originalSnapshotRef.current) {
       updateIndicatorInputs(paneId, indicatorId, originalSnapshotRef.current.inputs);
       updateIndicatorStyles(paneId, indicatorId, originalSnapshotRef.current.styles);
+      if (originalSnapshotRef.current.bands) {
+        updateIndicatorBands(paneId, indicatorId, originalSnapshotRef.current.bands);
+      }
+      if (originalSnapshotRef.current.levels) {
+        updateIndicatorLevels(paneId, indicatorId, originalSnapshotRef.current.levels);
+      }
+      updateIndicatorMeta(paneId, indicatorId, {
+        precision: originalSnapshotRef.current.precision,
+        timeframe: originalSnapshotRef.current.timeframe,
+        waitForClose: originalSnapshotRef.current.waitForClose,
+        showLabelsOnPriceScale: originalSnapshotRef.current.showLabelsOnPriceScale,
+        showValuesInStatusLine: originalSnapshotRef.current.showValuesInStatusLine,
+        showInputsInStatusLine: originalSnapshotRef.current.showInputsInStatusLine,
+      });
     }
     closeIndicatorSettings();
   };
 
-  // Confirm changes
-  const handleOk = () => {
-    updateIndicatorInputs(paneId, indicatorId, localInputs);
-    updateIndicatorStyles(paneId, indicatorId, localStyles);
-    closeIndicatorSettings();
-  };
-
-  // Reset to defaults
   const handleApplyDefaults = () => {
-    if (!def) return;
-    const defInp = { ...def.defaultInputs };
-    const defSty = JSON.parse(JSON.stringify(def.defaultStyles));
-    setLocalInputs(defInp);
-    setLocalStyles(defSty);
-    updateIndicatorInputs(paneId, indicatorId, defInp);
-    updateIndicatorStyles(paneId, indicatorId, defSty);
+    setLocalInputs(def.defaultInputs);
+    setLocalStyles(def.defaultStyles);
+    if (def.defaultBands) setLocalBands(def.defaultBands);
+    if (def.defaultLevels) setLocalLevels(def.defaultLevels);
+    setLocalPrecision('default');
+    setLocalTimeframe('chart');
+    setLocalWaitForClose(true);
+    setLocalLabelsOnPriceScale(true);
+    setLocalValuesInStatusLine(true);
+    setLocalInputsInStatusLine(true);
+
+    updateIndicatorInputs(paneId, indicatorId, def.defaultInputs);
+    updateIndicatorStyles(paneId, indicatorId, def.defaultStyles);
+    if (def.defaultBands) updateIndicatorBands(paneId, indicatorId, def.defaultBands);
+    if (def.defaultLevels) updateIndicatorLevels(paneId, indicatorId, def.defaultLevels);
+    updateIndicatorMeta(paneId, indicatorId, {
+      precision: 'default',
+      timeframe: 'chart',
+      waitForClose: true,
+      showLabelsOnPriceScale: true,
+      showValuesInStatusLine: true,
+      showInputsInStatusLine: true,
+    });
     setShowTemplateMenu(false);
   };
 
   const handleSaveAsDefault = () => {
-    if (!def) return;
-    try {
-      localStorage.setItem(
-        `ordercraft_indicator_template_${def.type}`,
-        JSON.stringify({ inputs: localInputs, styles: localStyles })
-      );
-    } catch {}
     setShowTemplateMenu(false);
   };
 
-  // ESC key listener to revert and close
-  useEffect(() => {
-    if (!isOpen) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation();
-        handleCancel();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen]);
+  if (!activeSettings || !indicator || !def) {
+    return null;
+  }
 
-  if (!isOpen || !indicator || !def) return null;
-
-  // Determine if all plots currently show price scale labels
-  const allPriceScaleLabelsVisible = Object.keys(def.plotLabels).every(
-    (plotId) => (localStyles[plotId]?.lastValueVisible ?? true) !== false
-  );
-
-  const availableTabs: TabType[] = ['inputs', 'style', 'visibility'];
+  const modalTitle = def.shortName || def.name;
 
   return createPortal(
     <div
       ref={modalRef}
       style={{
-        left: `${isDragging ? currentPosRef.current.x : pos.x}px`,
-        top: `${isDragging ? currentPosRef.current.y : pos.y}px`,
-        willChange: isDragging ? 'left, top' : 'auto',
-        touchAction: 'none',
+        position: 'fixed',
+        left: `${pos.x}px`,
+        top: `${pos.y}px`,
+        zIndex: 9999,
+        cursor: isDragging ? 'grabbing' : 'default',
       }}
-      onPointerDown={(e) => e.stopPropagation()}
-      onMouseDown={(e) => e.stopPropagation()}
-      onClick={(e) => e.stopPropagation()}
-      onKeyDown={(e) => e.stopPropagation()}
-      className="fixed z-[9999] w-[370px] bg-[#1e222d] border border-[#2a2e39] rounded-lg shadow-2xl flex flex-col overflow-hidden text-[#d1d4dc] select-none animate-in fade-in zoom-in-95 duration-100"
+      className="w-[380px] rounded-xl border border-[#2a2e39] bg-[#1e222d] shadow-2xl overflow-hidden select-none animate-in fade-in zoom-in-95 duration-100 flex flex-col font-sans"
     >
-      {/* Header: Indicator Title + Close Button */}
+      {/* Header — Clean title + X close button (matching Image 6 & 7) */}
       <div
         ref={headerRef}
-        onPointerDown={handleDragStart}
-        onMouseDown={(e) => e.stopPropagation()}
-        className="flex items-center justify-between px-4 py-3 cursor-move border-b border-[#2a2e39]/80 select-none"
+        onPointerDown={handleHeaderPointerDown}
+        className="flex items-center justify-between px-5 pt-4 pb-3 cursor-grab active:cursor-grabbing select-none"
       >
-        <div className="flex items-center space-x-2">
-          <span className="text-base font-semibold text-[#d1d4dc]">{indicator.name}</span>
-        </div>
-
+        <h3 className="text-sm font-bold text-white tracking-wide">{modalTitle}</h3>
         <button
           type="button"
           onClick={handleCancel}
-          className="p-1 rounded hover:bg-[#2a2e39] text-[#787b86] hover:text-[#d1d4dc] transition-colors cursor-pointer"
-          title="Close (Esc)"
+          className="p-1 rounded text-[#787b86] hover:text-white hover:bg-[#2a2e39] transition-colors cursor-pointer"
         >
           <X size={16} />
         </button>
       </div>
 
-      {/* Tabs Bar */}
-      <div className="flex items-center px-4 border-b border-[#2a2e39] space-x-5 text-xs font-medium">
-        {availableTabs.map((tab) => {
+      {/* Navigation Tabs (Inputs | Style | Visibility) */}
+      <div className="flex border-b border-[#2a2e39] px-5 text-xs font-medium text-[#787b86]">
+        {(['inputs', 'style', 'visibility'] as TabType[]).map((tab) => {
           const isActive = activeTab === tab;
+          const label = tab === 'inputs' ? 'Inputs' : tab === 'style' ? 'Style' : 'Visibility';
           return (
             <button
               key={tab}
               type="button"
-              onClick={() => setActiveTab(tab)}
-              className={`py-2.5 capitalize transition-colors relative cursor-pointer ${
-                isActive ? 'text-[#d1d4dc] font-semibold' : 'text-[#787b86] hover:text-[#d1d4dc]'
+              onClick={() => {
+                setActiveTab(tab);
+                setPlotTypeDropdownPlotId(null);
+              }}
+              className={`pb-2.5 px-3 border-b-2 font-medium capitalize transition-colors cursor-pointer mr-2 ${
+                isActive
+                  ? 'border-white text-white font-semibold'
+                  : 'border-transparent hover:text-[#d1d4dc]'
               }`}
             >
-              {tab}
-              {isActive && (
-                <div className="absolute bottom-0 left-0 right-0 h-[2px] bg-[#2962ff] rounded-t-full" />
-              )}
+              {label}
             </button>
           );
         })}
       </div>
 
       {/* Body Content */}
-      <div className="p-4 max-h-[440px] overflow-y-auto space-y-4">
+      <div className="p-5 max-h-[420px] overflow-y-auto space-y-4">
         {/* INPUTS TAB */}
         {activeTab === 'inputs' && (
-          <div className="space-y-3.5">
+          <div className="space-y-4">
             {def.inputSchemas.length === 0 ? (
               <p className="text-xs text-[#787b86] py-6 text-center">
                 This indicator does not require any input parameters.
               </p>
             ) : (
-              def.inputSchemas.map((schema) => (
-                <div key={schema.id} className="flex items-center justify-between gap-4">
-                  <label className="text-xs text-[#d1d4dc] font-normal">{schema.name}</label>
-                  {schema.type === 'number' ? (
-                    <input
-                      type="number"
-                      min={schema.min ?? 1}
-                      max={schema.max ?? 1000}
-                      step={schema.step ?? 1}
-                      value={localInputs[schema.id] ?? schema.default}
-                      onChange={(e) =>
-                        handleInputChange(schema.id, parseFloat(e.target.value) || schema.default)
-                      }
-                      className="w-28 px-2.5 py-1.5 rounded bg-[#131722] border border-[#2a2e39] hover:border-[#363a45] text-xs font-mono text-white text-right focus:outline-none focus:border-[#2962ff]"
-                    />
-                  ) : (
-                    <select
-                      value={localInputs[schema.id] ?? schema.default}
-                      onChange={(e) => handleInputChange(schema.id, e.target.value)}
-                      className="w-36 px-2.5 py-1.5 rounded bg-[#131722] border border-[#2a2e39] hover:border-[#363a45] text-xs text-white focus:outline-none focus:border-[#2962ff] cursor-pointer"
-                    >
-                      {schema.options?.map((opt) => (
-                        <option key={opt.value} value={opt.value}>
-                          {opt.label}
-                        </option>
-                      ))}
-                    </select>
-                  )}
-                </div>
-              ))
+              <div className="space-y-3.5">
+                {def.inputSchemas.map((schema) => {
+                  const rawVal = localInputs[schema.id] ?? schema.default;
+                  const isNumeric =
+                    schema.type === 'integer' ||
+                    schema.type === 'float' ||
+                    schema.type === 'number';
+
+                  // Show info icon for offset, sigma, or parameters with descriptions
+                  const hasInfo =
+                    schema.id === 'offset' ||
+                    schema.id === 'sigma' ||
+                    Boolean(schema.description && schema.description !== schema.name);
+
+                  return (
+                    <div key={schema.id} className="flex items-center justify-between gap-4">
+                      <label className="text-xs text-[#d1d4dc] font-normal">{schema.name}</label>
+                      {isNumeric ? (
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="number"
+                            min={schema.min ?? (schema.type === 'integer' ? 1 : undefined)}
+                            max={schema.max ?? (schema.type === 'integer' ? 1000 : undefined)}
+                            step={schema.step ?? (schema.type === 'integer' ? 1 : 0.01)}
+                            value={Number(rawVal)}
+                            onChange={(e) => {
+                              const num =
+                                schema.type === 'integer'
+                                  ? parseInt(e.target.value, 10)
+                                  : parseFloat(e.target.value);
+                              handleInputChange(
+                                schema.id,
+                                isNaN(num) ? (schema.default as number) : num
+                              );
+                            }}
+                            className="w-24 px-2.5 py-1.5 rounded bg-[#131722] border border-[#2a2e39] hover:border-[#363a45] text-xs font-mono text-white text-right focus:outline-none focus:border-[#2962ff]"
+                          />
+                          {hasInfo && (
+                            <div
+                              title={schema.description || schema.name}
+                              className="text-[#787b86] hover:text-[#d1d4dc] cursor-help"
+                            >
+                              <Info size={13} />
+                            </div>
+                          )}
+                        </div>
+                      ) : schema.type === 'boolean' ? (
+                        <label className="relative inline-flex items-center cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={Boolean(rawVal)}
+                            onChange={(e) => handleInputChange(schema.id, e.target.checked)}
+                            className="rounded border-[#363a45] bg-[#131722] text-[#2962ff] focus:ring-0 cursor-pointer w-4 h-4"
+                          />
+                        </label>
+                      ) : schema.type === 'source' ? (
+                        <select
+                          value={String(rawVal)}
+                          onChange={(e) => handleInputChange(schema.id, e.target.value)}
+                          className="w-32 px-2.5 py-1.5 rounded bg-[#131722] border border-[#2a2e39] hover:border-[#363a45] text-xs text-white focus:outline-none focus:border-[#2962ff] cursor-pointer"
+                        >
+                          {(schema.options && schema.options.length > 0
+                            ? schema.options
+                            : SOURCE_OPTIONS
+                          ).map((opt) => (
+                            <option key={String(opt.value)} value={String(opt.value)}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </select>
+                      ) : schema.type === 'select' ? (
+                        <select
+                          value={String(rawVal)}
+                          onChange={(e) => handleInputChange(schema.id, e.target.value)}
+                          className="w-32 px-2.5 py-1.5 rounded bg-[#131722] border border-[#2a2e39] hover:border-[#363a45] text-xs text-white focus:outline-none focus:border-[#2962ff] cursor-pointer"
+                        >
+                          {schema.options?.map((opt) => (
+                            <option key={String(opt.value)} value={String(opt.value)}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          type="text"
+                          value={String(rawVal)}
+                          onChange={(e) => handleInputChange(schema.id, e.target.value)}
+                          className="w-32 px-2.5 py-1.5 rounded bg-[#131722] border border-[#2a2e39] hover:border-[#363a45] text-xs text-white focus:outline-none focus:border-[#2962ff]"
+                        />
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             )}
+
+            {/* CALCULATION SECTION (Image 6) */}
+            <div className="pt-4 border-t border-[#2a2e39]/60 space-y-3">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-[#787b86]">
+                Calculation
+              </div>
+
+              {/* Timeframe selector */}
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-[#d1d4dc]">Timeframe</span>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={localTimeframe}
+                    onChange={(e) => handleTimeframeChange(e.target.value)}
+                    className="w-28 px-2.5 py-1.5 rounded bg-[#131722] border border-[#2a2e39] hover:border-[#363a45] text-xs text-white focus:outline-none focus:border-[#2962ff] cursor-pointer"
+                  >
+                    <option value="chart">Chart</option>
+                    <option value="1s">1 second</option>
+                    <option value="1m">1 minute</option>
+                    <option value="3m">3 minutes</option>
+                    <option value="5m">5 minutes</option>
+                    <option value="15m">15 minutes</option>
+                    <option value="30m">30 minutes</option>
+                    <option value="1h">1 hour</option>
+                    <option value="2h">2 hours</option>
+                    <option value="4h">4 hours</option>
+                    <option value="1d">1 day</option>
+                    <option value="1w">1 week</option>
+                  </select>
+                  <div
+                    title="Timeframe data used for calculating this indicator"
+                    className="text-[#787b86] hover:text-[#d1d4dc] cursor-help"
+                  >
+                    <HelpCircle size={13} />
+                  </div>
+                </div>
+              </div>
+
+              {/* Wait for timeframe closes */}
+              <label className="flex items-center gap-2.5 cursor-pointer select-none pt-0.5">
+                <input
+                  type="checkbox"
+                  checked={localWaitForClose}
+                  onChange={(e) => handleWaitForCloseChange(e.target.checked)}
+                  className="rounded border-[#363a45] bg-[#131722] text-[#2962ff] focus:ring-0 cursor-pointer w-4 h-4"
+                />
+                <span className="text-xs text-[#d1d4dc]">Wait for timeframe closes</span>
+              </label>
+            </div>
           </div>
         )}
 
-        {/* STYLE TAB */}
+        {/* STYLE TAB (Image 7) */}
         {activeTab === 'style' && (
           <div className="space-y-4">
             {/* Plot Rows */}
             <div className="space-y-3">
-              {Object.entries(def.plotLabels).map(([plotId, label]) => {
-                const style = localStyles[plotId] || def.defaultStyles[plotId] || {
-                  color: '#2962ff',
-                  lineWidth: 2,
-                  visible: true,
-                };
-                const isPlotVisible = style.visible !== false;
-                const isPriceScaleVisible = style.lastValueVisible !== false;
+              {(() => {
+                const hasTrendRegimes = 'up' in def.plotLabels && 'down' in def.plotLabels;
+                const visiblePlotEntries = Object.entries(def.plotLabels).filter(([plotId]) => {
+                  if (hasTrendRegimes && (plotId === 'value' || plotId === 'direction' || plotId === 'plot')) {
+                    return false;
+                  }
+                  return true;
+                });
 
-                const isVolume = indicator.type === 'volume';
-                const isVolPlot = isVolume && plotId === 'vol';
-                const isHistogram = style.plotType === 'histogram' || isVolPlot;
+                return visiblePlotEntries.map(([plotId, label]) => {
+                  const defaultColor =
+                    plotId === 'up' ? '#089981' : plotId === 'down' ? '#f23645' : '#2962ff';
+                  const style = localStyles[plotId] || def.defaultStyles[plotId] || {
+                    color: defaultColor,
+                    lineWidth: 2,
+                    visible: true,
+                    priceLineVisible: false,
+                  };
+                  const isPlotVisible = style.visible !== false;
+                  const isHistogram = style.plotType === 'histogram';
 
-                return (
-                  <div
-                    key={plotId}
-                    className="p-2.5 rounded bg-[#171a22] border border-[#2a2e39] space-y-2.5"
-                  >
-                    <div className="flex items-center justify-between">
-                      <label className="flex items-center gap-2 cursor-pointer select-none">
+                  return (
+                    <div key={plotId} className="flex items-center justify-between py-0.5">
+                      <label className="flex items-center gap-2.5 cursor-pointer select-none">
                         <input
                           type="checkbox"
                           checked={isPlotVisible}
-                          onChange={(e) => {
-                            handleStyleChange(plotId, { visible: e.target.checked });
-                            if (isVolume && plotId === 'ma') {
-                              handleInputChange('showMa', e.target.checked);
-                            }
-                          }}
-                          className="rounded border-[#363a45] bg-[#131722] text-[#2962ff] focus:ring-0 cursor-pointer"
+                          onChange={(e) =>
+                            handleStyleChange(plotId, { visible: e.target.checked })
+                          }
+                          className="rounded border-[#363a45] bg-[#131722] text-[#2962ff] focus:ring-0 cursor-pointer w-4 h-4"
                         />
                         <span className="text-xs font-semibold text-[#d1d4dc]">{label}</span>
                       </label>
 
-                      {/* Color Picker Swatch(es) using global ColorPickerPopover */}
-                      {isVolPlot ? (
+                      {isHistogram ? (
                         <div className="flex items-center gap-2.5">
-                          <div className="flex items-center gap-1.5" title="Up volume (growing)">
+                          <div className="flex items-center gap-1.5" title="Up color">
                             <span className="text-[10px] font-medium text-[#787b86]">Up</span>
                             <ColorPickerPopover
                               color={style.colorUp || style.color || '#089981'}
-                              onChange={(c) => handleStyleChange(plotId, { colorUp: c, color: c })}
-                              title="Up Volume"
+                              onChange={(c) =>
+                                handleStyleChange(plotId, { colorUp: c, color: c })
+                              }
+                              title="Up Color"
                             />
                           </div>
-                          <div className="flex items-center gap-1.5" title="Down volume (falling)">
+                          <div className="flex items-center gap-1.5" title="Down color">
                             <span className="text-[10px] font-medium text-[#787b86]">Down</span>
                             <ColorPickerPopover
                               color={style.colorDown || '#f23645'}
                               onChange={(c) => handleStyleChange(plotId, { colorDown: c })}
-                              title="Down Volume"
+                              title="Down Color"
                             />
                           </div>
                         </div>
                       ) : (
                         <div className="flex items-center gap-2">
+                          {/* Combined Swatch & Line Preview trigger */}
                           <ColorPickerPopover
-                            color={style.color || '#2962ff'}
+                            showLine={true}
+                            color={style.color || defaultColor}
+                            lineWidth={style.lineWidth || 2}
+                            lineStyle={style.lineStyle || 'solid'}
                             onChange={(color) => handleStyleChange(plotId, { color })}
+                            onLineWidthChange={(lineWidth) => handleStyleChange(plotId, { lineWidth })}
+                            onLineStyleChange={(lineStyle) => handleStyleChange(plotId, { lineStyle })}
                             title={label}
                           />
+
+                          {/* Plot Style Selector (~ icon button with dropdown) */}
+                          <div className="relative">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setPlotTypeDropdownPlotId(
+                                  plotTypeDropdownPlotId === plotId ? null : plotId
+                                )
+                              }
+                              className="w-7 h-6 rounded-[3px] border border-[#363a45] hover:border-[#787b86] bg-[#131722] flex items-center justify-center text-[#d1d4dc] hover:text-white transition-colors cursor-pointer"
+                              title="Plot type (Line, Step line, Histogram, Cross, Circles, Area)"
+                            >
+                              <svg className="w-4 h-3.5" viewBox="0 0 20 16" fill="none" stroke="currentColor" strokeWidth="2">
+                                {style.plotType === 'stepline' ? (
+                                  <path d="M2 12h4V8h6V4h6" />
+                                ) : style.plotType === 'histogram' ? (
+                                  <path d="M4 14V8M8 14V4M12 14V6M16 14V10" />
+                                ) : (
+                                  <path d="M2 10c3-5 6-5 9 0s5 5 7 0" />
+                                )}
+                              </svg>
+                            </button>
+
+                            {plotTypeDropdownPlotId === plotId && (
+                              <div className="absolute right-0 top-full mt-1 z-50 bg-[#1e222d] border border-[#2a2e39] rounded-md shadow-2xl py-1 w-32 text-xs">
+                                {[
+                                  { id: 'line', label: 'Line' },
+                                  { id: 'stepline', label: 'Step line' },
+                                  { id: 'histogram', label: 'Histogram' },
+                                  { id: 'cross', label: 'Cross' },
+                                  { id: 'circles', label: 'Circles' },
+                                  { id: 'area', label: 'Area' },
+                                ].map((pt) => (
+                                  <button
+                                    key={pt.id}
+                                    type="button"
+                                    onClick={() => {
+                                      handleStyleChange(plotId, {
+                                        plotType: pt.id as IndicatorPlotType,
+                                      });
+                                      setPlotTypeDropdownPlotId(null);
+                                    }}
+                                    className={`w-full text-left px-3 py-1.5 hover:bg-[#2a2e39] transition-colors cursor-pointer ${
+                                      (style.plotType || 'line') === pt.id
+                                        ? 'text-[#2962ff] font-semibold'
+                                        : 'text-[#d1d4dc]'
+                                    }`}
+                                  >
+                                    {pt.label}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
                         </div>
                       )}
                     </div>
-
-                    {/* Width & Line Style Selector (only for line/non-histogram series) */}
-                    {!isHistogram && (
-                      <div className="flex items-center justify-between pt-0.5">
-                        {/* Width buttons */}
-                        <div className="flex items-center gap-1 bg-[#131722] p-0.5 rounded border border-[#2a2e39]">
-                          {[1, 2, 3, 4].map((w) => (
-                            <button
-                              key={w}
-                              type="button"
-                              onClick={() => handleStyleChange(plotId, { lineWidth: w as 1 | 2 | 3 | 4 })}
-                              className={`px-1.5 py-0.5 text-[10px] rounded font-mono cursor-pointer ${
-                                (style.lineWidth || 1) === w
-                                  ? 'bg-[#2962ff] text-white'
-                                  : 'text-[#787b86] hover:text-white'
-                              }`}
-                            >
-                              {w}px
-                            </button>
-                          ))}
-                        </div>
-
-                        {/* Line style dropdown */}
-                        <select
-                          value={style.lineStyle || 'solid'}
-                          onChange={(e) =>
-                            handleStyleChange(plotId, {
-                              lineStyle: e.target.value as 'solid' | 'dashed' | 'dotted',
-                            })
-                          }
-                          className="px-2 py-0.5 rounded bg-[#131722] border border-[#2a2e39] text-[11px] text-[#d1d4dc] focus:outline-none focus:border-[#2962ff] cursor-pointer"
-                        >
-                          <option value="solid">Solid</option>
-                          <option value="dashed">Dashed</option>
-                          <option value="dotted">Dotted</option>
-                        </select>
-                      </div>
-                    )}
-
-                    {/* Plot-specific Price scale label toggle (Request 4) */}
-                    <div className="flex items-center justify-between pt-1 border-t border-[#2a2e39]/60">
-                      <span className="text-[11px] text-[#787b86]">Price scale label</span>
-                      <label className="relative inline-flex items-center cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={isPriceScaleVisible}
-                          onChange={(e) =>
-                            handleStyleChange(plotId, {
-                              lastValueVisible: e.target.checked,
-                              priceLineVisible: false,
-                            })
-                          }
-                          className="rounded border-[#363a45] bg-[#131722] text-[#2962ff] focus:ring-0 cursor-pointer"
-                        />
-                      </label>
-                    </div>
-                  </div>
-                );
-              })}
+                  );
+                });
+              })()}
             </div>
 
-            {/* Master Price Scale Label Toggle */}
-            <div className="flex items-center justify-between p-2.5 rounded bg-[#171a22] border border-[#2a2e39]">
-              <span className="text-xs font-medium text-[#d1d4dc]">Labels on price scale</span>
-              <input
-                type="checkbox"
-                checked={allPriceScaleLabelsVisible}
-                onChange={(e) => handleGlobalPriceScaleLabelToggle(e.target.checked)}
-                className="rounded border-[#363a45] bg-[#131722] text-[#2962ff] focus:ring-0 cursor-pointer"
-              />
+            {/* Shaded Bands Controls (e.g. Bollinger Bands, Keltner) */}
+            {localBands.length > 0 && (
+              <div className="pt-3 border-t border-[#2a2e39]/60 space-y-2.5">
+                <div className="flex items-center gap-1.5 text-xs font-semibold text-white">
+                  <Layers className="w-3.5 h-3.5 text-[#2962ff]" />
+                  <span>Shaded Bands</span>
+                </div>
+                {localBands.map((band, idx) => (
+                  <div key={band.id || idx} className="flex items-center justify-between">
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={band.visible !== false}
+                        onChange={(e) =>
+                          handleBandChange(idx, { visible: e.target.checked })
+                        }
+                        className="rounded border-[#363a45] bg-[#131722] text-[#2962ff] focus:ring-0 cursor-pointer w-4 h-4"
+                      />
+                      <span className="text-xs text-[#d1d4dc]">{band.title || 'Channel Fill'}</span>
+                    </label>
+                    <ColorPickerPopover
+                      color={band.fillColor || 'rgba(41, 98, 255, 0.2)'}
+                      onChange={(c) => handleBandChange(idx, { fillColor: c })}
+                      title="Band Fill Color"
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Reference Levels Controls (e.g. RSI 70/30) */}
+            {localLevels.length > 0 && (
+              <div className="pt-3 border-t border-[#2a2e39]/60 space-y-2.5">
+                <div className="flex items-center gap-1.5 text-xs font-semibold text-white">
+                  <Sliders className="w-3.5 h-3.5 text-[#089981]" />
+                  <span>Reference Levels</span>
+                </div>
+                {localLevels.map((lvl, idx) => (
+                  <div key={idx} className="flex items-center justify-between gap-2">
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={lvl.visible !== false}
+                        onChange={(e) =>
+                          handleLevelChange(idx, { visible: e.target.checked })
+                        }
+                        className="rounded border-[#363a45] bg-[#131722] text-[#2962ff] focus:ring-0 cursor-pointer w-4 h-4"
+                      />
+                      <span className="text-xs text-[#d1d4dc]">{lvl.label || `Level ${idx + 1}`}</span>
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        value={lvl.value}
+                        onChange={(e) =>
+                          handleLevelChange(idx, { value: parseFloat(e.target.value) || 0 })
+                        }
+                        className="w-16 px-1.5 py-0.5 rounded bg-[#131722] border border-[#2a2e39] text-xs font-mono text-white text-right focus:outline-none focus:border-[#2962ff]"
+                      />
+                      <ColorPickerPopover
+                        showLine={true}
+                        color={lvl.color || '#787b86'}
+                        lineWidth={lvl.lineWidth || 1}
+                        lineStyle={lvl.lineStyle || 'dashed'}
+                        onChange={(c) => handleLevelChange(idx, { color: c })}
+                        onLineWidthChange={(lineWidth) => handleLevelChange(idx, { lineWidth })}
+                        onLineStyleChange={(lineStyle) => handleLevelChange(idx, { lineStyle })}
+                        title={lvl.label || `Level ${idx + 1}`}
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* OUTPUT VALUES SECTION (Image 7) */}
+            <div className="pt-4 border-t border-[#2a2e39]/60 space-y-3">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-[#787b86]">
+                Output Values
+              </div>
+
+              {/* Precision selector */}
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-[#d1d4dc]">Precision</span>
+                <select
+                  value={localPrecision}
+                  onChange={(e) => handlePrecisionChange(e.target.value)}
+                  className="w-28 px-2.5 py-1.5 rounded bg-[#131722] border border-[#2a2e39] hover:border-[#363a45] text-xs text-white focus:outline-none focus:border-[#2962ff] cursor-pointer"
+                >
+                  <option value="default">Default</option>
+                  <option value="0">0</option>
+                  <option value="1">1</option>
+                  <option value="2">2</option>
+                  <option value="3">3</option>
+                  <option value="4">4</option>
+                  <option value="5">5</option>
+                  <option value="6">6</option>
+                  <option value="7">7</option>
+                  <option value="8">8</option>
+                </select>
+              </div>
+
+              {/* Labels on price scale */}
+              <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={localLabelsOnPriceScale}
+                  onChange={(e) => handleLabelsOnPriceScaleToggle(e.target.checked)}
+                  className="rounded border-[#363a45] bg-[#131722] text-[#2962ff] focus:ring-0 cursor-pointer w-4 h-4"
+                />
+                <span className="text-xs text-[#d1d4dc]">Labels on price scale</span>
+              </label>
+
+              {/* Values in status line */}
+              <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={localValuesInStatusLine}
+                  onChange={(e) => handleValuesInStatusLineToggle(e.target.checked)}
+                  className="rounded border-[#363a45] bg-[#131722] text-[#2962ff] focus:ring-0 cursor-pointer w-4 h-4"
+                />
+                <span className="text-xs text-[#d1d4dc]">Values in status line</span>
+              </label>
+            </div>
+
+            {/* INPUT VALUES SECTION (Image 7) */}
+            <div className="pt-4 border-t border-[#2a2e39]/60 space-y-3">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-[#787b86]">
+                Input Values
+              </div>
+
+              {/* Inputs in status line */}
+              <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={localInputsInStatusLine}
+                  onChange={(e) => handleInputsInStatusLineToggle(e.target.checked)}
+                  className="rounded border-[#363a45] bg-[#131722] text-[#2962ff] focus:ring-0 cursor-pointer w-4 h-4"
+                />
+                <span className="text-xs text-[#d1d4dc]">Inputs in status line</span>
+              </label>
             </div>
           </div>
         )}
@@ -553,7 +917,7 @@ export const IndicatorSettingsModal: React.FC = () => {
                   <input
                     type="checkbox"
                     defaultChecked
-                    className="rounded border-[#363a45] bg-[#131722] text-[#2962ff] focus:ring-0 cursor-pointer"
+                    className="rounded border-[#363a45] bg-[#131722] text-[#2962ff] focus:ring-0 cursor-pointer w-4 h-4"
                   />
                   <span>{tf}</span>
                 </label>
@@ -563,21 +927,21 @@ export const IndicatorSettingsModal: React.FC = () => {
         )}
       </div>
 
-      {/* Footer: Defaults dropdown + Cancel / Ok buttons */}
-      <div className="flex items-center justify-between px-4 py-3 border-t border-[#2a2e39] bg-[#1a1d26]">
+      {/* Footer (matching Image 6 & 7) */}
+      <div className="flex items-center justify-between px-5 py-3 border-t border-[#2a2e39] bg-[#171a22]">
         {/* Template / Defaults Menu */}
         <div className="relative">
           <button
             type="button"
             onClick={() => setShowTemplateMenu(!showTemplateMenu)}
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded border border-[#363a45] hover:border-[#787b86] hover:bg-[#2a2e39] text-xs text-[#d1d4dc] transition-colors cursor-pointer"
+            className="flex items-center space-x-1.5 px-3 py-1.5 rounded border border-[#2a2e39] bg-[#1e222d] hover:border-[#363a45] hover:bg-[#2a2e39] text-xs text-[#d1d4dc] transition-colors cursor-pointer"
           >
             <span>Defaults</span>
             <ChevronDown size={13} className="text-[#787b86]" />
           </button>
 
           {showTemplateMenu && (
-            <div className="absolute bottom-full left-0 mb-1 z-50 bg-[#1e222d] border border-[#2a2e39] rounded shadow-2xl py-1 w-44 text-xs">
+            <div className="absolute bottom-full left-0 mb-1.5 z-50 bg-[#1e222d] border border-[#2a2e39] rounded shadow-2xl py-1 w-44 text-xs">
               <button
                 type="button"
                 onClick={handleApplyDefaults}
@@ -601,7 +965,7 @@ export const IndicatorSettingsModal: React.FC = () => {
           <button
             type="button"
             onClick={handleCancel}
-            className="px-3.5 py-1.5 rounded border border-[#363a45] hover:border-[#787b86] hover:bg-[#2a2e39] text-xs text-[#d1d4dc] font-medium transition-colors cursor-pointer"
+            className="px-4 py-1.5 rounded border border-[#2a2e39] bg-[#1e222d] hover:border-[#363a45] hover:bg-[#2a2e39] text-xs text-[#d1d4dc] font-medium transition-colors cursor-pointer"
           >
             Cancel
           </button>

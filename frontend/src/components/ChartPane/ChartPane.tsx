@@ -7,7 +7,6 @@ import {
   LineSeries,
   AreaSeries,
   BaselineSeries,
-  HistogramSeries,
   ColorType,
   CrosshairMode,
   PriceScaleMode,
@@ -20,9 +19,7 @@ import type {
   SeriesType,
   Time,
   CandlestickData,
-  HistogramData,
   WhitespaceData,
-  IPriceLine,
   ITextWatermarkPluginApi,
   TextWatermarkLineOptions,
 } from 'lightweight-charts';
@@ -32,7 +29,7 @@ import { transport } from '../../transport/client';
 import type { Candle } from '../../transport/client';
 import { DrawingCanvas } from './DrawingCanvas';
 import { PriceCountdownPrimitive } from './PriceCountdownPrimitive';
-import { computeIndicator } from '../../indicators/calculator';
+import { UniversalIndicatorConnector, isVolumeIndicatorType } from '../../indicators/UniversalIndicatorConnector';
 import { IndicatorLegend, IndicatorLegendItem } from './IndicatorLegend';
 import type { IndicatorInstance } from '../../indicators/types';
 import { isLightColor } from '../../utils/colorUtils';
@@ -43,7 +40,7 @@ import {
   transformHighLow,
   transformRenko,
 } from '../../utils/barTypeTransformers';
-import { Globe, Clock, ChevronUp, ArrowUp, ArrowDown, Trash2, Minus, Maximize2, Minimize2, ChevronsRight } from 'lucide-react';
+import { Globe, Clock, ChevronUp, ArrowUp, ArrowDown, Trash2, Minus, Maximize2, Minimize2, ChevronsRight, Code } from 'lucide-react';
 import { ChartContextMenu } from '../ContextMenu/ChartContextMenu';
 
 const ObjectTreeModal = React.lazy(() =>
@@ -133,12 +130,6 @@ export function getTimezoneOffsetSeconds(tz: string): number {
   }
 
   return 0;
-}
-
-function getIndicatorLineStyle(style?: 'solid' | 'dashed' | 'dotted'): LineStyle {
-  if (style === 'dashed') return LineStyle.Dashed;
-  if (style === 'dotted') return LineStyle.Dotted;
-  return LineStyle.Solid;
 }
 
 // Format the tick marks directly on the X-axis in the chosen timezone
@@ -436,6 +427,8 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
   const toggleMaximizePane = useSyncStore((s) => s.toggleMaximizePane);
   const isMaximized = useSyncStore((s) => s.maximizedPaneId === paneId);
   const setTimezone = useSyncStore((s) => s.setTimezone);
+  const isBottomDrawerOpen = useSyncStore((s) => s.isBottomDrawerOpen);
+  const toggleBottomDrawer = useSyncStore((s) => s.toggleBottomDrawer);
 
   const symbol = useSyncStore((s) => s.panes[paneId]?.symbol || s.symbol);
   const timeframe = useSyncStore((s) => s.panes[paneId]?.timeframe || s.timeframe);
@@ -623,13 +616,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
       const panes = chart.panes();
       if (currentIdx < panes.length && targetIdx < panes.length) {
         chart.swapPanes(currentIdx, targetIdx);
-        managedIndicatorsRef.current.forEach((entry) => {
-          if (entry.paneIndex === currentIdx) {
-            entry.paneIndex = targetIdx;
-          } else if (entry.paneIndex === targetIdx) {
-            entry.paneIndex = currentIdx;
-          }
-        });
+        indicatorConnectorRef.current?.swapIndicatorPanes(currentIdx, targetIdx);
         setPaneOrder((prev) => {
           const next = [...prev];
           const temp = next[currentIdx];
@@ -654,13 +641,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
       const panes = chart.panes();
       if (currentIdx < panes.length && targetIdx < panes.length) {
         chart.swapPanes(currentIdx, targetIdx);
-        managedIndicatorsRef.current.forEach((entry) => {
-          if (entry.paneIndex === currentIdx) {
-            entry.paneIndex = targetIdx;
-          } else if (entry.paneIndex === targetIdx) {
-            entry.paneIndex = currentIdx;
-          }
-        });
+        indicatorConnectorRef.current?.swapIndicatorPanes(currentIdx, targetIdx);
         setPaneOrder((prev) => {
           const next = [...prev];
           const temp = next[currentIdx];
@@ -938,346 +919,26 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
     []
   );
 
-  const managedIndicatorsRef = useRef<
-    Map<
-      string,
-      {
-        instanceId: string;
-        paneIndex: number;
-        series: Map<string, ISeriesApi<SeriesType, Time>>;
-        priceLines: IPriceLine[];
-      }
-    >
-  >(new Map());
+  const indicatorConnectorRef = useRef<UniversalIndicatorConnector | null>(null);
 
-  const syncIndicators = useCallback((candles: Candle[]) => {
-    const chart = chartApiRef.current;
-    if (!chart || candles.length === 0) return;
+  const syncIndicators = useCallback(
+    (candles: Candle[]) => {
+      const chart = chartApiRef.current;
+      if (!chart || candles.length === 0 || !indicatorConnectorRef.current) return;
 
-    const currentIndicators = indicatorsRef.current;
-    const managed = managedIndicatorsRef.current;
+      indicatorConnectorRef.current.syncIndicators(
+        indicatorsRef.current,
+        candles,
+        paneOrder,
+        chartSettingsRef.current,
+        customStretchFactorsRef.current,
+        chartContainerRef.current
+      );
+      requestAnimationFrame(updatePaneOffsets);
+    },
+    [paneOrder, updatePaneOffsets]
+  );
 
-    // 1. Remove deleted indicators
-    const currentIds = new Set(currentIndicators.map((ind) => ind.id));
-    for (const [id, entry] of Array.from(managed.entries())) {
-      if (!currentIds.has(id)) {
-        for (const line of entry.priceLines) {
-          const firstSeries = Array.from(entry.series.values())[0];
-          if (firstSeries) {
-            try {
-              firstSeries.removePriceLine(line);
-            } catch {}
-          }
-        }
-        for (const s of Array.from(entry.series.values())) {
-          try {
-            chart.removeSeries(s);
-          } catch {}
-        }
-        managed.delete(id);
-      }
-    }
-
-    // 2. Determine pane assignments using paneOrder
-    const currentSubpaneIds = new Set(
-      currentIndicators.filter((i) => i.category === 'subpane').map((i) => i.id)
-    );
-    let nextOrder = paneOrder.filter(
-      (id) => id === 'main' || currentSubpaneIds.has(id)
-    );
-    if (!nextOrder.includes('main')) {
-      nextOrder = ['main', ...nextOrder];
-    }
-    for (const ind of currentIndicators) {
-      if (ind.category === 'subpane' && !nextOrder.includes(ind.id)) {
-        nextOrder.push(ind.id);
-      }
-    }
-
-    const requiredPanes = nextOrder.length;
-    let panesChanged = false;
-    try {
-      const existingPanes = chart.panes();
-      for (let i = existingPanes.length - 1; i >= 0; i--) {
-        if (chart.panes().length > requiredPanes && existingPanes[i].getSeries().length === 0) {
-          chart.removePane(i);
-          panesChanged = true;
-        }
-      }
-      while (chart.panes().length < requiredPanes) {
-        chart.addPane();
-        panesChanged = true;
-      }
-      while (chart.panes().length > requiredPanes && chart.panes().length > 1) {
-        chart.removePane(chart.panes().length - 1);
-        panesChanged = true;
-      }
-      chart.panes().forEach((_, pIdx) => {
-        chart.priceScale('right', pIdx).applyOptions({
-          textColor: chartSettingsRef.current.scalesTextColor || '#787b86',
-          borderColor: chartSettingsRef.current.scalesLineColor || '#2a2e39',
-        });
-      });
-
-      if (panesChanged) {
-        const curPanes = chart.panes();
-        if (curPanes.length > 1) {
-          curPanes[0].setStretchFactor(customStretchFactorsRef.current['main'] ?? 75);
-          const subCount = curPanes.length - 1;
-          for (let p = 1; p < curPanes.length; p++) {
-            const indId = nextOrder[p];
-            const saved = indId ? customStretchFactorsRef.current[indId] : undefined;
-            curPanes[p].setStretchFactor(saved ?? Math.round(25 / subCount));
-          }
-          const cont = chartContainerRef.current;
-          if (cont) {
-            chart.applyOptions({ width: cont.clientWidth, height: cont.clientHeight });
-          }
-        }
-      }
-    } catch (err) {
-      console.warn('Pane adjustment error:', err);
-    }
-
-    const mainVIdx = nextOrder.indexOf('main') !== -1 ? nextOrder.indexOf('main') : 0;
-    const paneAssignment = new Map<string, number>();
-    for (const ind of currentIndicators) {
-      if (ind.category === 'overlay') {
-        paneAssignment.set(ind.id, mainVIdx);
-      } else {
-        const vIdx = nextOrder.indexOf(ind.id);
-        paneAssignment.set(ind.id, vIdx !== -1 ? vIdx : 1);
-      }
-    }
-
-    // 3. For each active indicator, compute and update series
-    const newLatestValues: Record<string, Record<string, number | null>> = {};
-
-    for (const ind of currentIndicators) {
-      const targetPane = paneAssignment.get(ind.id) ?? mainVIdx;
-      let entry = managed.get(ind.id);
-
-      if (!entry || entry.paneIndex !== targetPane) {
-        if (entry) {
-          for (const s of Array.from(entry.series.values())) {
-            try {
-              chart.removeSeries(s);
-            } catch {}
-          }
-        }
-        entry = {
-          instanceId: ind.id,
-          paneIndex: targetPane,
-          series: new Map(),
-          priceLines: [],
-        };
-        managed.set(ind.id, entry);
-      }
-
-      // Compute plots
-      const calcResult = computeIndicator(ind.type, candles, ind.inputs);
-      newLatestValues[ind.id] = {};
-
-      for (const [plotId, plotData] of Object.entries(calcResult.plots)) {
-        const style = ind.styles[plotId];
-        const isVisible = ind.visible && (style ? style.visible !== false : true);
-        const isHistogram = style?.plotType === 'histogram';
-        const showPriceScale = style?.lastValueVisible !== false;
-
-        const isVolumeIndicator = ind.type === 'volume';
-        const priceScaleId = targetPane === mainVIdx ? (isVolumeIndicator ? 'overlay_volume' : 'right') : 'right';
-
-        let seriesApi = entry.series.get(plotId);
-        if (!seriesApi) {
-          try {
-            if (isHistogram) {
-              seriesApi = chart.addSeries(
-                HistogramSeries,
-                {
-                  color: style?.color || '#089981',
-                  priceFormat: isVolumeIndicator ? { type: 'volume' } : undefined,
-                  priceScaleId,
-                  visible: isVisible,
-                  lastValueVisible: showPriceScale,
-                  priceLineVisible: false,
-                },
-                targetPane
-              );
-              if (targetPane === mainVIdx && isVolumeIndicator) {
-                seriesApi.priceScale().applyOptions({
-                  scaleMargins: {
-                    top: 0.8,
-                    bottom: 0,
-                  },
-                });
-              }
-              seriesApi.priceScale().applyOptions({
-                textColor: chartSettingsRef.current.scalesTextColor || '#787b86',
-                borderColor: chartSettingsRef.current.scalesLineColor || '#2a2e39',
-              });
-            } else {
-              seriesApi = chart.addSeries(
-                LineSeries,
-                {
-                  color: style?.color || '#2962ff',
-                  lineWidth: (style?.lineWidth || 2) as 1 | 2 | 3 | 4,
-                  lineStyle: getIndicatorLineStyle(style?.lineStyle),
-                  lineType: style?.plotType === 'stepline' ? LineType.WithSteps : LineType.Simple,
-                  pointMarkersVisible: style?.plotType === 'circles' || style?.plotType === 'cross',
-                  pointMarkersRadius: 3,
-                  crosshairMarkerVisible: false,
-                  priceScaleId,
-                  priceFormat: isVolumeIndicator ? { type: 'volume' } : undefined,
-                  visible: isVisible,
-                  lastValueVisible: showPriceScale,
-                  priceLineVisible: Boolean(style?.priceLineVisible),
-                },
-                targetPane
-              );
-              if (targetPane === mainVIdx && isVolumeIndicator) {
-                seriesApi.priceScale().applyOptions({
-                  scaleMargins: {
-                    top: 0.8,
-                    bottom: 0,
-                  },
-                });
-              }
-              seriesApi.priceScale().applyOptions({
-                textColor: chartSettingsRef.current.scalesTextColor || '#787b86',
-                borderColor: chartSettingsRef.current.scalesLineColor || '#2a2e39',
-              });
-            }
-            entry.series.set(plotId, seriesApi);
-          } catch (err) {
-            console.warn(`Failed to create series for ${ind.id}:${plotId}:`, err);
-            continue;
-          }
-        } else {
-          try {
-            if (isHistogram) {
-              seriesApi.applyOptions({
-                color: style?.color || '#089981',
-                visible: isVisible,
-                lastValueVisible: showPriceScale,
-                priceLineVisible: false,
-              });
-              if (targetPane === mainVIdx && isVolumeIndicator) {
-                seriesApi.priceScale().applyOptions({
-                  scaleMargins: {
-                    top: 0.8,
-                    bottom: 0,
-                  },
-                });
-              }
-              seriesApi.priceScale().applyOptions({
-                textColor: chartSettingsRef.current.scalesTextColor || '#787b86',
-                borderColor: chartSettingsRef.current.scalesLineColor || '#2a2e39',
-              });
-            } else {
-              seriesApi.applyOptions({
-                color: style?.color || '#2962ff',
-                lineWidth: (style?.lineWidth || 2) as 1 | 2 | 3 | 4,
-                lineStyle: getIndicatorLineStyle(style?.lineStyle),
-                lineType: style?.plotType === 'stepline' ? LineType.WithSteps : LineType.Simple,
-                pointMarkersVisible: style?.plotType === 'circles' || style?.plotType === 'cross',
-                crosshairMarkerVisible: false,
-                visible: isVisible,
-                lastValueVisible: showPriceScale,
-                priceLineVisible: Boolean(style?.priceLineVisible),
-              });
-              if (targetPane === mainVIdx && isVolumeIndicator) {
-                seriesApi.priceScale().applyOptions({
-                  scaleMargins: {
-                    top: 0.8,
-                    bottom: 0,
-                  },
-                });
-              }
-              seriesApi.priceScale().applyOptions({
-                textColor: chartSettingsRef.current.scalesTextColor || '#787b86',
-                borderColor: chartSettingsRef.current.scalesLineColor || '#2a2e39',
-              });
-            }
-          } catch {}
-        }
-
-        // Set data on series
-        if (isHistogram) {
-          const colorUp = style?.colorUp || style?.color || '#089981';
-          const colorDown = style?.colorDown || '#f23645';
-          const candleMap = new Map<number, Candle>();
-          for (let i = 0; i < candles.length; i++) {
-            candleMap.set(candles[i].time, candles[i]);
-          }
-          const histData: HistogramData<Time>[] = plotData.map((pt) => {
-            const candle = candleMap.get(pt.time);
-            const isUp = candle ? candle.close >= candle.open : true;
-            return {
-              time: pt.time as Time,
-              value: pt.value,
-              color: isUp ? colorUp : colorDown,
-            };
-          });
-          seriesApi.setData(histData);
-        } else {
-          const lineData = plotData.map((pt) => ({
-            time: pt.time as Time,
-            value: pt.value,
-            color: pt.color || style?.color,
-          }));
-          seriesApi.setData(lineData);
-        }
-
-        const lastPt = plotData[plotData.length - 1];
-        newLatestValues[ind.id][plotId] = lastPt ? lastPt.value : null;
-      }
-
-      // Manage levels
-      if (ind.levels && ind.levels.length > 0) {
-        const firstSeries = Array.from(entry.series.values())[0];
-        if (firstSeries) {
-          if (entry.priceLines.length === 0) {
-            for (const lvl of ind.levels) {
-              if (lvl.visible !== false) {
-                try {
-                  const pl = firstSeries.createPriceLine({
-                    price: lvl.value,
-                    color: lvl.color,
-                    lineWidth: (lvl.lineWidth || 1) as 1 | 2 | 3 | 4,
-                    lineStyle: getIndicatorLineStyle(lvl.lineStyle),
-                    axisLabelVisible: true,
-                    title: lvl.label || `${lvl.value}`,
-                    axisLabelTextColor: chartSettingsRef.current.scalesTextColor || '#d1d4dc',
-                  });
-                  entry.priceLines.push(pl);
-                } catch {}
-              }
-            }
-          } else {
-            entry.priceLines.forEach((pl, lIdx) => {
-              const lvl = ind.levels?.[lIdx];
-              if (lvl) {
-                try {
-                  pl.applyOptions({
-                    price: lvl.value,
-                    color: lvl.color,
-                    lineWidth: (lvl.lineWidth || 1) as 1 | 2 | 3 | 4,
-                    lineStyle: getIndicatorLineStyle(lvl.lineStyle),
-                    axisLabelVisible: lvl.visible !== false,
-                    title: lvl.label || `${lvl.value}`,
-                    axisLabelTextColor: chartSettingsRef.current.scalesTextColor || '#d1d4dc',
-                  });
-                } catch {}
-              }
-            });
-          }
-        }
-      }
-    }
-
-    setIndicatorLatestValues(newLatestValues);
-    requestAnimationFrame(updatePaneOffsets);
-  }, [paneOrder, updatePaneOffsets]);
 
   useEffect(() => {
     if (candlesRef.current.length > 0) {
@@ -2078,7 +1739,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
           top: (chartSettings.marginScaleTop ?? 10) / 100,
           bottom: (chartSettings.marginScaleBottom ?? 8) / 100,
         },
-        autoScale: false,
+        autoScale: true,
       },
       timeScale: {
         borderColor: chartSettings.scalesLineColor || '#2a2e39',
@@ -2107,6 +1768,21 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
     if (wrapperRef.current) {
       (wrapperRef.current as any).__chart = chart;
     }
+
+    indicatorConnectorRef.current = new UniversalIndicatorConnector(
+      chart,
+      paneId,
+      symbol,
+      timeframe,
+      {
+        onLatestValuesChange: (vals) => {
+          setIndicatorLatestValues(vals);
+        },
+        onPanesAdjusted: () => {
+          requestAnimationFrame(updatePaneOffsets);
+        },
+      }
+    );
 
     // Initialize professional lightweight-charts v5 text watermark on first pane
     const firstPane = chart.panes()[0];
@@ -2240,7 +1916,8 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
 
     const checkAutoScale = () => {
       try {
-        const curAuto = chart.priceScale('right').options().autoScale ?? false;
+        const mainVIdx = paneOrderRef.current.indexOf('main') !== -1 ? paneOrderRef.current.indexOf('main') : 0;
+        const curAuto = chart.priceScale('right', mainVIdx).options().autoScale ?? false;
         setIsAutoScale((prev) => (prev !== curAuto ? curAuto : prev));
       } catch {
         // chart may have been destroyed
@@ -2253,7 +1930,8 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
 
     // Crosshair move HUD update & dynamic price Y tracker
     chart.subscribeCrosshairMove((param) => {
-      const curAuto = chart.priceScale('right').options().autoScale ?? false;
+      const mainVIdx = paneOrderRef.current.indexOf('main') !== -1 ? paneOrderRef.current.indexOf('main') : 0;
+      const curAuto = chart.priceScale('right', mainVIdx).options().autoScale ?? false;
       setIsAutoScale((prev) => (prev !== curAuto ? curAuto : prev));
       const isCrosshairLocked = useSyncStore.getState().crosshairLock;
 
@@ -2337,24 +2015,11 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
             changePercent,
           });
 
-          // Extract hovered indicator values from seriesData for this candle
-          const currentIndicators = indicatorsRef.current;
-          const managed = managedIndicatorsRef.current;
-          const hoveredVals: Record<string, Record<string, number | null>> = {};
-          for (const ind of currentIndicators) {
-            const entry = managed.get(ind.id);
-            if (!entry) continue;
-            hoveredVals[ind.id] = {};
-            for (const [plotId, sApi] of entry.series.entries()) {
-              const sData = param.seriesData.get(sApi);
-              if (sData && 'value' in sData && typeof (sData as any).value === 'number' && !isNaN((sData as any).value)) {
-                hoveredVals[ind.id][plotId] = (sData as any).value;
-              } else {
-                hoveredVals[ind.id][plotId] = null;
-              }
-            }
+          // Extract hovered indicator values for this candle
+          if (indicatorConnectorRef.current) {
+            const hoveredVals = indicatorConnectorRef.current.getValuesAtTime(candleData.time);
+            setHoveredIndicatorValues(hoveredVals);
           }
-          setHoveredIndicatorValues(hoveredVals);
         } else {
           lastHoveredBarTime = null;
           setHoveredOHLC(null);
@@ -2467,6 +2132,10 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
           watermarkRef.current.detach();
         } catch {}
         watermarkRef.current = null;
+      }
+      if (indicatorConnectorRef.current) {
+        indicatorConnectorRef.current.destroy();
+        indicatorConnectorRef.current = null;
       }
       chart.remove();
       chartApiRef.current = null;
@@ -2698,10 +2367,17 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
 
       // Explicitly update all pane price scales to ensure instant redraw across all indicator subpanes
       const allPanes = chartApiRef.current.panes();
+      const mainVIdx = paneOrderRef.current.indexOf('main') !== -1 ? paneOrderRef.current.indexOf('main') : 0;
       allPanes.forEach((_, pIdx) => {
         chartApiRef.current?.priceScale('right', pIdx).applyOptions({
           textColor: chartSettings.scalesTextColor || '#787b86',
           borderColor: chartSettings.scalesLineColor || '#2a2e39',
+          ...(pIdx !== mainVIdx
+            ? {
+                autoScale: true,
+                scaleMargins: { top: 0.1, bottom: 0.1 },
+              }
+            : {}),
         });
       });
       timeScale.applyOptions({
@@ -2709,15 +2385,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
       });
 
       // Synchronize indicator level axis labels text color
-      managedIndicatorsRef.current.forEach((entry) => {
-        entry.priceLines.forEach((pl) => {
-          try {
-            pl.applyOptions({
-              axisLabelTextColor: chartSettings.scalesTextColor || '#d1d4dc',
-            });
-          } catch {}
-        });
-      });
+      indicatorConnectorRef.current?.updateChartSettings(chartSettings);
 
       // Only update scaleMargins if the margin percentages specifically changed
       if (
@@ -2725,7 +2393,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
         (prev.marginScaleTop !== chartSettings.marginScaleTop ||
           prev.marginScaleBottom !== chartSettings.marginScaleBottom)
       ) {
-        chartApiRef.current.priceScale('right').applyOptions({
+        chartApiRef.current.priceScale('right', mainVIdx).applyOptions({
           scaleMargins: {
             top: (chartSettings.marginScaleTop ?? 10) / 100,
             bottom: (chartSettings.marginScaleBottom ?? 8) / 100,
@@ -2802,9 +2470,11 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
       from: count - visibleCount,
       to: count + 5,
     });
+    const mainVIdx = paneOrderRef.current.indexOf('main') !== -1 ? paneOrderRef.current.indexOf('main') : 0;
     chartApiRef.current.panes().forEach((_, pIdx) => {
       chartApiRef.current?.priceScale('right', pIdx).applyOptions({
         autoScale: true,
+        ...(pIdx !== mainVIdx ? { scaleMargins: { top: 0.1, bottom: 0.1 } } : {}),
       });
     });
     setIsAutoScale(true);
@@ -2813,7 +2483,8 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
   // Toggle Auto price scale
   const toggleAutoScale = () => {
     if (!chartApiRef.current) return;
-    const curAuto = chartApiRef.current.priceScale('right').options().autoScale ?? false;
+    const mainVIdx = paneOrderRef.current.indexOf('main') !== -1 ? paneOrderRef.current.indexOf('main') : 0;
+    const curAuto = chartApiRef.current.priceScale('right', mainVIdx).options().autoScale ?? false;
     const nextAuto = !curAuto;
     if (nextAuto) {
       if (candlesRef.current.length > 0) {
@@ -2824,16 +2495,19 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
           to: count + 5,
         });
       }
-      chartApiRef.current.priceScale('right').applyOptions({
-        autoScale: true,
+      chartApiRef.current.panes().forEach((_, pIdx) => {
+        chartApiRef.current?.priceScale('right', pIdx).applyOptions({
+          autoScale: true,
+          ...(pIdx !== mainVIdx ? { scaleMargins: { top: 0.1, bottom: 0.1 } } : {}),
+        });
       });
       setIsAutoScale(true);
     } else {
-      const range = chartApiRef.current.priceScale('right').getVisibleRange();
+      const range = chartApiRef.current.priceScale('right', mainVIdx).getVisibleRange();
       if (range) {
-        chartApiRef.current.priceScale('right').setVisibleRange(range);
+        chartApiRef.current.priceScale('right', mainVIdx).setVisibleRange(range);
       } else {
-        chartApiRef.current.priceScale('right').applyOptions({
+        chartApiRef.current.priceScale('right', mainVIdx).applyOptions({
           autoScale: false,
         });
       }
@@ -2922,6 +2596,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
 
         applyChartTypeDataRef.current(chartTypeRef.current, candles);
         updateFutureWhitespace(candles, timeframe, 300);
+        indicatorConnectorRef.current?.updateContext(symbol, timeframe);
         syncIndicators(candles);
 
         const detectedDecimals = detectPrecisionFromCandles(candles, symbol);
@@ -2942,7 +2617,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
         prevLoadedTimeframeRef.current = timeframe;
         isInitialCandlesLoadedRef.current = true;
 
-        // Position viewport to keep last price visible and set manual price range without autoScale
+        // Position viewport to keep last price visible and ensure autoScale is cleanly active
         if (isFirstLoad || isSymbolChange || isTimeframeChange) {
           if (candles.length > 0 && chartApiRef.current) {
             const count = candles.length;
@@ -2952,23 +2627,15 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
               to: count + 5,
             });
 
-            // Directly compute visible candles min/max and set manual visible range with margins
-            const visibleCandles = candles.slice(Math.max(0, count - visibleCount));
-            let minPrice = Infinity;
-            let maxPrice = -Infinity;
-            for (const c of visibleCandles) {
-              if (c.low < minPrice) minPrice = c.low;
-              if (c.high > maxPrice) maxPrice = c.high;
-            }
-            if (minPrice !== Infinity && maxPrice !== -Infinity) {
-              const span = maxPrice - minPrice || 1;
-              const topMargin = (chartSettings.marginScaleTop ?? 10) / 100;
-              const bottomMargin = (chartSettings.marginScaleBottom ?? 8) / 100;
-              const from = minPrice - span * bottomMargin;
-              const to = maxPrice + span * topMargin;
-              chartApiRef.current.priceScale('right').setVisibleRange({ from, to });
-              setIsAutoScale(false);
-            }
+            const mainVIdx = paneOrderRef.current.indexOf('main') !== -1 ? paneOrderRef.current.indexOf('main') : 0;
+            chartApiRef.current.priceScale('right', mainVIdx).applyOptions({
+              autoScale: true,
+              scaleMargins: {
+                top: (chartSettings.marginScaleTop ?? 10) / 100,
+                bottom: (chartSettings.marginScaleBottom ?? 8) / 100,
+              },
+            });
+            setIsAutoScale(true);
           }
         }
 
@@ -3092,6 +2759,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
                   high: Math.max(arr[idx].high, liveCandle.high),
                   low: Math.min(arr[idx].low, liveCandle.low),
                   close: liveCandle.close,
+                  volume: Math.max(arr[idx].volume || 0, liveCandle.volume ?? 0),
                 };
                 scheduleCandlesUpdate();
                 // NOTE: Do NOT call candleSeries.update() for bars older than the series tip!
@@ -3103,11 +2771,9 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
 
             if (lastBar.time === bucketTime) {
               const liveVol = liveCandle.volume ?? 0;
-              // Candle volume can only increase or stay the same — it must never decrease.
-              const newVolume =
-                liveCandle.time === lastBar.time
-                  ? Math.max(lastBar.volume || 0, liveVol)
-                  : (lastBar.volume || 0) + liveVol;
+              // Candle volume from provider is the bar's cumulative volume.
+              // It must be at least the existing bar's volume and never decrease.
+              const newVolume = Math.max(lastBar.volume || 0, liveVol);
 
               aggregatedCandle = {
                 time: bucketTime,
@@ -3195,7 +2861,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
             });
 
             if (indicatorsRef.current.length > 0) {
-              syncIndicators(candlesRef.current);
+              indicatorConnectorRef.current?.updateRealtimeCandle(aggregatedCandle);
             }
           };
 
@@ -3744,7 +3410,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
               .map((ind) => {
                 const values = displayIndicatorValues?.[ind.id] || {};
                 const inputsStr =
-                  ind.type === 'volume'
+                  isVolumeIndicatorType(ind.type)
                     ? ind.inputs?.showMa
                       ? String(ind.inputs.maLength || 20)
                       : ''
@@ -3794,7 +3460,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
                           const color = style?.color || '#2962ff';
                           const formatted =
                             val !== null && val !== undefined && !isNaN(val)
-                              ? ind.type === 'volume' && plotKey === 'vol'
+                              ? isVolumeIndicatorType(ind.type) && plotKey === 'vol'
                                 ? Math.abs(val) >= 1_000_000
                                   ? (val / 1_000_000).toFixed(2) + 'M'
                                   : Math.abs(val) >= 1_000
@@ -3985,6 +3651,23 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
 
         {/* Right: Scale Toggles, Timezone Selector & Live Clock */}
         <div className="flex items-center space-x-2">
+          {/* OrderScript Editor Quick Toggle */}
+          <button
+            onClick={toggleBottomDrawer}
+            className={`flex items-center space-x-1 px-2 py-0.5 rounded text-[10px] transition-colors cursor-pointer ${
+              isBottomDrawerOpen
+                ? 'bg-[#2962ff]/20 text-[#2962ff] font-medium'
+                : 'hover:bg-[#1e222d] text-[#787b86] hover:text-[#d1d4dc]'
+            }`}
+            title="Toggle OrderScript Editor (Python / Starlark) [Beta]"
+          >
+            <Code size={11} className={isBottomDrawerOpen ? 'text-[#2962ff]' : 'text-[#787b86]'} />
+            <span className="text-[8px] font-bold px-1 py-0.2 bg-[#2962ff]/20 text-[#2962ff] rounded border border-[#2962ff]/30 leading-none">Beta</span>
+            <span>OrderScript</span>
+          </button>
+
+          <span className="text-[#2a2e39]">•</span>
+
           {/* Scale controls */}
           <div className="flex items-center space-x-1">
             <button

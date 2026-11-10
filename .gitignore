@@ -60,6 +60,7 @@ CLAUDE.md
 .cursor/
 .claude/
 .windsurf/
+.agents/
 
 # Internal migration & planning docs (never commit)
 docs/migration-klinecharts.md

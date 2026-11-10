@@ -24,6 +24,9 @@ const IndicatorsModal = React.lazy(() =>
 const IndicatorSettingsModal = React.lazy(() =>
   import('./components/Modals/IndicatorSettingsModal').then((m) => ({ default: m.IndicatorSettingsModal }))
 );
+const ScriptEditorDrawer = React.lazy(() =>
+  import('./components/BottomDrawer/ScriptEditorDrawer').then((m) => ({ default: m.ScriptEditorDrawer }))
+);
 
 export const App: React.FC = () => {
   const isObjectTreeOpen = useSyncStore((s) => s.isObjectTreeOpen);
@@ -172,6 +175,7 @@ export const App: React.FC = () => {
         {isChartSettingsOpen && <ChartSettingsModal isOpen={isChartSettingsOpen} onClose={closeChartSettings} />}
         {isIndicatorsModalOpen && <IndicatorsModal isOpen={isIndicatorsModalOpen} onClose={closeIndicatorsModal} />}
         {activeSettingsIndicator && <IndicatorSettingsModal />}
+        <ScriptEditorDrawer />
       </Suspense>
     </div>
   );
