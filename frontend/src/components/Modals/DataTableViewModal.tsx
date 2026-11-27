@@ -1,8 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { X, Table, Download } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import type { Candle } from '../../transport/client';
 import { useSyncStore } from '../../store/syncStore';
-import { getTimezoneOffsetSeconds } from '../ChartPane/ChartPane';
+import { getTimezoneOffsetSeconds } from '../../utils/timezones';
+import { detectPrecisionFromCandles } from '../../utils/priceFormatting';
 
 export interface DataTableViewModalProps {
   isOpen: boolean;
@@ -15,15 +17,27 @@ export const DataTableViewModal: React.FC<DataTableViewModalProps> = ({
   candles,
   onClose,
 }) => {
-  const { symbol, timeframe, timezone } = useSyncStore();
+  const activePaneId = useSyncStore((s) => s.activePaneId || 'pane-1');
+  const { symbol, timeframe, timezone } = useSyncStore(
+    useShallow((s) => ({
+      symbol: s.panes[activePaneId]?.symbol || s.symbol,
+      timeframe: s.panes[activePaneId]?.timeframe || s.timeframe,
+      timezone: s.panes[activePaneId]?.timezone || s.timezone,
+    }))
+  );
   const [page, setPage] = useState(0);
   const pageSize = 50;
+
+  // Show newest candles first (memoized)
+  const reversed = useMemo(() => [...candles].reverse(), [candles]);
+  const precision = useMemo(
+    () => detectPrecisionFromCandles(candles, symbol),
+    [candles, symbol]
+  );
 
   if (!isOpen) return null;
 
   const totalCandles = candles.length;
-  // Show newest candles first
-  const reversed = [...candles].reverse();
   const totalPages = Math.ceil(totalCandles / pageSize);
   const pagedCandles = reversed.slice(page * pageSize, (page + 1) * pageSize);
 
@@ -56,6 +70,7 @@ export const DataTableViewModal: React.FC<DataTableViewModalProps> = ({
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -120,19 +135,19 @@ export const DataTableViewModal: React.FC<DataTableViewModalProps> = ({
                     <td className="py-1.5 px-3 text-left text-[#787b86] text-[11px]">
                       {formatCandleTime(c.time)}
                     </td>
-                    <td className="py-1.5 px-3">{c.open.toFixed(2)}</td>
-                    <td className="py-1.5 px-3 text-[#089981]">{c.high.toFixed(2)}</td>
-                    <td className="py-1.5 px-3 text-[#f23645]">{c.low.toFixed(2)}</td>
+                    <td className="py-1.5 px-3">{c.open.toFixed(precision)}</td>
+                    <td className="py-1.5 px-3 text-[#089981]">{c.high.toFixed(precision)}</td>
+                    <td className="py-1.5 px-3 text-[#f23645]">{c.low.toFixed(precision)}</td>
                     <td
                       className={`py-1.5 px-3 font-semibold ${
                         isBull ? 'text-[#089981]' : 'text-[#f23645]'
                       }`}
                     >
-                      {c.close.toFixed(2)}
+                      {c.close.toFixed(precision)}
                     </td>
                     <td className={`py-1.5 px-3 ${isBull ? 'text-[#089981]' : 'text-[#f23645]'}`}>
                       {diff >= 0 ? '+' : ''}
-                      {diff.toFixed(2)}
+                      {diff.toFixed(precision)}
                     </td>
                     <td className={`py-1.5 px-3 ${isBull ? 'text-[#089981]' : 'text-[#f23645]'}`}>
                       {diff >= 0 ? '+' : ''}

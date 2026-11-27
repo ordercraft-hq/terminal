@@ -1,3 +1,4 @@
+import type { Time } from 'lightweight-charts';
 import { BaseDrawingTool } from '../BaseDrawingTool';
 import type {
   DrawingToolType,
@@ -31,6 +32,21 @@ interface ScreenVWAPPoint {
   upper3Y: number;
   lower3Y: number;
 }
+
+interface VWAPCache {
+  anchorKey: string;
+  candlesRef: Candle[];
+  candlesLen: number;
+  lastCandleTime: number;
+  lastCandleHigh: number;
+  lastCandleLow: number;
+  lastCandleClose: number;
+  lastCandleVolume: number;
+  optsKey: string;
+  data: ComputedVWAPPoint[];
+}
+
+const vwapCache = new WeakMap<UserDrawing, VWAPCache>();
 
 export class AnchoredVWAPTool extends BaseDrawingTool<AnchoredVWAPOptions> {
   readonly id: DrawingToolType = 'anchored_vwap';
@@ -93,6 +109,60 @@ export class AnchoredVWAPTool extends BaseDrawingTool<AnchoredVWAPOptions> {
         months: true,
       },
     };
+  }
+
+  /**
+   * Memoized VWAP computation on drawing entity.
+   */
+  public getOrComputeVWAPData(
+    drawing: UserDrawing,
+    anchor: LogicalAnchor,
+    candles: Candle[],
+    opts?: AnchoredVWAPOptions
+  ): ComputedVWAPPoint[] {
+    if (!anchor || !candles || candles.length === 0) return [];
+
+    const effectiveOpts = opts || (drawing.options as AnchoredVWAPOptions) || this.getDefaultOptions();
+    const anchorKey = `${anchor.time}_${anchor.price}`;
+    const candlesLen = candles.length;
+    const lastCandle = candles[candlesLen - 1];
+    const lastCandleTime = lastCandle ? lastCandle.time : 0;
+    const lastCandleHigh = lastCandle ? lastCandle.high : 0;
+    const lastCandleLow = lastCandle ? lastCandle.low : 0;
+    const lastCandleClose = lastCandle ? lastCandle.close : 0;
+    const lastCandleVolume = lastCandle ? (lastCandle.volume ?? 0) : 0;
+    const optsKey = `${effectiveOpts.calcMode}_${effectiveOpts.source}_${effectiveOpts.mult1}_${effectiveOpts.mult2}_${effectiveOpts.mult3}`;
+
+    const cached = vwapCache.get(drawing);
+    if (
+      cached &&
+      cached.anchorKey === anchorKey &&
+      cached.candlesRef === candles &&
+      cached.candlesLen === candlesLen &&
+      cached.lastCandleTime === lastCandleTime &&
+      cached.lastCandleHigh === lastCandleHigh &&
+      cached.lastCandleLow === lastCandleLow &&
+      cached.lastCandleClose === lastCandleClose &&
+      cached.lastCandleVolume === lastCandleVolume &&
+      cached.optsKey === optsKey
+    ) {
+      return cached.data;
+    }
+
+    const data = this.computeVWAPData(anchor, candles, effectiveOpts);
+    vwapCache.set(drawing, {
+      anchorKey,
+      candlesRef: candles,
+      candlesLen,
+      lastCandleTime,
+      lastCandleHigh,
+      lastCandleLow,
+      lastCandleClose,
+      lastCandleVolume,
+      optsKey,
+      data,
+    });
+    return data;
   }
 
   /**
@@ -171,49 +241,127 @@ export class AnchoredVWAPTool extends BaseDrawingTool<AnchoredVWAPOptions> {
   }
 
   /**
-   * Projects computed VWAP points into screen pixel coordinates.
+   * Projects a single computed VWAP point into screen pixel coordinates.
+   */
+  private projectPoint(
+    ctx: DrawingRenderContext,
+    pt: ComputedVWAPPoint,
+    knownX?: number
+  ): ScreenVWAPPoint | null {
+    const x = knownX ?? (ctx.chart.timeScale().timeToCoordinate(pt.time as Time) as number | null);
+    if (x === null || isNaN(x)) return null;
+
+    const series = ctx.series;
+    const vwapY = series.priceToCoordinate(pt.vwap);
+    const upper1Y = series.priceToCoordinate(pt.upper1);
+    const lower1Y = series.priceToCoordinate(pt.lower1);
+    if (
+      vwapY === null ||
+      upper1Y === null ||
+      lower1Y === null ||
+      isNaN(vwapY) ||
+      isNaN(upper1Y) ||
+      isNaN(lower1Y)
+    ) {
+      return null;
+    }
+
+    const upper2Y = series.priceToCoordinate(pt.upper2);
+    const lower2Y = series.priceToCoordinate(pt.lower2);
+    const upper3Y = series.priceToCoordinate(pt.upper3);
+    const lower3Y = series.priceToCoordinate(pt.lower3);
+
+    return {
+      x,
+      vwapY,
+      upper1Y,
+      lower1Y,
+      upper2Y: upper2Y ?? vwapY,
+      lower2Y: lower2Y ?? vwapY,
+      upper3Y: upper3Y ?? vwapY,
+      lower3Y: lower3Y ?? vwapY,
+    };
+  }
+
+  /**
+   * Projects visible computed VWAP points into screen pixel coordinates with visible-range culling.
    */
   private getScreenPoints(
     ctx: DrawingRenderContext,
     computed: ComputedVWAPPoint[]
   ): ScreenVWAPPoint[] {
+    if (computed.length === 0) return [];
+
     const screenPts: ScreenVWAPPoint[] = [];
     const timeScale = ctx.chart.timeScale();
-    const series = ctx.series;
 
-    for (const pt of computed) {
-      const x = timeScale.timeToCoordinate(pt.time as any);
+    let startIdx = 0;
+    let endIdx = computed.length - 1;
+
+    // 1. Coarse O(log N) binary-search cull using chart visible time range
+    try {
+      const visibleRange = timeScale.getVisibleRange?.();
+      if (
+        visibleRange &&
+        typeof visibleRange.from === 'number' &&
+        typeof visibleRange.to === 'number' &&
+        Number.isFinite(visibleRange.from) &&
+        Number.isFinite(visibleRange.to)
+      ) {
+        const fromTime = visibleRange.from;
+        const toTime = visibleRange.to;
+
+        // Find last point with time < fromTime so boundary segment enters viewport cleanly
+        let lo = 0;
+        let hi = computed.length - 1;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (computed[mid].time < fromTime) lo = mid + 1;
+          else hi = mid - 1;
+        }
+        startIdx = Math.max(0, hi);
+
+        // Find first point with time > toTime so boundary segment exits viewport cleanly
+        lo = startIdx;
+        hi = computed.length - 1;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (computed[mid].time <= toTime) lo = mid + 1;
+          else hi = mid - 1;
+        }
+        endIdx = Math.min(computed.length - 1, lo);
+      }
+    } catch {}
+
+    // 2. Fine screen-X culling: avoid projecting 7 price coords for off-screen bars
+    const margin = 60;
+    const maxScreenX = ctx.width + margin;
+    let pendingLeft: { pt: ComputedVWAPPoint; x: number } | null = null;
+
+    for (let i = startIdx; i <= endIdx; i++) {
+      const pt = computed[i];
+      const x = timeScale.timeToCoordinate(pt.time as Time) as number | null;
       if (x === null || isNaN(x)) continue;
 
-      const vwapY = series.priceToCoordinate(pt.vwap);
-      const upper1Y = series.priceToCoordinate(pt.upper1);
-      const lower1Y = series.priceToCoordinate(pt.lower1);
-      const upper2Y = series.priceToCoordinate(pt.upper2);
-      const lower2Y = series.priceToCoordinate(pt.lower2);
-      const upper3Y = series.priceToCoordinate(pt.upper3);
-      const lower3Y = series.priceToCoordinate(pt.lower3);
-
-      if (
-        vwapY === null ||
-        upper1Y === null ||
-        lower1Y === null ||
-        isNaN(vwapY) ||
-        isNaN(upper1Y) ||
-        isNaN(lower1Y)
-      ) {
+      if (x < -margin) {
+        pendingLeft = { pt, x };
         continue;
       }
 
-      screenPts.push({
-        x,
-        vwapY,
-        upper1Y,
-        lower1Y,
-        upper2Y: upper2Y ?? vwapY,
-        lower2Y: lower2Y ?? vwapY,
-        upper3Y: upper3Y ?? vwapY,
-        lower3Y: lower3Y ?? vwapY,
-      });
+      if (pendingLeft) {
+        const leftProjected = this.projectPoint(ctx, pendingLeft.pt, pendingLeft.x);
+        if (leftProjected) screenPts.push(leftProjected);
+        pendingLeft = null;
+      }
+
+      const projected = this.projectPoint(ctx, pt, x);
+      if (projected) {
+        screenPts.push(projected);
+      }
+
+      if (x > maxScreenX) {
+        break;
+      }
     }
 
     return screenPts;
@@ -225,16 +373,16 @@ export class AnchoredVWAPTool extends BaseDrawingTool<AnchoredVWAPOptions> {
 
     const anchor = drawing.anchors[0];
     const opts: AnchoredVWAPOptions = (drawing.options as AnchoredVWAPOptions) || this.getDefaultOptions();
-    const computed = this.computeVWAPData(anchor, ctx.candles, opts);
+    const computed = this.getOrComputeVWAPData(drawing, anchor, ctx.candles, opts);
     if (computed.length === 0) return handles;
 
-    const pts = this.getScreenPoints(ctx, computed);
-    if (pts.length === 0) return handles;
+    const anchorPt = this.projectPoint(ctx, computed[0]);
+    if (!anchorPt) return handles;
 
-    // Anchor handle placed precisely at the actual start point of the curve (pts[0])
+    // Anchor handle placed precisely at the actual start point of the curve (computed[0])
     handles.push({
-      x: pts[0].x,
-      y: pts[0].vwapY,
+      x: anchorPt.x,
+      y: anchorPt.vwapY,
       index: 0,
       type: 'vertex',
       cursor: 'grab',
@@ -250,7 +398,7 @@ export class AnchoredVWAPTool extends BaseDrawingTool<AnchoredVWAPOptions> {
     const opts: AnchoredVWAPOptions = (drawing.options as AnchoredVWAPOptions) || this.getDefaultOptions();
     const c2d = ctx.ctx;
 
-    const computed = this.computeVWAPData(anchor, ctx.candles, opts);
+    const computed = this.getOrComputeVWAPData(drawing, anchor, ctx.candles, opts);
     if (computed.length === 0) return;
 
     const pts = this.getScreenPoints(ctx, computed);
@@ -368,10 +516,12 @@ export class AnchoredVWAPTool extends BaseDrawingTool<AnchoredVWAPOptions> {
     const mainStyle = drawing.lineStyle || opts.lineStyle || 'solid';
     drawCurve((p) => p.vwapY, mainColor, mainWidth, mainStyle);
 
-    // 6. Anchor Point Handle at the actual start point (pts[0].x, pts[0].vwapY) strictly when selected
-    if (ctx.isSelected) {
-      const anchorX = pts[0].x;
-      const anchorY = pts[0].vwapY;
+    const anchorPt = this.projectPoint(ctx, computed[0]);
+
+    // 6. Anchor Point Handle at the actual start point (computed[0]) strictly when selected
+    if (ctx.isSelected && anchorPt) {
+      const anchorX = anchorPt.x;
+      const anchorY = anchorPt.vwapY;
 
       // Outer glow / halo ring when selected
       c2d.beginPath();
@@ -401,13 +551,13 @@ export class AnchoredVWAPTool extends BaseDrawingTool<AnchoredVWAPOptions> {
         c2d.stroke();
       };
 
-      // Band 1 start handles
-      if (opts.band1 !== false) {
+      // Band 1 start handles at actual anchor point
+      if (anchorPt && opts.band1 !== false) {
         if (opts.showUpperBand1 !== false) {
-          renderDot(pts[0].x, pts[0].upper1Y, opts.upperBand1Color || '#089981');
+          renderDot(anchorPt.x, anchorPt.upper1Y, opts.upperBand1Color || '#089981');
         }
         if (opts.showLowerBand1 !== false) {
-          renderDot(pts[0].x, pts[0].lower1Y, opts.lowerBand1Color || '#089981');
+          renderDot(anchorPt.x, anchorPt.lower1Y, opts.lowerBand1Color || '#089981');
         }
       }
 
@@ -457,23 +607,23 @@ export class AnchoredVWAPTool extends BaseDrawingTool<AnchoredVWAPOptions> {
     const anchor = drawing.anchors[0];
     const opts: AnchoredVWAPOptions = (drawing.options as AnchoredVWAPOptions) || this.getDefaultOptions();
 
-    const computed = this.computeVWAPData(anchor, ctx.candles, opts);
+    const computed = this.getOrComputeVWAPData(drawing, anchor, ctx.candles, opts);
     if (computed.length === 0) return null;
 
-    const pts = this.getScreenPoints(ctx, computed);
-    if (pts.length === 0) return null;
-
+    const anchorPt = this.projectPoint(ctx, computed[0]);
     // 1. Test Anchor Vertex Handle (radius <= 14px) at actual start point
-    const distToAnchor = Math.hypot(px - pts[0].x, py - pts[0].vwapY);
-    if (distToAnchor <= 14) {
-      return {
-        hit: true,
-        handleIndex: 0,
-        cursor: 'grab',
-      };
+    if (anchorPt) {
+      const distToAnchor = Math.hypot(px - anchorPt.x, py - anchorPt.vwapY);
+      if (distToAnchor <= 14) {
+        return {
+          hit: true,
+          handleIndex: 0,
+          cursor: 'grab',
+        };
+      }
     }
 
-    // 2. Test Curves
+    const pts = this.getScreenPoints(ctx, computed);
     if (pts.length < 2) return null;
 
     const hitTolerance = 7;

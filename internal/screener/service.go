@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/ordercraft-hq/terminal/internal/datafeed"
 )
 
 type MoverItem struct {
@@ -138,24 +141,27 @@ type cachedCategory struct {
 	lastFetched time.Time
 }
 
+const defaultMaxScreenerCacheEntries = 100
+
 type Service struct {
-	mu            sync.RWMutex
-	client        *http.Client
-	categoryCache map[string]*cachedCategory
-	cacheTTL      time.Duration
-	endpointBase  string
-	userAgent     string
+	mu              sync.RWMutex
+	client          *http.Client
+	categoryCache   map[string]*cachedCategory
+	maxCacheEntries int
+	cacheTTL        time.Duration
+	endpointBase    string
+	userAgent       string
+	flight          datafeed.SingleFlight[*MoversResponse]
 }
 
 func NewService() *Service {
 	return &Service{
-		client: &http.Client{
-			Timeout: 12 * time.Second,
-		},
-		categoryCache: make(map[string]*cachedCategory),
-		cacheTTL:      25 * time.Second,
-		endpointBase:  "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved",
-		userAgent:     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+		client:          datafeed.NewHTTPClient(12 * time.Second),
+		categoryCache:   make(map[string]*cachedCategory),
+		maxCacheEntries: defaultMaxScreenerCacheEntries,
+		cacheTTL:        25 * time.Second,
+		endpointBase:    "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved",
+		userAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 	}
 }
 
@@ -171,6 +177,32 @@ func (s *Service) GetMovers(ctx context.Context, category ...string) (*MoversRes
 		cat = category[0]
 	}
 	return s.GetMoversWithOpts(ctx, cat, false)
+}
+
+func (s *Service) evictCacheLocked(now time.Time) {
+	for k, v := range s.categoryCache {
+		if now.Sub(v.lastFetched) >= s.cacheTTL {
+			delete(s.categoryCache, k)
+		}
+	}
+	maxEntries := s.maxCacheEntries
+	if maxEntries <= 0 {
+		maxEntries = defaultMaxScreenerCacheEntries
+	}
+	for len(s.categoryCache) >= maxEntries {
+		var oldestKey string
+		var oldestTime time.Time
+		for k, v := range s.categoryCache {
+			if oldestKey == "" || v.lastFetched.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = v.lastFetched
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(s.categoryCache, oldestKey)
+	}
 }
 
 func (s *Service) GetMoversWithOpts(ctx context.Context, category string, force bool) (*MoversResponse, error) {
@@ -189,25 +221,46 @@ func (s *Service) GetMoversWithOpts(ctx context.Context, category string, force 
 		}
 	}
 
-	fresh, err := s.fetchCategoryFromYFinance(ctx, category)
-	if err != nil {
-		s.mu.RLock()
-		cached, exists := s.categoryCache[category]
-		s.mu.RUnlock()
-		if exists && cached.data != nil {
-			return cached.data, nil
+	flightKey := category
+	if force {
+		flightKey = "force:" + category
+	}
+
+	return s.flight.Do(ctx, flightKey, func(fetchCtx context.Context) (*MoversResponse, error) {
+		if !force {
+			s.mu.RLock()
+			cached, exists := s.categoryCache[category]
+			cachedValid := exists && cached.data != nil && time.Since(cached.lastFetched) < s.cacheTTL
+			s.mu.RUnlock()
+			if cachedValid {
+				return cached.data, nil
+			}
 		}
-		return getFallbackMovers(category), nil
-	}
 
-	s.mu.Lock()
-	s.categoryCache[category] = &cachedCategory{
-		data:        fresh,
-		lastFetched: time.Now(),
-	}
-	s.mu.Unlock()
+		fresh, err := s.fetchCategoryFromYFinance(fetchCtx, category)
+		if err != nil {
+			s.mu.RLock()
+			cached, exists := s.categoryCache[category]
+			s.mu.RUnlock()
+			if exists && cached.data != nil {
+				return cached.data, nil
+			}
+			return getFallbackMovers(category), nil
+		}
 
-	return fresh, nil
+		now := time.Now()
+		s.mu.Lock()
+		if _, exists := s.categoryCache[category]; !exists {
+			s.evictCacheLocked(now)
+		}
+		s.categoryCache[category] = &cachedCategory{
+			data:        fresh,
+			lastFetched: now,
+		}
+		s.mu.Unlock()
+
+		return fresh, nil
+	})
 }
 
 func (s *Service) fetchCategoryFromYFinance(ctx context.Context, category string) (*MoversResponse, error) {
@@ -364,7 +417,7 @@ func (s *Service) fetchScreenerQuotes(ctx context.Context, scrId string, count i
 	}
 
 	var parsed yfScreenerResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&parsed); err != nil {
 		return nil, err
 	}
 

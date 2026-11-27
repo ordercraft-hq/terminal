@@ -241,3 +241,105 @@ def main(ctx):
 		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestUnifiedIndicatorEngine_ScriptCacheAndInvalidation(t *testing.T) {
+	tmpDir := t.TempDir()
+	st, err := storage.NewStorage(tmpDir + "/script_cache.db")
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	defer st.Close()
+
+	srv := NewServer(st)
+	srv.SetScriptingEngine(scripting.NewEngine(nil))
+	unified := srv.indicatorEngine.(*UnifiedIndicatorEngine)
+
+	scriptID := "custom_cache_ind"
+	saveInd := func(code string) {
+		payload := storage.UserIndicator{
+			ID:   scriptID,
+			Name: "Cache Test Script",
+			Code: code,
+		}
+		b, _ := json.Marshal(payload)
+		req := httptest.NewRequest(http.MethodPost, "/api/indicators/user", bytes.NewReader(b))
+		rec := httptest.NewRecorder()
+		srv.mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("save indicator failed: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	// 1. Save v1: returns ctx.close
+	saveInd(`
+def main(ctx):
+    return [plot.line(ctx.close, title="Val")]
+`)
+
+	cfgs := []wickra.EvalIndicatorInstance{
+		{InstanceID: "inst_cache", IndicatorID: scriptID},
+	}
+
+	session, err := unified.CreateSession(context.Background(), "TEST:CACHE", "1m", cfgs)
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	defer session.Close(context.Background())
+
+	// Tick 1: bar 1
+	plots, err := session.Update(context.Background(), wickra.CandleData{Time: 1000, Open: 10, High: 12, Low: 9, Close: 11, Volume: 100})
+	if err != nil {
+		t.Fatalf("Update tick 1 failed: %v", err)
+	}
+	if got := plots["inst_cache"]["plot_0"]; got != 11 {
+		t.Fatalf("expected 11 on v1 tick 1, got %v", got)
+	}
+
+	// Verify script was cached in UnifiedIndicatorEngine
+	unified.scriptCacheMu.RLock()
+	cached := unified.scriptCache[scriptID]
+	unified.scriptCacheMu.RUnlock()
+	if cached == nil || !cached.found || cached.prog == nil {
+		t.Fatalf("expected compiled *starlark.Program to be cached for %s", scriptID)
+	}
+
+	// Tick 2: same timestamp (in-progress tip update)
+	plots, err = session.Update(context.Background(), wickra.CandleData{Time: 1000, Open: 10, High: 15, Low: 9, Close: 14, Volume: 150})
+	if err != nil {
+		t.Fatalf("Update tick 2 failed: %v", err)
+	}
+	if got := plots["inst_cache"]["plot_0"]; got != 14 {
+		t.Fatalf("expected 14 on v1 in-progress tip update, got %v", got)
+	}
+
+	// 2. Update script via POST /api/indicators/user -> cache must invalidate and recompile v2
+	saveInd(`
+def main(ctx):
+    doubled = [x * 2.0 for x in ctx.close]
+    return [plot.line(doubled, title="Doubled")]
+`)
+
+	plots, err = session.Update(context.Background(), wickra.CandleData{Time: 1060, Open: 14, High: 16, Low: 13, Close: 15, Volume: 200})
+	if err != nil {
+		t.Fatalf("Update tick 3 (v2) failed: %v", err)
+	}
+	if got := plots["inst_cache"]["plot_0"]; got != 30 {
+		t.Fatalf("expected 30 (15*2) after script update & cache invalidation, got %v", got)
+	}
+
+	// 3. Delete script via DELETE /api/indicators/user/{id} -> cache must invalidate
+	delReq := httptest.NewRequest(http.MethodDelete, "/api/indicators/user/"+scriptID, nil)
+	delRec := httptest.NewRecorder()
+	srv.mux.ServeHTTP(delRec, delReq)
+	if delRec.Code != http.StatusOK {
+		t.Fatalf("delete indicator failed: %d", delRec.Code)
+	}
+
+	evalRes, err := unified.Evaluate(context.Background(), []wickra.CandleData{{Time: 1000, Close: 10}}, cfgs)
+	if err == nil && len(evalRes) == 1 && len(evalRes[0].Plots) > 0 {
+		t.Fatalf("expected deleted script not to evaluate plots, got %+v", evalRes)
+	}
+	if _, ok := unified.GetDescriptor(scriptID); ok {
+		t.Fatalf("expected GetDescriptor(%q) to return false after delete", scriptID)
+	}
+}

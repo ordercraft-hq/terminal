@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import {
   Code2,
   Terminal,
@@ -12,6 +12,7 @@ import {
   Check,
 } from 'lucide-react';
 import { useSyncStore } from '../../store/syncStore';
+import { transport, type ScriptEvalResponsePayload } from '../../transport/client';
 import { MonacoEditorPane } from './MonacoEditorPane';
 import { ConsolePanel } from './ConsolePanel';
 import { ScriptPermissionModal } from './ScriptPermissionModal';
@@ -56,30 +57,58 @@ export const ScriptEditorDrawer: React.FC = () => {
   const [permissionModalOpen, setPermissionModalOpen] = useState(false);
   const [requestedPermissions, setRequestedPermissions] = useState<string[]>([]);
   const [grantedPermissions, setGrantedPermissions] = useState<string[]>([]);
+  const [pendingTemplateId, setPendingTemplateId] = useState<string | null>(null);
 
-  // Drag resizing state
+  // Drag resizing state (commits to store on pointerup to avoid 60fps persist writes)
   const isDraggingRef = useRef(false);
   const startYRef = useRef(0);
   const startHeightRef = useRef(bottomDrawerHeight);
+  const [dragHeight, setDragHeight] = useState<number | null>(null);
+  const dragHeightRef = useRef<number | null>(null);
+  const addedTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (addedTimerRef.current !== null) {
+        window.clearTimeout(addedTimerRef.current);
+      }
+    };
+  }, []);
+
+  const effectiveHeight = dragHeight ?? bottomDrawerHeight;
+
+  const clampHeight = (h: number) => {
+    const maxH = typeof window !== 'undefined' ? window.innerHeight * 0.85 : 650;
+    return Math.max(160, Math.min(maxH, Math.round(h)));
+  };
 
   const handlePointerDown = (e: React.PointerEvent) => {
     e.preventDefault();
     isDraggingRef.current = true;
     startYRef.current = e.clientY;
     startHeightRef.current = bottomDrawerHeight;
+    dragHeightRef.current = bottomDrawerHeight;
+    setDragHeight(bottomDrawerHeight);
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
   };
 
   const handlePointerMove = (e: React.PointerEvent) => {
     if (!isDraggingRef.current) return;
     const deltaY = startYRef.current - e.clientY;
-    const newHeight = startHeightRef.current + deltaY;
-    setBottomDrawerHeight(newHeight);
+    const newHeight = clampHeight(startHeightRef.current + deltaY);
+    dragHeightRef.current = newHeight;
+    setDragHeight(newHeight);
   };
 
   const handlePointerUp = (e: React.PointerEvent) => {
     if (!isDraggingRef.current) return;
     isDraggingRef.current = false;
+    const finalHeight = dragHeightRef.current;
+    dragHeightRef.current = null;
+    setDragHeight(null);
+    if (finalHeight !== null) {
+      setBottomDrawerHeight(finalHeight);
+    }
     try {
       (e.target as HTMLElement).releasePointerCapture(e.pointerId);
     } catch {
@@ -99,22 +128,27 @@ export const ScriptEditorDrawer: React.FC = () => {
     }
   };
 
+  const applyTemplateById = (templateId: string) => {
+    const tpl = ORDERSCRIPT_TEMPLATES.find((t) => t.id === templateId);
+    if (!tpl) return;
+    setActiveScriptCode(tpl.code);
+    setScriptError(null);
+    setPendingTemplateId(null);
+  };
+
   const handleTemplateChange = (templateId: string) => {
     const tpl = ORDERSCRIPT_TEMPLATES.find((t) => t.id === templateId);
     if (!tpl) return;
-    if (
-      activeScriptCode.trim() !== '' &&
-      !confirm('Loading template will replace your current editor content. Continue?')
-    ) {
+    if (activeScriptCode.trim() !== '') {
+      setPendingTemplateId(templateId);
       return;
     }
-    setActiveScriptCode(tpl.code);
-    setScriptError(null);
+    applyTemplateById(templateId);
   };
 
   const applyScriptToChart = useCallback(
     async (
-      evalData: { directives?: IndicatorPlotDirective[]; bands?: IndicatorBandDirective[] },
+      evalData: ScriptEvalResponsePayload,
       permissionsToUse: string[],
       forceNew: boolean
     ) => {
@@ -123,38 +157,61 @@ export const ScriptEditorDrawer: React.FC = () => {
       const timestamp = Date.now();
       const scriptId = `script.${scriptName.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${timestamp}`;
 
-      await fetch('/api/indicators/user', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: scriptId,
-          name: scriptName,
-          code: activeScriptCode,
-          permissions: permissionsToUse,
-        }),
+      await transport.saveScript({
+        id: scriptId,
+        name: scriptName,
+        code: activeScriptCode,
+        permissions: permissionsToUse,
       });
 
       const defaultStyles: Record<string, IndicatorPlotStyle> = {};
       const plotLabels: Record<string, string> = {};
-      const plots = evalData.directives || [];
+      const rawPlots = evalData.directives || [];
+      const plots: IndicatorPlotDirective[] = [];
 
-      for (const p of plots) {
+      for (const p of rawPlots) {
+        const plotType = p.type as IndicatorPlotType;
+        const color = p.color || '#2962FF';
+        const lineWidth = p.lineWidth || 2;
+        const lineStyle = p.lineStyle || 'solid';
+        const overlay = p.overlay !== false;
+
         defaultStyles[p.id] = {
-          color: p.color || '#2962FF',
+          color,
           colorUp: p.colorUp,
           colorDown: p.colorDown,
-          lineWidth: p.lineWidth || 2,
-          lineStyle: p.lineStyle || 'solid',
-          plotType: p.type as IndicatorPlotType,
+          lineWidth,
+          lineStyle,
+          plotType,
           visible: true,
           lastValueVisible: true,
           priceLineVisible: false,
-          overlay: p.overlay !== false,
+          overlay,
         };
         plotLabels[p.id] = p.title || p.id;
+        plots.push({
+          id: p.id,
+          type: plotType,
+          title: p.title || p.id,
+          color,
+          colorUp: p.colorUp,
+          colorDown: p.colorDown,
+          lineWidth,
+          lineStyle,
+          visible: true,
+          overlay,
+        });
       }
 
-      const isOverlay = plots.some((p: { overlay?: boolean }) => p.overlay !== false);
+      const bands: IndicatorBandDirective[] | undefined = evalData.bands?.map((b) => ({
+        id: b.id,
+        upperPlotId: b.plot1,
+        lowerPlotId: b.plot2,
+        fillColor: b.color || 'rgba(41, 98, 255, 0.2)',
+        visible: true,
+      }));
+
+      const isOverlay = plots.some((p) => p.overlay !== false);
 
       const customDef: IndicatorDefinition = {
         id: scriptId,
@@ -175,7 +232,7 @@ export const ScriptEditorDrawer: React.FC = () => {
         plots,
         defaultStyles,
         plotLabels,
-        defaultBands: evalData.bands,
+        defaultBands: bands,
       };
 
       registerCustomIndicator(customDef);
@@ -200,7 +257,13 @@ export const ScriptEditorDrawer: React.FC = () => {
       }
 
       setAddedSuccess(true);
-      setTimeout(() => setAddedSuccess(false), 2500);
+      if (addedTimerRef.current !== null) {
+        window.clearTimeout(addedTimerRef.current);
+      }
+      addedTimerRef.current = window.setTimeout(() => {
+        setAddedSuccess(false);
+        addedTimerRef.current = null;
+      }, 2500);
     },
     [activeScriptCode, activePaneId, addIndicatorToPane, addScriptConsoleLog]
   );
@@ -228,22 +291,15 @@ export const ScriptEditorDrawer: React.FC = () => {
       }
 
       try {
-        const payload = {
+        const data = await transport.runScript({
           code: activeScriptCode,
           symbol,
           resolution: timeframe,
           permissions: permissionsToUse,
-        };
-
-        const res = await fetch('/api/indicators/script/eval', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
         });
 
-        const data = await res.json();
-        if (!res.ok || !data.success) {
-          const errMsg = data.error || `Evaluation failed with status ${res.status}`;
+        if (!data.success) {
+          const errMsg = data.error || 'Evaluation failed';
           setScriptError(errMsg);
           addScriptConsoleLog(`[ERROR] ${errMsg}`);
           setBottomDrawerTab('console');
@@ -288,21 +344,14 @@ export const ScriptEditorDrawer: React.FC = () => {
     setScriptError(null);
 
     try {
-      const payload = {
+      const data = await transport.runScript({
         code: activeScriptCode,
         symbol,
         resolution: timeframe,
         permissions: grantedPermissions,
-      };
-
-      const res = await fetch('/api/indicators/script/eval', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
       });
 
-      const data = await res.json();
-      if (!res.ok || !data.success) {
+      if (!data.success) {
         throw new Error(data.error || 'Evaluation failed');
       }
 
@@ -327,7 +376,7 @@ export const ScriptEditorDrawer: React.FC = () => {
 
   return (
     <div
-      style={{ height: `${bottomDrawerHeight}px` }}
+      style={{ height: `${effectiveHeight}px` }}
       className="fixed bottom-0 left-0 right-0 z-40 bg-[#131722] border-t border-[#2a2e39] flex flex-col shadow-2xl transition-none select-none"
     >
       {/* Resizer Handle */}
@@ -384,7 +433,7 @@ export const ScriptEditorDrawer: React.FC = () => {
             <FileCode className="w-3.5 h-3.5 text-[#787b86]" />
             <select
               onChange={(e) => handleTemplateChange(e.target.value)}
-              defaultValue=""
+              value=""
               className="bg-transparent text-xs text-[#d1d4dc] focus:outline-none cursor-pointer py-0.5"
             >
               <option value="" disabled>
@@ -455,16 +504,40 @@ export const ScriptEditorDrawer: React.FC = () => {
         </div>
       </div>
 
-      {/* Drawer Body */}
+      {/* Inline Template Replacement Confirmation Banner */}
+      {pendingTemplateId && (
+        <div className="flex items-center justify-between px-3 py-1.5 bg-amber-500/10 border-b border-amber-500/30 text-xs text-[#d1d4dc] shrink-0">
+          <span>Loading this template will replace your current editor content. Continue?</span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setPendingTemplateId(null)}
+              className="px-2.5 py-0.5 rounded bg-[#2a2e39] hover:bg-[#363a45] text-[#d1d4dc] cursor-pointer"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => applyTemplateById(pendingTemplateId)}
+              className="px-2.5 py-0.5 rounded bg-[#2962ff] hover:bg-[#1e53e5] text-white font-medium cursor-pointer"
+            >
+              Replace
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Drawer Body - keep MonacoEditorPane mounted to preserve undo history & cursor */}
       <div className="flex-1 min-h-0 overflow-hidden relative">
-        {bottomDrawerTab === 'editor' ? (
+        <div className={bottomDrawerTab === 'editor' ? 'w-full h-full' : 'hidden'}>
           <MonacoEditorPane
             code={activeScriptCode}
             onChange={setActiveScriptCode}
             onRun={() => handleRunScript()}
             error={scriptError}
           />
-        ) : (
+        </div>
+        {bottomDrawerTab === 'console' && (
           <ConsolePanel
             logs={scriptConsoleLogs}
             error={scriptError}

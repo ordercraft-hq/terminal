@@ -37,7 +37,7 @@ type AlpacaProvider struct {
 
 // NewAlpacaProvider initializes the Alpaca provider with credentials loaded from environment or .env.
 func NewAlpacaProvider() *AlpacaProvider {
-	loadDotEnv()
+	datafeed.LoadDotEnv()
 
 	apiKey := os.Getenv("ALPACA_API_KEY")
 	apiSecret := os.Getenv("ALPACA_API_SECRET")
@@ -71,10 +71,8 @@ func NewAlpacaProvider() *AlpacaProvider {
 		dataURL:   dataURL,
 		streamURL: streamURL,
 		feed:      feed,
-		client: &http.Client{
-			Timeout: 15 * time.Second,
-		},
-		subs: make(map[string]context.CancelFunc),
+		client:    datafeed.NewHTTPClient(15 * time.Second),
+		subs:      make(map[string]context.CancelFunc),
 	}
 
 	// Asynchronously load US equity assets only if credentials configured

@@ -3,6 +3,7 @@ package scripting
 import (
 	"context"
 	"math"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -539,5 +540,242 @@ def main(ctx):
 	_, err = engine.Eval(context.Background(), script, sCtx, []string{"network:" + u.Host})
 	if err != nil {
 		t.Fatalf("expected success with exact port token, got: %v", err)
+	}
+}
+
+func naiveWMARef(data []float64, period int) []float64 {
+	n := len(data)
+	res := make([]float64, n)
+	for i := range res {
+		res[i] = math.NaN()
+	}
+	if period <= 0 || n < period {
+		return res
+	}
+	denom := float64(period * (period + 1) / 2)
+	for i := period - 1; i < n; i++ {
+		var s float64
+		for j := 0; j < period; j++ {
+			s += data[i-period+1+j] * float64(j+1)
+		}
+		res[i] = s / denom
+	}
+	return res
+}
+
+func naiveBollingerRef(data []float64, period int, stddev float64) ([]float64, []float64, []float64) {
+	n := len(data)
+	mid := MathSMA(data, period)
+	upper := make([]float64, n)
+	lower := make([]float64, n)
+	for i := range upper {
+		upper[i] = math.NaN()
+		lower[i] = math.NaN()
+	}
+	for i := period - 1; i < n; i++ {
+		m := mid[i]
+		var variance float64
+		for j := 0; j < period; j++ {
+			d := data[i-period+1+j] - m
+			variance += d * d
+		}
+		sd := math.Sqrt(variance / float64(period))
+		upper[i] = m + stddev*sd
+		lower[i] = m - stddev*sd
+	}
+	return upper, mid, lower
+}
+
+func TestOptimizedTAAlgorithmsAccuracy(t *testing.T) {
+	rng := rand.New(rand.NewSource(42))
+	n := 800
+	data := make([]float64, n)
+	// Include large price offset to stress catastrophic cancellation resistance in Bollinger
+	for i := 0; i < n; i++ {
+		data[i] = 100000.0 + math.Sin(float64(i)*0.1)*50.0 + (rng.Float64()-0.5)*10.0
+	}
+
+	assertSliceClose := func(name string, got, want []float64) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("%s length mismatch: got %d, want %d", name, len(got), len(want))
+		}
+		for i := range want {
+			if math.IsNaN(want[i]) {
+				if !math.IsNaN(got[i]) {
+					t.Fatalf("%s[%d] expected NaN, got %f", name, i, got[i])
+				}
+				continue
+			}
+			if math.IsNaN(got[i]) || math.Abs(got[i]-want[i]) > 1e-6 {
+				t.Fatalf("%s[%d] mismatch: got %f, want %f (diff %e)", name, i, got[i], want[i], math.Abs(got[i]-want[i]))
+			}
+		}
+	}
+
+	for _, period := range []int{1, 5, 14, 50} {
+		assertSliceClose("WMA", MathWMA(data, period), naiveWMARef(data, period))
+
+		uGot, mGot, lGot := MathBollinger(data, period, 2.0)
+		uWant, mWant, lWant := naiveBollingerRef(data, period, 2.0)
+		assertSliceClose("BB.upper", uGot, uWant)
+		assertSliceClose("BB.mid", mGot, mWant)
+		assertSliceClose("BB.lower", lGot, lWant)
+
+		// Highest / Lowest against naive O(N*period)
+		hGot := MathHighest(data, period)
+		lExtremeGot := MathLowest(data, period)
+		for i := period - 1; i < n; i++ {
+			hWant, lWantVal := data[i], data[i]
+			for j := 1; j < period; j++ {
+				if data[i-j] > hWant {
+					hWant = data[i-j]
+				}
+				if data[i-j] < lWantVal {
+					lWantVal = data[i-j]
+				}
+			}
+			if math.Abs(hGot[i]-hWant) > 1e-9 {
+				t.Fatalf("Highest[%d] mismatch: got %f, want %f", i, hGot[i], hWant)
+			}
+			if math.Abs(lExtremeGot[i]-lWantVal) > 1e-9 {
+				t.Fatalf("Lowest[%d] mismatch: got %f, want %f", i, lExtremeGot[i], lWantVal)
+			}
+		}
+	}
+
+	// Verify HMA accuracy against naive WMA composition
+	hmaGot := MathHMA(data, 16)
+	wmaHalf := naiveWMARef(data, 8)
+	wmaFull := naiveWMARef(data, 16)
+	diff := make([]float64, n)
+	for i := range diff {
+		if math.IsNaN(wmaHalf[i]) || math.IsNaN(wmaFull[i]) {
+			diff[i] = math.NaN()
+		} else {
+			diff[i] = 2*wmaHalf[i] - wmaFull[i]
+		}
+	}
+	// Naive WMA(diff, 4) skipping NaN prefix
+	hmaWant := make([]float64, n)
+	for i := range hmaWant {
+		hmaWant[i] = math.NaN()
+	}
+	for i := 15 + 4 - 1; i < n; i++ {
+		var s float64
+		for j := 0; j < 4; j++ {
+			s += diff[i-4+1+j] * float64(j+1)
+		}
+		hmaWant[i] = s / 10.0
+	}
+	assertSliceClose("HMA(16)", hmaGot, hmaWant)
+}
+
+func TestScriptContextIncrementalUpdateAndProgramCache(t *testing.T) {
+	candles := createTestCandles(10)
+	sCtx := NewScriptContextFromCandles("BINANCE:BTCUSDT", "1m", candles[:5])
+
+	// Incremental appends + in-progress tip update
+	for i := 5; i < 10; i++ {
+		inProgress := candles[i]
+		inProgress.Close -= 1.5
+		sCtx.UpdateCandle(inProgress, 8)
+		sCtx.UpdateCandle(candles[i], 8) // Same timestamp replaces tip
+	}
+
+	refCtx := NewScriptContextFromCandles("BINANCE:BTCUSDT", "1m", candles[2:]) // Last 8 bars
+	if len(sCtx.Close) != 8 || len(refCtx.Close) != 8 {
+		t.Fatalf("expected length 8 after maxHistory trim, got %d", len(sCtx.Close))
+	}
+	for i := range refCtx.Close {
+		if math.Abs(sCtx.Close[i]-refCtx.Close[i]) > 1e-9 {
+			t.Fatalf("Close[%d] mismatch: got %f, want %f", i, sCtx.Close[i], refCtx.Close[i])
+		}
+		if math.Abs(sCtx.Delta[i]-refCtx.Delta[i]) > 1e-9 {
+			t.Fatalf("Delta[%d] mismatch: got %f, want %f", i, sCtx.Delta[i], refCtx.Delta[i])
+		}
+	}
+
+	script := `
+def main(ctx):
+    bb = ta.bollinger(ctx.close, 3, 2.0)
+    hi = ta.highest(ctx.high, 3)
+    lo = ta.lowest(ctx.low, 3)
+    return [plot.line(bb.upper), plot.line(hi), plot.line(lo)]
+`
+	engine := NewEngine(nil)
+	prog, err := engine.Compile(script)
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+	resInc, err := engine.EvalProgram(context.Background(), prog, sCtx, nil)
+	if err != nil {
+		t.Fatalf("EvalProgram incremental failed: %v", err)
+	}
+	resRef, err := engine.Eval(context.Background(), script, refCtx, nil)
+	if err != nil {
+		t.Fatalf("Eval reference failed: %v", err)
+	}
+	for plotID, ptsRef := range resRef.Plots {
+		ptsInc := resInc.Plots[plotID]
+		if len(ptsInc) != len(ptsRef) {
+			t.Fatalf("plot %s length mismatch: got %d, want %d", plotID, len(ptsInc), len(ptsRef))
+		}
+		for i := range ptsRef {
+			if math.Abs(ptsInc[i].Value-ptsRef[i].Value) > 1e-6 {
+				t.Fatalf("plot %s[%d] mismatch: got %f, want %f", plotID, i, ptsInc[i].Value, ptsRef[i].Value)
+			}
+		}
+	}
+}
+
+func TestSecurity_CancellationLogsAndPanicBounds(t *testing.T) {
+	candles := []wickra.CandleData{
+		{Time: 1000, Open: 10, High: 12, Low: 9, Close: 11, Volume: 100},
+		{Time: 1060, Open: 11, High: 13, Low: 10, Close: 12, Volume: 100},
+	}
+	sCtx := NewScriptContextFromCandles("BINANCE:BTCUSDT", "1m", candles)
+	engine := NewEngine(nil)
+
+	// 1. Pre-canceled parent context must immediately cancel EvalProgram
+	ctxCanceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	loopScript := `
+def main(ctx):
+    x = 0
+    for i in range(100000):
+        x = x + 1
+    return [plot.line(ctx.close)]
+`
+	if _, err := engine.Eval(ctxCanceled, loopScript, sCtx, nil); err == nil {
+		t.Fatalf("Expected canceled context to abort script execution")
+	}
+
+	// 2. Negative length in ta.change must return an error, not panic
+	negChange := `
+def main(ctx):
+    return [plot.line(ta.change(ctx.close, -1))]
+`
+	if _, err := engine.Eval(context.Background(), negChange, sCtx, nil); err == nil {
+		t.Fatalf("Expected error for negative ta.change length")
+	}
+
+	// 3. Mismatched slices in MathATR / MathStoch must not panic
+	_ = MathATR([]float64{1, 2, 3}, []float64{1}, []float64{1}, 2)
+	_, _ = MathStoch([]float64{1}, []float64{1}, []float64{1, 2, 3}, 2, 1, 1)
+
+	// 4. Print logs must be capped cleanly at MaxLogLines + truncation notice
+	logScript := `
+def main(ctx):
+    for i in range(1000):
+        print("line")
+    return [plot.line(ctx.close)]
+`
+	res, err := engine.Eval(context.Background(), logScript, sCtx, nil)
+	if err != nil {
+		t.Fatalf("Expected capped log script to succeed, got %v", err)
+	}
+	if len(res.Logs) != MaxLogLines+1 {
+		t.Fatalf("Expected %d log lines (including truncation marker), got %d", MaxLogLines+1, len(res.Logs))
 	}
 }

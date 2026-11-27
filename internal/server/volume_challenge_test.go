@@ -37,6 +37,7 @@ func setupTestServerWithEngine(t *testing.T) (*Server, *wickra.Engine, func()) {
 	srv.SetIndicatorEngine(engine)
 
 	cleanup := func() {
+		_ = srv.Shutdown(context.Background())
 		engine.Close(ctx)
 		st.Close()
 	}

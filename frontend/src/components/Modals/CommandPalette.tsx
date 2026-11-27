@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { Search, X, Clock, TrendingUp } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import { useSyncStore } from '../../store/syncStore';
 import { transport } from '../../transport/client';
 import type { SymbolInfo } from '../../transport/client';
@@ -167,7 +168,16 @@ export const CommandPalette: React.FC = () => {
     commandPaletteInitialQuery,
     setSymbol,
     setTimeframe,
-  } = useSyncStore();
+  } = useSyncStore(
+    useShallow((s) => ({
+      symbol: s.symbol,
+      isCommandPaletteOpen: s.isCommandPaletteOpen,
+      closeCommandPalette: s.closeCommandPalette,
+      commandPaletteInitialQuery: s.commandPaletteInitialQuery,
+      setSymbol: s.setSymbol,
+      setTimeframe: s.setTimeframe,
+    }))
+  );
 
   const [query, setQuery] = useState('');
   const [activeTab, setActiveTab] = useState<CategoryTab>('All');
@@ -177,10 +187,10 @@ export const CommandPalette: React.FC = () => {
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
-  // Focus input and populate initial query when opened
+  // Focus input and populate initial query when opened (preserve case for intervals like 1m vs 1M)
   useEffect(() => {
     if (isCommandPaletteOpen) {
-      const initQ = (commandPaletteInitialQuery || '').toUpperCase();
+      const initQ = commandPaletteInitialQuery || '';
       setQuery(initQ);
       setSelectedIndex(0);
       setActiveTab('All');
@@ -198,27 +208,28 @@ export const CommandPalette: React.FC = () => {
     }
   }, [isCommandPaletteOpen, commandPaletteInitialQuery]);
 
-  // Dynamically fetch symbols from active providers
+  // Dynamically fetch symbols from active providers with AbortController cleanup
   useEffect(() => {
     if (!isCommandPaletteOpen) return;
 
-    let isCancelled = false;
+    const controller = new AbortController();
     const fetchSymbols = async () => {
       try {
-        const matches = await transport.searchSymbols(query);
-        if (!isCancelled) {
+        const matches = await transport.searchSymbols(query.trim(), controller.signal);
+        if (!controller.signal.aborted) {
           setResults(Array.isArray(matches) ? matches : []);
           setSelectedIndex(0);
         }
       } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') return;
         console.error('Failed to search symbols:', err);
       }
     };
 
-    const timer = setTimeout(fetchSymbols, 50);
+    const timer = window.setTimeout(fetchSymbols, 50);
     return () => {
-      isCancelled = true;
-      clearTimeout(timer);
+      window.clearTimeout(timer);
+      controller.abort();
     };
   }, [query, isCommandPaletteOpen]);
 
@@ -242,7 +253,8 @@ export const CommandPalette: React.FC = () => {
     }
   }, [selectedIndex]);
 
-  const cleanQuery = query.trim().toLowerCase();
+  const trimmedQuery = query.trim();
+  const cleanQuery = trimmedQuery.toLowerCase();
   const recognizedTfs = [
     '1s', '5s', '10s', '15s', '30s',
     '1m', '2m', '3m', '4m', '5m', '10m', '15m', '30m', '45m',
@@ -250,6 +262,13 @@ export const CommandPalette: React.FC = () => {
     '1d', '3d', '1w', '1mo',
   ];
   const isTimeframeQuery = recognizedTfs.includes(cleanQuery);
+  const resolvedTimeframe = useMemo(() => {
+    if (!isTimeframeQuery) return '';
+    if (cleanQuery === '1d') return '1D';
+    if (cleanQuery === '1w') return '1W';
+    if (cleanQuery === '1mo' || trimmedQuery === '1M') return '1M';
+    return cleanQuery;
+  }, [isTimeframeQuery, cleanQuery, trimmedQuery]);
 
   const handleSelect = (sym: SymbolInfo) => {
     setSymbol(sym.full_symbol);
@@ -270,15 +289,11 @@ export const CommandPalette: React.FC = () => {
       } else if (e.key === 'Enter') {
         e.preventDefault();
 
-        // Direct timeframe shortcut (e.g. "15m", "1h", "1D", "30s")
-        if (isTimeframeQuery) {
-          const support = isTimeframeSupported(symbol, cleanQuery);
+        // Direct timeframe shortcut (e.g. "1m", "1M", "15m", "1h", "1D", "30s")
+        if (isTimeframeQuery && resolvedTimeframe) {
+          const support = isTimeframeSupported(symbol, resolvedTimeframe);
           if (support.supported) {
-            let appliedTf = cleanQuery;
-            if (cleanQuery === '1d') appliedTf = '1D';
-            else if (cleanQuery === '1w') appliedTf = '1W';
-            else if (cleanQuery === '1m' && query.trim() === '1M') appliedTf = '1M';
-            setTimeframe(appliedTf);
+            setTimeframe(resolvedTimeframe);
             closeCommandPalette();
           }
           return;
@@ -286,8 +301,8 @@ export const CommandPalette: React.FC = () => {
 
         if (displayedResults[selectedIndex]) {
           handleSelect(displayedResults[selectedIndex]);
-        } else if (query.trim() && /^[a-zA-Z0-9_\-\.\/:]+$/.test(query.trim())) {
-          const raw = query.trim().toUpperCase();
+        } else if (trimmedQuery && /^[a-zA-Z0-9_\-\.\/:]+$/.test(trimmedQuery)) {
+          const raw = trimmedQuery.toUpperCase();
           setSymbol(raw.includes(':') ? raw : `BINANCE:${raw}`);
           closeCommandPalette();
         }
@@ -304,13 +319,24 @@ export const CommandPalette: React.FC = () => {
         if (inputRef.current) {
           inputRef.current.focus();
         }
-        setQuery((prev) => (prev + e.key).toUpperCase());
+        setQuery((prev) => prev + e.key);
       }
     };
 
     window.addEventListener('keydown', handleModalKeyDown);
     return () => window.removeEventListener('keydown', handleModalKeyDown);
-  }, [isCommandPaletteOpen, displayedResults, selectedIndex, query, isTimeframeQuery, cleanQuery, symbol]);
+  }, [
+    isCommandPaletteOpen,
+    displayedResults,
+    selectedIndex,
+    trimmedQuery,
+    isTimeframeQuery,
+    resolvedTimeframe,
+    symbol,
+    setSymbol,
+    setTimeframe,
+    closeCommandPalette,
+  ]);
 
   if (!isCommandPaletteOpen) return null;
 
@@ -330,10 +356,10 @@ export const CommandPalette: React.FC = () => {
             ref={inputRef}
             type="text"
             value={query}
-            onChange={(e) => setQuery(e.target.value.toUpperCase())}
-            placeholder="Symbol, ISIN, or CUSIP"
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Symbol, ISIN, or CUSIP (e.g. BTCUSDT, 15m, 1M)"
             autoFocus
-            className="flex-1 bg-transparent border-none outline-none text-white text-base tracking-wide placeholder:text-[#606573] font-normal uppercase"
+            className="flex-1 bg-transparent border-none outline-none text-white text-base tracking-wide placeholder:text-[#606573] font-normal"
           />
           {query && (
             <button
@@ -369,16 +395,12 @@ export const CommandPalette: React.FC = () => {
         </div>
 
         {/* Timeframe Direct Action Banner */}
-        {isTimeframeQuery && (
+        {isTimeframeQuery && resolvedTimeframe && (
           <div
             onClick={() => {
-              const support = isTimeframeSupported(symbol, cleanQuery);
+              const support = isTimeframeSupported(symbol, resolvedTimeframe);
               if (support.supported) {
-                let appliedTf = cleanQuery;
-                if (cleanQuery === '1d') appliedTf = '1D';
-                else if (cleanQuery === '1w') appliedTf = '1W';
-                else if (cleanQuery === '1m' && query.trim() === '1M') appliedTf = '1M';
-                setTimeframe(appliedTf);
+                setTimeframe(resolvedTimeframe);
                 closeCommandPalette();
               }
             }}
@@ -387,7 +409,7 @@ export const CommandPalette: React.FC = () => {
             <div className="flex items-center space-x-2.5">
               <Clock size={16} className="text-[#2962ff]" />
               <span className="font-semibold text-sm">
-                Switch chart timeframe to <span className="text-[#2962ff] uppercase">{cleanQuery}</span>
+                Switch chart timeframe to <span className="text-[#2962ff] font-mono">{resolvedTimeframe}</span>
               </span>
             </div>
             <kbd className="px-2 py-0.5 bg-[#2962ff] text-white rounded text-[11px] font-mono font-bold">

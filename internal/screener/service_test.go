@@ -4,7 +4,10 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestMoversService(t *testing.T) {
@@ -50,5 +53,45 @@ func TestMoversService(t *testing.T) {
 	}
 	if techMovers.Gainers[0].Symbol != "NVDA" {
 		t.Errorf("expected NVDA to be top gainer, got %s", techMovers.Gainers[0].Symbol)
+	}
+}
+
+func TestMoversSingleFlightAndCacheBound(t *testing.T) {
+	var hits atomic.Int32
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		time.Sleep(30 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"finance":{"result":[{"title":"Test","quotes":[{"symbol":"NVDA","shortName":"NVIDIA","regularMarketPrice":200.0,"regularMarketChange":2.0,"regularMarketChangePercent":1.0,"regularMarketVolume":1000}]}]}}`))
+	}))
+	defer mockServer.Close()
+
+	svc := NewService()
+	svc.maxCacheEntries = 2
+	svc.SetEndpointURL(mockServer.URL)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := svc.GetMovers(context.Background(), "growth_technology_stocks")
+			if err != nil || res == nil || len(res.Gainers) == 0 {
+				t.Errorf("unexpected movers result: %v, %+v", err, res)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("expected 1 coalesced screener fetch, got %d", got)
+	}
+
+	_, _ = svc.GetMovers(context.Background(), "undervalued_growth_stocks")
+	_, _ = svc.GetMovers(context.Background(), "most_shorted_stocks")
+	svc.mu.RLock()
+	cacheLen := len(svc.categoryCache)
+	svc.mu.RUnlock()
+	if cacheLen > 2 {
+		t.Fatalf("expected screener cache bounded at <= 2 entries, got %d", cacheLen)
 	}
 }

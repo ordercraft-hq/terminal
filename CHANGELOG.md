@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0] - 2026-11-27
+
+### Added
+- **Level 2 Market Data Bridge (`DataBridgeProvider`):**
+  - Implemented `L2DataProvider` WebSocket + HTTP streaming adapter (`internal/datafeed/providers/databridge.go`) supporting `TickData`, `OrderBookDepth`, `DeltaBar`, and live `FootprintBar` bid/ask price clusters.
+  - Added server-side delta/tick aggregation (`internal/datafeed/aggregator.go`) and symbol alias resolution (`@NQ` / exchange tickers).
+  - Enforced automatic chart-type capability checks (`frontend/src/utils/chartTypeSupport.ts`), gracefully guiding L1-only feeds vs. L2 feeds in multi-pane workspaces.
+- **Footprint Charts & Orderflow L2 Suite (`OrderflowPanel` + `FootprintPrimitive`):**
+  - Upgraded `FootprintPrimitive` with 4 display modes (**Footprint only**, **Vol Profile only**, **Both**, **No candle**), **Bid × Ask** and **Delta** cluster rendering, automatic candle fallback on dense zoom, and customizable Point of Control (**POC**) highlights.
+  - Added **Per-Bar Volume Profile** with customizable tick intervals, **POC Bar** highlighting, and configurable **Value Area (70% default VAH/VAL)** shading (`volumeProfileCalc.ts`).
+  - Added **Bar Statistics Header/Footer** displaying live Bar Delta, Delta %, Total Volume, and Min/Max Delta.
+  - Built **Diagonal & Stacked Imbalances Engine** with SQLite-persisted CRUD rules (`imbalanceRules`), configurable imbalance ratio %, delta volume filters, buy/sell text/box highlights, stacked consecutive-level thresholds, zone borders, and mitigated-zone tracking.
+- **Time Synchronization & Multi-Pane Precision:**
+  - Added `/api/time` server-time synchronization (`frontend/src/utils/serverTime.ts`), live bar countdown (`PriceCountdownPrimitive`), IANA timezone switcher (`timezones.ts`), and `subscribeWithSelector`-powered per-pane orderflow/chart state in `syncStore`.
+  - Added default Volume indicators on new chart panes and live candle merge/HUD performance optimizations with dedicated unit and stress tests.
+
+### Security & Reliability
+- **Credential & Host Protection:** Enforced fail-closed HTTP/WebSocket authentication checks for non-loopback bindings (`--token` / `ORDERCRAFT_AUTH_TOKEN`), strict `Host` header validation (`isAllowedHost`), WebSocket origin checks, and restrictive file ACLs for local AES-256-GCM keyfiles (`internal/security/acl_windows.go`, `acl_other.go`).
+- **SSRF & Sandbox Hardening:** Added DNS-rebinding-resistant outbound IP validation (`SafeHTTPClient` in `internal/datafeed/httpclient.go` & `internal/security/permissions.go`), response-size caps across providers, and bounded Starlark execution steps (`ORDERCRAFT_SCRIPT_MAX_STEPS`).
+- **Concurrency & CI Provenance:** Hardened `StreamHub` and `DataBridgeProvider` goroutine/mutex lifecycles under `-race`, resolved potential data races, and pinned GitHub Actions workflows cleanly.
+
+---
+
 ## [0.2.0] - 2026-11-07
 
 ### Added

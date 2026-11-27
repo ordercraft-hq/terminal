@@ -1,4 +1,5 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import type { IChartApi } from 'lightweight-charts';
 import {
   GripVertical,
   Pencil,
@@ -37,6 +38,8 @@ interface DrawingQuickToolbarProps {
   onDuplicate: () => void;
   onOpenSettings: () => void;
   initialCoords?: { x: number; y: number };
+  getDrawingCoords?: () => { x: number; y: number } | undefined;
+  chart?: IChartApi | null;
   containerBounds?: { width: number; height: number };
 }
 
@@ -47,11 +50,13 @@ export const DrawingQuickToolbar: React.FC<DrawingQuickToolbarProps> = ({
   onDuplicate,
   onOpenSettings,
   initialCoords,
+  getDrawingCoords,
+  chart,
 }) => {
   const toolbarRef = useRef<HTMLDivElement>(null);
 
   // Helper to compute clamped coordinates inside parent container
-  const getClampedPos = (x: number, y: number) => {
+  const getClampedPos = useCallback((x: number, y: number) => {
     const parent = toolbarRef.current?.parentElement;
     const containerW = parent ? parent.clientWidth : (typeof window !== 'undefined' ? window.innerWidth : 1200);
     const containerH = parent ? parent.clientHeight : (typeof window !== 'undefined' ? window.innerHeight : 800);
@@ -65,7 +70,7 @@ export const DrawingQuickToolbar: React.FC<DrawingQuickToolbarProps> = ({
       x: Math.max(minX, Math.min(maxX, x)),
       y: Math.max(minY, Math.min(maxY, y)),
     };
-  };
+  }, []);
 
   // Position state (draggable)
   const [pos, setPos] = useState<{ x: number; y: number }>(() => {
@@ -78,46 +83,94 @@ export const DrawingQuickToolbar: React.FC<DrawingQuickToolbarProps> = ({
     return { x: 200, y: 40 };
   });
 
-  // Position only re-centers when a DIFFERENT drawing is selected, not when the current line moves
+  const currentPosRef = useRef<{ x: number; y: number }>(pos);
+  const isDraggingRef = useRef(false);
+  const userDraggedRef = useRef(false);
+  const getDrawingCoordsRef = useRef(getDrawingCoords);
+  getDrawingCoordsRef.current = getDrawingCoords;
+  const initialCoordsRef = useRef(initialCoords);
+  initialCoordsRef.current = initialCoords;
+
+  const syncToDrawingCoords = useCallback(() => {
+    if (isDraggingRef.current || userDraggedRef.current) return;
+    const coords = getDrawingCoordsRef.current?.() ?? initialCoordsRef.current;
+    if (!coords) return;
+    const nextPos = getClampedPos(coords.x - 160, coords.y - 56);
+    currentPosRef.current = nextPos;
+    if (toolbarRef.current) {
+      toolbarRef.current.style.left = `${nextPos.x}px`;
+      toolbarRef.current.style.top = `${nextPos.y}px`;
+    }
+    setPos((prev) => (prev.x === nextPos.x && prev.y === nextPos.y ? prev : nextPos));
+  }, [getClampedPos]);
+
+  // Re-center when a DIFFERENT drawing is selected, or when anchors update (unless user manually dragged toolbar)
   const lastSelectedIdRef = useRef<string>(drawing.id);
   useEffect(() => {
     if (drawing.id !== lastSelectedIdRef.current) {
       lastSelectedIdRef.current = drawing.id;
-      if (initialCoords) {
-        const nextPos = getClampedPos(initialCoords.x - 160, initialCoords.y - 56);
-        setPos(nextPos);
-        currentPosRef.current = nextPos;
-      }
+      userDraggedRef.current = false;
     }
-  }, [drawing.id, initialCoords]);
+    syncToDrawingCoords();
+  }, [drawing.id, drawing.anchors, syncToDrawingCoords]);
 
-  // Ensure toolbar stays within boundaries after layout or resize
+  // Track chart pan, zoom, and resize so toolbar stays anchored to the selected drawing
   useEffect(() => {
-    const clampPos = () => {
-      setPos((prev) => {
-        const clamped = getClampedPos(prev.x, prev.y);
-        if (clamped.x !== prev.x || clamped.y !== prev.y) {
-          currentPosRef.current = clamped;
-          return clamped;
+    let rafId: number | null = null;
+
+    const scheduleReposition = () => {
+      if (rafId !== null) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        if (isDraggingRef.current) return;
+        if (!userDraggedRef.current) {
+          syncToDrawingCoords();
+        } else {
+          setPos((prev) => {
+            const clamped = getClampedPos(prev.x, prev.y);
+            if (clamped.x !== prev.x || clamped.y !== prev.y) {
+              currentPosRef.current = clamped;
+              return clamped;
+            }
+            return prev;
+          });
         }
-        return prev;
       });
     };
 
-    const timer = setTimeout(clampPos, 20);
-    window.addEventListener('resize', clampPos);
+    const timer = setTimeout(scheduleReposition, 20);
+    window.addEventListener('resize', scheduleReposition);
+
+    const timeScale = chart?.timeScale();
+    if (timeScale) {
+      try {
+        timeScale.subscribeVisibleLogicalRangeChange(scheduleReposition);
+        timeScale.subscribeVisibleTimeRangeChange(scheduleReposition);
+        timeScale.subscribeSizeChange(scheduleReposition);
+      } catch {}
+    }
+
     return () => {
       clearTimeout(timer);
-      window.removeEventListener('resize', clampPos);
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      window.removeEventListener('resize', scheduleReposition);
+      if (timeScale) {
+        try {
+          timeScale.unsubscribeVisibleLogicalRangeChange(scheduleReposition);
+          timeScale.unsubscribeVisibleTimeRangeChange(scheduleReposition);
+          timeScale.unsubscribeSizeChange(scheduleReposition);
+        } catch {}
+      }
     };
-  }, [drawing.id]);
+  }, [chart, drawing.id, getClampedPos, syncToDrawingCoords]);
 
   // Dragging toolbar logic (direct DOM transform for smooth 144fps without hitting artificial boundaries)
   const [isDragging, setIsDragging] = useState(false);
-  const isDraggingRef = useRef(false);
   const dragStartMouseRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const dragStartPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
-  const currentPosRef = useRef<{ x: number; y: number }>(pos);
 
   const handleDragStart = (e: React.PointerEvent) => {
     e.preventDefault();
@@ -127,6 +180,7 @@ export const DrawingQuickToolbar: React.FC<DrawingQuickToolbarProps> = ({
     } catch {}
     setIsDragging(true);
     isDraggingRef.current = true;
+    userDraggedRef.current = true;
     dragStartMouseRef.current = { x: e.clientX, y: e.clientY };
     dragStartPosRef.current = { ...currentPosRef.current };
   };
@@ -230,7 +284,7 @@ export const DrawingQuickToolbar: React.FC<DrawingQuickToolbarProps> = ({
       }}
       onMouseDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
-      className="floating-drawing-toolbar absolute z-40 pointer-events-auto flex items-center h-9 px-1.5 rounded-lg bg-[#1e222d] border border-[#2a2e39] shadow-2xl text-[#d1d4dc] backdrop-blur-md select-none animate-in fade-in zoom-in-95 duration-100"
+      className="floating-drawing-toolbar absolute z-40 pointer-events-auto flex items-center h-9 px-1.5 rounded-lg bg-[#1e222d]/95 border border-[#2a2e39] shadow-2xl text-[#d1d4dc] select-none animate-in fade-in zoom-in-95 duration-100"
     >
       {/* 1. Drag Handle (6 dots) */}
       <div

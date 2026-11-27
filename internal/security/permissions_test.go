@@ -309,3 +309,30 @@ func TestSafeHttpClient_RedirectToBlockedTarget(t *testing.T) {
 		t.Errorf("expected ErrSSRFProtection on redirect, got %v", err)
 	}
 }
+
+func TestSafeDialContext_BlocksInternalAndProxyBypass(t *testing.T) {
+	dialCtx := NewSafeDialContext(nil, nil)
+	blocked := []string{
+		"10.0.0.1:80",
+		"172.16.0.1:443",
+		"192.168.1.1:80",
+		"100.100.100.200:80",
+		"[fd00:ec2::254]:80",
+		"0.0.0.0:8448",
+	}
+	for _, target := range blocked {
+		_, err := dialCtx(context.Background(), "tcp", target)
+		if !errors.Is(err, ErrSSRFProtection) {
+			t.Errorf("expected ErrSSRFProtection for %s, got %v", target, err)
+		}
+	}
+
+	client := NewSafeHttpClient()
+	tr, ok := client.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport")
+	}
+	if tr.Proxy != nil {
+		t.Fatalf("expected SafeHttpClient transport Proxy to be nil to prevent ambient proxy SSRF bypass")
+	}
+}

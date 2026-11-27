@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ordercraft-hq/terminal/internal/datafeed"
 )
 
 type CalendarEvent struct {
@@ -27,13 +30,12 @@ type Service struct {
 	lastFetched time.Time
 	cacheTTL    time.Duration
 	feedURL     string
+	flight      datafeed.SingleFlight[[]CalendarEvent]
 }
 
 func NewService() *Service {
 	return &Service{
-		client: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		client:   datafeed.NewHTTPClient(10 * time.Second),
 		cacheTTL: 1 * time.Hour,
 		feedURL:  "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
 	}
@@ -56,20 +58,43 @@ func (s *Service) GetEventsWithOpts(ctx context.Context, impactFilter string, co
 	s.mu.RUnlock()
 
 	if force || !cachedValid {
-		fresh, err := s.fetchEvents(ctx)
-		if err != nil {
-			if len(cached) > 0 {
-				// Use stale cache gracefully if offline
-				fresh = cached
-			} else {
-				// Return fallback sample data if completely offline
-				fresh = getFallbackEvents()
+		flightKey := "events"
+		if force {
+			flightKey = "force:events"
+		}
+		fresh, err := s.flight.Do(ctx, flightKey, func(fetchCtx context.Context) ([]CalendarEvent, error) {
+			if !force {
+				s.mu.RLock()
+				valid := len(s.cachedData) > 0 && time.Since(s.lastFetched) < s.cacheTTL
+				cur := s.cachedData
+				s.mu.RUnlock()
+				if valid {
+					return cur, nil
+				}
 			}
-		} else {
+
+			fetched, err := s.fetchEvents(fetchCtx)
+			if err != nil {
+				s.mu.RLock()
+				cur := s.cachedData
+				s.mu.RUnlock()
+				if len(cur) > 0 {
+					return cur, nil
+				}
+				return getFallbackEvents(), nil
+			}
 			s.mu.Lock()
-			s.cachedData = fresh
+			s.cachedData = fetched
 			s.lastFetched = time.Now()
 			s.mu.Unlock()
+			return fetched, nil
+		})
+		if err != nil {
+			if len(cached) > 0 {
+				fresh = cached
+			} else {
+				fresh = getFallbackEvents()
+			}
 		}
 		cached = fresh
 	}
@@ -118,8 +143,12 @@ func (s *Service) fetchEvents(ctx context.Context) ([]CalendarEvent, error) {
 	}
 
 	var events []CalendarEvent
-	if err := json.NewDecoder(resp.Body).Decode(&events); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&events); err != nil {
 		return nil, err
+	}
+	const maxCalendarEvents = 2000
+	if len(events) > maxCalendarEvents {
+		events = events[:maxCalendarEvents]
 	}
 
 	return events, nil

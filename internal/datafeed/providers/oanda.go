@@ -28,29 +28,33 @@ type OandaProvider struct {
 	baseURL         string
 	streamURL       string
 	httpClient      *http.Client
+	streamClient    *http.Client
 	symbolsMu       sync.RWMutex
 	cachedSymbols   []datafeed.SymbolInfo
 	lastFetched     time.Time
 
 	// Real-time pricing stream state
-	streamMu            sync.Mutex
-	activeSubs          map[string]map[uint64]func(c datafeed.Candle) // key: "SYMBOL::RESOLUTION"
-	activeCandles       map[string]*datafeed.Candle                  // key: "SYMBOL::RESOLUTION"
-	lastTickTime        map[string]time.Time                          // symbol -> last tick receive time
-	activeStreamSymbols map[string]bool                               // symbols currently streaming
-	pendingTeardowns    map[string]*time.Timer                        // symbol -> grace period teardown timer
-	lastMidPrice        map[string]float64                            // symbol -> latest live mid price
-	nextSubID           uint64
-	streamCancel        context.CancelFunc
-	notifyCh            chan struct{}
-	isClosed            bool
-	supervisorsStarted  bool
-	cancelLoad          context.CancelFunc
+	streamMu             sync.Mutex
+	activeSubs           map[string]map[uint64]func(c datafeed.Candle) // key: "SYMBOL::RESOLUTION"
+	activeCandles        map[string]*datafeed.Candle                  // key: "SYMBOL::RESOLUTION"
+	lastTickTime         map[string]time.Time                         // symbol -> last tick receive time
+	activeStreamSymbols  map[string]bool                              // symbols desired on stream
+	currentStreamSymbols map[string]bool                              // symbols on currently open stream
+	pendingTeardowns     map[string]*time.Timer                      // symbol -> grace period teardown timer
+	restartTimer         *time.Timer
+	lastMidPrice         map[string]float64 // symbol -> latest live mid price
+	nextSubID            uint64
+	streamCancel         context.CancelFunc
+	notifyCh             chan struct{}
+	stopCh               chan struct{}
+	isClosed             bool
+	supervisorsStarted   bool
+	cancelLoad           context.CancelFunc
 }
 
 // NewOandaProvider initializes the provider loading config from env and .env file.
 func NewOandaProvider() *OandaProvider {
-	loadDotEnv()
+	datafeed.LoadDotEnv()
 
 	token := os.Getenv("OANDA_ACCESS_TOKEN")
 	accID := os.Getenv("OANDA_ACCOUNT_ID")
@@ -67,6 +71,9 @@ func NewOandaProvider() *OandaProvider {
 		streamURL = "https://stream-fxpractice.oanda.com"
 	}
 
+	streamTransport := datafeed.SharedHTTPTransport.Clone()
+	streamTransport.ResponseHeaderTimeout = 3 * time.Second
+
 	op := &OandaProvider{
 		accessToken:     token,
 		accountID:       accID,
@@ -74,16 +81,28 @@ func NewOandaProvider() *OandaProvider {
 		fallbackAccount: fallbackAcc,
 		baseURL:         strings.TrimRight(baseURL, "/"),
 		streamURL:       strings.TrimRight(streamURL, "/"),
-		httpClient: &http.Client{
-			Timeout: 12 * time.Second,
+		httpClient:      datafeed.NewHTTPClient(12 * time.Second),
+		streamClient: &http.Client{
+			Transport: streamTransport,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) > 0 {
+					if auth := via[0].Header.Get("Authorization"); auth != "" {
+						req.Header.Set("Authorization", auth)
+					}
+				}
+				return nil
+			},
+			Timeout: 0, // continuous persistent stream
 		},
-		activeSubs:          make(map[string]map[uint64]func(c datafeed.Candle)),
-		activeCandles:       make(map[string]*datafeed.Candle),
-		lastTickTime:        make(map[string]time.Time),
-		activeStreamSymbols: make(map[string]bool),
-		pendingTeardowns:    make(map[string]*time.Timer),
-		lastMidPrice:        make(map[string]float64),
-		notifyCh:            make(chan struct{}, 1),
+		activeSubs:           make(map[string]map[uint64]func(c datafeed.Candle)),
+		activeCandles:        make(map[string]*datafeed.Candle),
+		lastTickTime:         make(map[string]time.Time),
+		activeStreamSymbols:  make(map[string]bool),
+		currentStreamSymbols: make(map[string]bool),
+		pendingTeardowns:     make(map[string]*time.Timer),
+		lastMidPrice:         make(map[string]float64),
+		notifyCh:             make(chan struct{}, 1),
+		stopCh:               make(chan struct{}),
 	}
 	// Pre-load instruments and start supervisors only if configured
 	if op.IsConfigured() {
@@ -98,40 +117,6 @@ func NewOandaProvider() *OandaProvider {
 		go op.fallbackSupervisor()
 	}
 	return op
-}
-
-func loadDotEnv() {
-	// Look for .env in current directory or parent
-	paths := []string{".env", "../.env", "../../.env", "../../../.env"}
-	for _, p := range paths {
-		f, err := os.Open(p)
-		if err != nil {
-			continue
-		}
-
-		scanner := bufio.NewScanner(f)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) == 2 {
-				k := strings.TrimSpace(parts[0])
-				v := strings.TrimSpace(parts[1])
-				// Don't overwrite existing environment variables
-				if os.Getenv(k) == "" {
-					os.Setenv(k, v)
-				}
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			f.Close()
-			continue
-		}
-		f.Close()
-		break
-	}
 }
 
 func (o *OandaProvider) Name() string {
@@ -159,8 +144,6 @@ func (o *OandaProvider) SetCredentials(accountID, token, environment string) {
 	if env == "live" {
 		baseURL = "https://api-fxtrade.oanda.com"
 		streamURL = "https://stream-fxtrade.oanda.com"
-	} else if strings.HasPrefix(env, "http") {
-		baseURL = env
 	}
 
 	configured := cleanTok != "" &&
@@ -613,6 +596,53 @@ type oandaCreds struct {
 	account string
 }
 
+// openStreamBar opens a new real-time OANDA stream candle from the incoming live quote,
+// preserving any natural inter-bar market gap between bars.
+func openStreamBar(bucketTime int64, midPrice float64) datafeed.Candle {
+	return datafeed.Candle{
+		Time:   bucketTime,
+		Open:   midPrice,
+		High:   midPrice,
+		Low:    midPrice,
+		Close:  midPrice,
+		Volume: 1,
+	}
+}
+
+// reconcileActiveBar merges authoritative REST candle bounds and Open into an
+// active streaming candle (mutating currentBar in place when it matches Time)
+// and returns the reconciled snapshot.
+func reconcileActiveBar(currentBar *datafeed.Candle, latest datafeed.Candle, hasFreshTicks bool) datafeed.Candle {
+	if currentBar == nil || latest.Time > currentBar.Time {
+		return latest
+	}
+	if latest.Time < currentBar.Time {
+		return *currentBar
+	}
+	if latest.Open > 0 {
+		currentBar.Open = latest.Open
+	}
+	if latest.High > currentBar.High {
+		currentBar.High = latest.High
+	}
+	if currentBar.Open > currentBar.High {
+		currentBar.High = currentBar.Open
+	}
+	if latest.Low > 0 && (currentBar.Low == 0 || latest.Low < currentBar.Low) {
+		currentBar.Low = latest.Low
+	}
+	if currentBar.Open > 0 && (currentBar.Low == 0 || currentBar.Open < currentBar.Low) {
+		currentBar.Low = currentBar.Open
+	}
+	if latest.Volume > currentBar.Volume {
+		currentBar.Volume = latest.Volume
+	}
+	if !hasFreshTicks && latest.Close > 0 {
+		currentBar.Close = latest.Close
+	}
+	return *currentBar
+}
+
 // streamSupervisor maintains the persistent, multiplexed pricing stream from OANDA.
 // Any incoming price tick is immediately dispatched with zero delay and zero capping.
 func (o *OandaProvider) streamSupervisor() {
@@ -639,14 +669,21 @@ func (o *OandaProvider) streamSupervisor() {
 		}
 
 		var symbols []string
+		currentSet := make(map[string]bool, len(symMap))
 		for s := range symMap {
 			symbols = append(symbols, s)
 			o.activeStreamSymbols[s] = true
+			currentSet[s] = true
 		}
 		o.streamMu.Unlock()
 
 		if len(symbols) == 0 {
+			o.streamMu.Lock()
+			o.currentStreamSymbols = make(map[string]bool)
+			o.streamMu.Unlock()
 			select {
+			case <-o.stopCh:
+				return
 			case <-o.notifyCh:
 			case <-time.After(3 * time.Second):
 			}
@@ -658,6 +695,7 @@ func (o *OandaProvider) streamSupervisor() {
 		ctx, cancel := context.WithCancel(context.Background())
 		o.streamMu.Lock()
 		o.streamCancel = cancel
+		o.currentStreamSymbols = currentSet
 		o.streamMu.Unlock()
 
 		err := o.connectAndReadStream(ctx, symbols)
@@ -668,13 +706,21 @@ func (o *OandaProvider) streamSupervisor() {
 			o.streamMu.Unlock()
 			return
 		}
+		o.streamCancel = nil
+		o.currentStreamSymbols = make(map[string]bool)
 		o.streamMu.Unlock()
 
 		if err != nil && ctx.Err() == nil {
 			log.Printf("[OANDA Stream] Stream disconnected: %v. Reconnecting in %v...", err, backoff)
-			time.Sleep(backoff)
-			if backoff < 8*time.Second {
-				backoff *= 2
+			select {
+			case <-o.stopCh:
+				return
+			case <-o.notifyCh:
+				backoff = 1 * time.Second
+			case <-time.After(backoff):
+				if backoff < 8*time.Second {
+					backoff *= 2
+				}
 			}
 		} else {
 			backoff = 1 * time.Second
@@ -720,18 +766,7 @@ func (o *OandaProvider) connectAndReadStream(ctx context.Context, symbols []stri
 		}
 		req.Header.Set("Authorization", "Bearer "+cred.token)
 
-		streamClient := &http.Client{
-			Transport: &http.Transport{
-				ResponseHeaderTimeout: 3 * time.Second,
-			},
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				req.Header.Set("Authorization", "Bearer "+cred.token)
-				return nil
-			},
-			Timeout: 0, // continuous persistent stream
-		}
-
-		resp, err := streamClient.Do(req)
+		resp, err := o.streamClient.Do(req)
 		if err != nil {
 			continue
 		}
@@ -831,15 +866,9 @@ func (o *OandaProvider) connectAndReadStream(ctx context.Context, symbols []stri
 
 				bar, exists := o.activeCandles[subKey]
 				if !exists || bucketTime > bar.Time {
-					bar = &datafeed.Candle{
-						Time:   bucketTime,
-						Open:   midPrice,
-						High:   midPrice,
-						Low:    midPrice,
-						Close:  midPrice,
-						Volume: 1,
-					}
-					o.activeCandles[subKey] = bar
+					nextBar := openStreamBar(bucketTime, midPrice)
+					o.activeCandles[subKey] = &nextBar
+					bar = &nextBar
 				} else {
 					if midPrice > bar.High {
 						bar.High = midPrice
@@ -868,12 +897,19 @@ func (o *OandaProvider) connectAndReadStream(ctx context.Context, symbols []stri
 	return scanner.Err()
 }
 
-// fallbackSupervisor ensures continuous sub-second live updates.
-// When the real-time pricing stream is active, it stays completely idle.
-// If stream ticks are not flowing for a symbol (>800ms) or for instruments not enabled on stream,
-// it queries the authentic in-progress candle directly with change detection.
+// fallbackSupervisor ensures continuous live updates when the pricing stream
+// is quiet or unavailable, using a calm check interval with exponential backoff
+// during quiet/closed market sessions and resetting backoff when live ticks arrive.
 func (o *OandaProvider) fallbackSupervisor() {
-	ticker := time.NewTicker(100 * time.Millisecond)
+	const (
+		checkInterval       = 500 * time.Millisecond
+		baseQuietPoll       = 1 * time.Second
+		maxQuietPoll        = 30 * time.Second
+		activeSyncInterval  = 2500 * time.Millisecond
+		liveTickFreshWindow = 2 * time.Second
+	)
+
+	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 
 	type barState struct {
@@ -886,12 +922,18 @@ func (o *OandaProvider) fallbackSupervisor() {
 	}
 
 	lastBars := make(map[string]barState)
+	lastPrevBars := make(map[string]barState)
 	lastPollTime := make(map[string]time.Time)
+	pollBackoff := make(map[string]time.Duration)
 	inFlight := make(map[string]bool)
 	var stateMu sync.Mutex
 
 	for {
-		<-ticker.C
+		select {
+		case <-o.stopCh:
+			return
+		case <-ticker.C:
+		}
 
 		o.streamMu.Lock()
 		if o.isClosed {
@@ -900,12 +942,16 @@ func (o *OandaProvider) fallbackSupervisor() {
 		}
 
 		now := time.Now()
-		var targets []struct {
-			key string
-			sym string
-			res string
-			cbs []func(c datafeed.Candle)
+		type pollTarget struct {
+			key           string
+			sym           string
+			res           string
+			cbs           []func(c datafeed.Candle)
+			lastTick      time.Time
+			activeBarTime int64
 		}
+		var activeSnapshots []pollTarget
+		activeKeys := make(map[string]bool, len(o.activeSubs))
 
 		for key, listeners := range o.activeSubs {
 			if len(listeners) == 0 {
@@ -915,102 +961,154 @@ func (o *OandaProvider) fallbackSupervisor() {
 			if len(parts) != 2 {
 				continue
 			}
+			activeKeys[key] = true
 			sym := parts[0]
 			res := parts[1]
-
-			// Synchronize authentic candle volume and state periodically from REST (every ~1.2s)
-			// or immediately if no live stream ticks have arrived in the last 800ms
-			lastPoll := lastPollTime[key]
-			needsPoll := now.Sub(o.lastTickTime[sym]) > 800*time.Millisecond || now.Sub(lastPoll) >= 1200*time.Millisecond
-			if needsPoll {
-				lastPollTime[key] = now
-				var cbList []func(c datafeed.Candle)
-				for _, cb := range listeners {
-					cbList = append(cbList, cb)
-				}
-				targets = append(targets, struct {
-					key string
-					sym string
-					res string
-					cbs []func(c datafeed.Candle)
-				}{
-					key: key,
-					sym: sym,
-					res: res,
-					cbs: cbList,
-				})
+			cbList := make([]func(c datafeed.Candle), 0, len(listeners))
+			for _, cb := range listeners {
+				cbList = append(cbList, cb)
 			}
+			var activeTime int64
+			if ab := o.activeCandles[key]; ab != nil {
+				activeTime = ab.Time
+			}
+			activeSnapshots = append(activeSnapshots, pollTarget{
+				key:           key,
+				sym:           sym,
+				res:           res,
+				cbs:           cbList,
+				lastTick:      o.lastTickTime[sym],
+				activeBarTime: activeTime,
+			})
 		}
 		o.streamMu.Unlock()
 
-		for _, target := range targets {
-			stateMu.Lock()
-			if inFlight[target.key] {
-				stateMu.Unlock()
+		var targets []pollTarget
+		stateMu.Lock()
+		for k := range lastBars {
+			if !activeKeys[k] {
+				delete(lastBars, k)
+				delete(lastPollTime, k)
+				delete(pollBackoff, k)
+			}
+		}
+		for _, snap := range activeSnapshots {
+			if inFlight[snap.key] {
 				continue
 			}
-			inFlight[target.key] = true
-			stateMu.Unlock()
+			lastPoll := lastPollTime[snap.key]
+			ticksActive := !snap.lastTick.IsZero() && now.Sub(snap.lastTick) <= liveTickFreshWindow
+			lastState, hasLastState := lastBars[snap.key]
+			// Promptly reconcile REST candles right after the live stream rolls over to a new bar
+			// so the finalized prior bar close and authentic REST open arrive immediately.
+			barRolledOver := hasLastState && snap.activeBarTime > lastState.time && now.Sub(lastPoll) >= 250*time.Millisecond
+			var needsPoll bool
+			if ticksActive {
+				pollBackoff[snap.key] = baseQuietPoll
+				needsPoll = barRolledOver || now.Sub(lastPoll) >= activeSyncInterval
+			} else {
+				interval := pollBackoff[snap.key]
+				if interval <= 0 {
+					interval = baseQuietPoll
+					pollBackoff[snap.key] = interval
+				}
+				needsPoll = barRolledOver || lastPoll.IsZero() || now.Sub(lastPoll) >= interval
+			}
+			if needsPoll {
+				lastPollTime[snap.key] = now
+				inFlight[snap.key] = true
+				targets = append(targets, snap)
+			}
+		}
+		stateMu.Unlock()
 
-			go func(t struct {
-				key string
-				sym string
-				res string
-				cbs []func(c datafeed.Candle)
-			}) {
+		for _, target := range targets {
+			go func(t pollTarget) {
 				defer func() {
 					stateMu.Lock()
 					delete(inFlight, t.key)
 					stateMu.Unlock()
 				}()
 
-				ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+				ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 				defer cancel()
 
 				candles, err := o.GetHistory(ctx, t.sym, t.res, 0, 0, 2)
 				if err != nil || len(candles) == 0 {
+					stateMu.Lock()
+					next := pollBackoff[t.key] * 2
+					if next <= 0 {
+						next = baseQuietPoll * 2
+					}
+					if next > maxQuietPoll {
+						next = maxQuietPoll
+					}
+					pollBackoff[t.key] = next
+					stateMu.Unlock()
 					return
 				}
 
 				latest := candles[len(candles)-1]
 
-				// Synchronize authentic volume into shared activeCandles
+				// Check if live stream ticks arrived recently on this symbol
 				o.streamMu.Lock()
+				lastTickTS := o.lastTickTime[t.sym]
+				hasFreshTicks := !lastTickTS.IsZero() && time.Since(lastTickTS) <= 500*time.Millisecond
 				currentBar, hasCurrent := o.activeCandles[t.key]
 				if hasCurrent && currentBar.Time == latest.Time {
-					if latest.Volume > currentBar.Volume {
-						currentBar.Volume = latest.Volume
-					}
-					if latest.High > currentBar.High {
-						currentBar.High = latest.High
-					}
-					if latest.Low < currentBar.Low && latest.Low > 0 {
-						currentBar.Low = latest.Low
-					}
-					latest.Volume = currentBar.Volume
+					latest = reconcileActiveBar(currentBar, latest, hasFreshTicks)
 				} else if !hasCurrent || latest.Time > currentBar.Time {
-					o.activeCandles[t.key] = &latest
+					copyBar := latest
+					o.activeCandles[t.key] = &copyBar
 				}
 				o.streamMu.Unlock()
 
-				stateMu.Lock()
-				last, hasLast := lastBars[t.key]
-				stateMu.Unlock()
+				var prev datafeed.Candle
+				hasPrevCandle := len(candles) >= 2
+				if hasPrevCandle {
+					prev = candles[len(candles)-2]
+				}
 
-				// If nothing changed in the candle OHLCV, skip duplicate broadcast
-				if hasLast &&
+				stateMu.Lock()
+				for k := range lastPrevBars {
+					if !activeKeys[k] {
+						delete(lastPrevBars, k)
+					}
+				}
+				last, hasLast := lastBars[t.key]
+				lastPrev, hasLastPrev := lastPrevBars[t.key]
+				unchanged := hasLast &&
 					latest.Time == last.time &&
 					latest.Open == last.open &&
 					latest.High == last.high &&
 					latest.Low == last.low &&
 					latest.Close == last.close &&
-					latest.Volume == last.volume {
+					latest.Volume == last.volume
+				prevChanged := hasPrevCandle && (!hasLastPrev ||
+					prev.Time != lastPrev.time ||
+					prev.Open != lastPrev.open ||
+					prev.High != lastPrev.high ||
+					prev.Low != lastPrev.low ||
+					prev.Close != lastPrev.close ||
+					prev.Volume != lastPrev.volume)
+				if unchanged && !prevChanged {
+					next := pollBackoff[t.key] * 2
+					if next <= 0 {
+						next = baseQuietPoll * 2
+					}
+					if next > maxQuietPoll {
+						next = maxQuietPoll
+					}
+					pollBackoff[t.key] = next
+					stateMu.Unlock()
 					return
 				}
+				pollBackoff[t.key] = baseQuietPoll
+				stateMu.Unlock()
 
-				// If a new candle opened and we have the previous bar, dispatch the finalized previous bar first
-				if hasLast && latest.Time > last.time && len(candles) >= 2 {
-					prev := candles[len(candles)-2]
+				// Dispatch finalized previous bar before latest whenever it rolled over
+				// or REST finalized revised OHLC/close/volume values after rollover.
+				if hasPrevCandle && ((hasLast && latest.Time > last.time) || prevChanged) {
 					for _, cb := range t.cbs {
 						cb(prev)
 					}
@@ -1028,6 +1126,16 @@ func (o *OandaProvider) fallbackSupervisor() {
 					low:    latest.Low,
 					close:  latest.Close,
 					volume: latest.Volume,
+				}
+				if hasPrevCandle {
+					lastPrevBars[t.key] = barState{
+						time:   prev.Time,
+						open:   prev.Open,
+						high:   prev.High,
+						low:    prev.Low,
+						close:  prev.Close,
+						volume: prev.Volume,
+					}
 				}
 				stateMu.Unlock()
 			}(target)
@@ -1060,9 +1168,9 @@ func (o *OandaProvider) Subscribe(ctx context.Context, symbol, resolution string
 	}
 	listeners[subID] = onCandle
 
-	// Check if this symbol is already streaming
-	isAlreadyStreaming := o.activeStreamSymbols[cleanSym]
-	if !isAlreadyStreaming {
+	// Check if this symbol is already active or on the current multiplexed stream
+	isAlreadyStreaming := o.activeStreamSymbols[cleanSym] || o.currentStreamSymbols[cleanSym]
+	if !o.activeStreamSymbols[cleanSym] {
 		o.activeStreamSymbols[cleanSym] = true
 	}
 
@@ -1070,7 +1178,52 @@ func (o *OandaProvider) Subscribe(ctx context.Context, symbol, resolution string
 	if bar, exists := o.activeCandles[subKey]; exists && bar != nil {
 		onCandle(*bar)
 	}
+
+	// Only coalesce a stream restart if a live stream is currently running WITHOUT cleanSym.
+	// If no stream is active yet, notifyCh wakes streamSupervisor immediately without tearing down anything.
+	if !isAlreadyStreaming && o.streamCancel != nil && !o.currentStreamSymbols[cleanSym] {
+		if o.restartTimer != nil {
+			o.restartTimer.Stop()
+		}
+		o.restartTimer = time.AfterFunc(50*time.Millisecond, func() {
+			o.streamMu.Lock()
+			defer o.streamMu.Unlock()
+			o.restartTimer = nil
+			if o.streamCancel != nil {
+				o.streamCancel()
+			}
+		})
+	}
 	o.streamMu.Unlock()
+
+	if ctx != nil && ctx.Done() != nil {
+		go func(done <-chan struct{}, sKey string, sID uint64, sym string) {
+			<-done
+			o.streamMu.Lock()
+			if o.isClosed {
+				o.streamMu.Unlock()
+				return
+			}
+			if listeners, ok := o.activeSubs[sKey]; ok {
+				delete(listeners, sID)
+				if len(listeners) == 0 {
+					delete(o.activeSubs, sKey)
+					delete(o.activeCandles, sKey)
+				}
+			}
+			hasMore := false
+			for k := range o.activeSubs {
+				if strings.HasPrefix(k, sym+"::") {
+					hasMore = true
+					break
+				}
+			}
+			if !hasMore {
+				o.scheduleTeardownLocked(sym)
+			}
+			o.streamMu.Unlock()
+		}(ctx.Done(), subKey, subID, cleanSym)
+	}
 
 	// Initial fetch to seed authentic historical bar from REST
 	go func() {
@@ -1082,17 +1235,10 @@ func (o *OandaProvider) Subscribe(ctx context.Context, symbol, resolution string
 			o.streamMu.Lock()
 			currentBar, hasCurrent := o.activeCandles[subKey]
 			if !hasCurrent || latest.Time > currentBar.Time {
-				o.activeCandles[subKey] = &latest
+				copyBar := latest
+				o.activeCandles[subKey] = &copyBar
 			} else if latest.Time == currentBar.Time {
-				if latest.High > currentBar.High {
-					currentBar.High = latest.High
-				}
-				if latest.Low < currentBar.Low && latest.Low > 0 {
-					currentBar.Low = latest.Low
-				}
-				if latest.Volume > currentBar.Volume {
-					currentBar.Volume = latest.Volume
-				}
+				candles[len(candles)-1] = reconcileActiveBar(currentBar, latest, false)
 			}
 			o.streamMu.Unlock()
 			for _, c := range candles {
@@ -1101,21 +1247,42 @@ func (o *OandaProvider) Subscribe(ctx context.Context, symbol, resolution string
 		}
 	}()
 
-	// Only if this symbol was not already streaming, restart stream supervisor to include the new instrument
-	if !isAlreadyStreaming {
-		o.streamMu.Lock()
-		if o.streamCancel != nil {
-			o.streamCancel()
-		}
-		o.streamMu.Unlock()
-	}
-
 	select {
 	case o.notifyCh <- struct{}{}:
 	default:
 	}
 
 	return nil
+}
+
+func (o *OandaProvider) scheduleTeardownLocked(cleanSym string) {
+	if t, ok := o.pendingTeardowns[cleanSym]; ok {
+		t.Stop()
+	}
+	o.pendingTeardowns[cleanSym] = time.AfterFunc(5*time.Second, func() {
+		o.streamMu.Lock()
+		defer o.streamMu.Unlock()
+		delete(o.pendingTeardowns, cleanSym)
+		if o.isClosed {
+			return
+		}
+
+		// Re-verify if any resolution was added for cleanSym during the grace period
+		stillHasMore := false
+		for k := range o.activeSubs {
+			if strings.HasPrefix(k, cleanSym+"::") {
+				stillHasMore = true
+				break
+			}
+		}
+
+		if !stillHasMore {
+			delete(o.activeStreamSymbols, cleanSym)
+			if o.streamCancel != nil {
+				o.streamCancel()
+			}
+		}
+	})
 }
 
 func (o *OandaProvider) Unsubscribe(symbol, resolution string) error {
@@ -1143,30 +1310,7 @@ func (o *OandaProvider) Unsubscribe(symbol, resolution string) error {
 		// Do not immediately cancel the stream!
 		// Switching timeframes (e.g. 30s -> 1m) invokes Unsubscribe followed by Subscribe within 100ms.
 		// Use a 5-second grace period before tearing down the stream for this instrument.
-		if t, ok := o.pendingTeardowns[cleanSym]; ok {
-			t.Stop()
-		}
-		o.pendingTeardowns[cleanSym] = time.AfterFunc(5*time.Second, func() {
-			o.streamMu.Lock()
-			defer o.streamMu.Unlock()
-			delete(o.pendingTeardowns, cleanSym)
-
-			// Re-verify if any resolution was added for cleanSym during the grace period
-			stillHasMore := false
-			for k := range o.activeSubs {
-				if strings.HasPrefix(k, cleanSym+"::") {
-					stillHasMore = true
-					break
-				}
-			}
-
-			if !stillHasMore {
-				delete(o.activeStreamSymbols, cleanSym)
-				if o.streamCancel != nil {
-					o.streamCancel()
-				}
-			}
-		})
+		o.scheduleTeardownLocked(cleanSym)
 	}
 	o.streamMu.Unlock()
 
@@ -1177,7 +1321,20 @@ func (o *OandaProvider) Unsubscribe(symbol, resolution string) error {
 func (o *OandaProvider) Close() error {
 	o.streamMu.Lock()
 	defer o.streamMu.Unlock()
-	o.isClosed = true
+	if !o.isClosed {
+		o.isClosed = true
+		if o.stopCh != nil {
+			close(o.stopCh)
+		}
+	}
+	if o.cancelLoad != nil {
+		o.cancelLoad()
+		o.cancelLoad = nil
+	}
+	if o.restartTimer != nil {
+		o.restartTimer.Stop()
+		o.restartTimer = nil
+	}
 	for _, t := range o.pendingTeardowns {
 		t.Stop()
 	}

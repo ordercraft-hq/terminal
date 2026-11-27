@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 
 	"github.com/ordercraft-hq/terminal/internal/indicators/wickra"
 	"go.starlark.net/starlark"
@@ -11,7 +12,7 @@ import (
 )
 
 // createTAModule builds the `ta` namespace struct containing vectorized math functions and the catalog bridge.
-func (e *Engine) createTAModule(sCtx *ScriptContext) *starlarkstruct.Struct {
+func (e *Engine) createTAModule(evalCtx context.Context, sCtx *ScriptContext) *starlarkstruct.Struct {
 	dict := starlark.StringDict{
 		"sma":        starlark.NewBuiltin("ta.sma", builtinSMA),
 		"ema":        starlark.NewBuiltin("ta.ema", builtinEMA),
@@ -30,7 +31,7 @@ func (e *Engine) createTAModule(sCtx *ScriptContext) *starlarkstruct.Struct {
 		"lowest":     starlark.NewBuiltin("ta.lowest", builtinLowest),
 		"crossover":  starlark.NewBuiltin("ta.crossover", builtinCrossover),
 		"crossunder": starlark.NewBuiltin("ta.crossunder", builtinCrossunder),
-		"call":       starlark.NewBuiltin("ta.call", e.makeBuiltinCatalogCall(sCtx)),
+		"call":       starlark.NewBuiltin("ta.call", e.makeBuiltinCatalogCall(evalCtx, sCtx)),
 	}
 
 	return starlarkstruct.FromStringDict(starlark.String("ta"), dict)
@@ -122,11 +123,55 @@ func MathWMA(data []float64, period int) []float64 {
 	}
 
 	denom := float64(period * (period + 1) / 2)
+	if period == 1 {
+		for i := 0; i < n; i++ {
+			res[i] = data[i]
+		}
+		return res
+	}
+
+	nanCount := 0
+	for i := 0; i < period-1; i++ {
+		if math.IsNaN(data[i]) {
+			nanCount++
+		}
+	}
+
+	var plainSum, weightedSum float64
+	hasClean := false
+	sinceAnchor := 0
+	const anchorInterval = 4096
+
 	for i := period - 1; i < n; i++ {
-		var weightedSum float64
-		for j := 0; j < period; j++ {
-			weight := float64(j + 1)
-			weightedSum += data[i-period+1+j] * weight
+		if math.IsNaN(data[i]) {
+			nanCount++
+		}
+		if i >= period && math.IsNaN(data[i-period]) {
+			nanCount--
+		}
+
+		if nanCount > 0 {
+			hasClean = false
+			continue
+		}
+
+		if !hasClean || sinceAnchor >= anchorInterval {
+			plainSum = 0
+			weightedSum = 0
+			base := i - period + 1
+			for j := 0; j < period; j++ {
+				v := data[base+j]
+				plainSum += v
+				weightedSum += v * float64(j+1)
+			}
+			hasClean = true
+			sinceAnchor = 0
+		} else {
+			xOut := data[i-period]
+			xIn := data[i]
+			weightedSum = weightedSum - plainSum + float64(period)*xIn
+			plainSum = plainSum - xOut + xIn
+			sinceAnchor++
 		}
 		res[i] = weightedSum / denom
 	}
@@ -164,36 +209,7 @@ func MathHMA(data []float64, period int) []float64 {
 		}
 	}
 
-	// Calculate WMA of diffSeries over sqrtPeriod, skipping NaN prefix
-	firstValid := -1
-	for i := 0; i < n; i++ {
-		if !math.IsNaN(diffSeries[i]) {
-			firstValid = i
-			break
-		}
-	}
-	if firstValid == -1 || n-firstValid < sqrtPeriod {
-		return res
-	}
-
-	denom := float64(sqrtPeriod * (sqrtPeriod + 1) / 2)
-	for i := firstValid + sqrtPeriod - 1; i < n; i++ {
-		var sum float64
-		valid := true
-		for j := 0; j < sqrtPeriod; j++ {
-			v := diffSeries[i-sqrtPeriod+1+j]
-			if math.IsNaN(v) {
-				valid = false
-				break
-			}
-			sum += v * float64(j+1)
-		}
-		if valid {
-			res[i] = sum / denom
-		}
-	}
-
-	return res
+	return MathWMA(diffSeries, sqrtPeriod)
 }
 
 func MathRMA(data []float64, period int) []float64 {
@@ -332,7 +348,7 @@ func MathATR(high, low, close []float64, period int) []float64 {
 	for i := range res {
 		res[i] = math.NaN()
 	}
-	if period <= 0 || n < period {
+	if period <= 0 || n < period || len(low) < n || len(close) < n {
 		return res
 	}
 
@@ -358,20 +374,128 @@ func MathBollinger(data []float64, period int, stddev float64) ([]float64, []flo
 		upper[i] = math.NaN()
 		lower[i] = math.NaN()
 	}
+	if period <= 0 || n < period {
+		return upper, mid, lower
+	}
+
+	nanCount := 0
+	for i := 0; i < period-1; i++ {
+		if math.IsNaN(data[i]) {
+			nanCount++
+		}
+	}
+
+	anchorInterval := period
+	if anchorInterval < 256 {
+		anchorInterval = 256
+	}
+
+	var m2 float64
+	hasClean := false
+	sinceAnchor := 0
+	pFloat := float64(period)
 
 	for i := period - 1; i < n; i++ {
-		m := mid[i]
-		var variance float64
-		for j := 0; j < period; j++ {
-			d := data[i-period+1+j] - m
-			variance += d * d
+		if math.IsNaN(data[i]) {
+			nanCount++
 		}
-		sd := math.Sqrt(variance / float64(period))
+		if i >= period && math.IsNaN(data[i-period]) {
+			nanCount--
+		}
+
+		m := mid[i]
+		if nanCount > 0 || math.IsNaN(m) {
+			hasClean = false
+			continue
+		}
+
+		if !hasClean || sinceAnchor >= anchorInterval {
+			m2 = 0
+			base := i - period + 1
+			for j := 0; j < period; j++ {
+				d := data[base+j] - m
+				m2 += d * d
+			}
+			hasClean = true
+			sinceAnchor = 0
+		} else {
+			xOld := data[i-period]
+			xNew := data[i]
+			mOld := mid[i-1]
+			m2 += (xNew - xOld) * ((xNew - m) + (xOld - mOld))
+			if m2 < 0 {
+				m2 = 0
+			}
+			sinceAnchor++
+		}
+
+		sd := math.Sqrt(m2 / pFloat)
 		upper[i] = m + stddev*sd
 		lower[i] = m - stddev*sd
 	}
 
 	return upper, mid, lower
+}
+
+func mathRollingExtreme(data []float64, period int, isMax bool) []float64 {
+	n := len(data)
+	res := make([]float64, n)
+	for i := range res {
+		res[i] = math.NaN()
+	}
+	if period <= 0 || n < period {
+		return res
+	}
+
+	// Ring-buffer monotonic deque storing indices into data.
+	capDQ := period + 1
+	dq := make([]int, capDQ)
+	head, tail := 0, 0
+
+	for i := 0; i < n; i++ {
+		// Evict indices outside [i-period+1 .. i]
+		minIdx := i - period + 1
+		if head != tail && dq[head] < minIdx {
+			head = (head + 1) % capDQ
+		}
+
+		val := data[i]
+		if !math.IsNaN(val) {
+			for head != tail {
+				backIdx := (tail - 1 + capDQ) % capDQ
+				backVal := data[dq[backIdx]]
+				if isMax {
+					if backVal > val {
+						break
+					}
+				} else {
+					if backVal < val {
+						break
+					}
+				}
+				tail = backIdx
+			}
+			dq[tail] = i
+			tail = (tail + 1) % capDQ
+		}
+
+		if i >= period-1 {
+			if math.IsNaN(val) || head == tail {
+				res[i] = math.NaN()
+			} else {
+				res[i] = data[dq[head]]
+			}
+		}
+	}
+	return res
+}
+
+func MathHighest(data []float64, period int) []float64 {
+	return mathRollingExtreme(data, period, true)
+}
+
+func MathLowest(data []float64, period int) []float64 {
+	return mathRollingExtreme(data, period, false)
 }
 
 func MathStoch(high, low, close []float64, periodK, periodD, smooth int) ([]float64, []float64) {
@@ -380,18 +504,23 @@ func MathStoch(high, low, close []float64, periodK, periodD, smooth int) ([]floa
 	for i := range kRaw {
 		kRaw[i] = math.NaN()
 	}
+	if periodK <= 0 || n < periodK || len(high) < n || len(low) < n {
+		k := MathSMA(kRaw, smooth)
+		d := MathSMA(k, periodD)
+		return k, d
+	}
+
+	highest := MathHighest(high, periodK)
+	lowest := MathLowest(low, periodK)
+	if len(highest) < n || len(lowest) < n {
+		k := MathSMA(kRaw, smooth)
+		d := MathSMA(k, periodD)
+		return k, d
+	}
 
 	for i := periodK - 1; i < n; i++ {
-		h := high[i]
-		l := low[i]
-		for j := 1; j < periodK; j++ {
-			if high[i-j] > h {
-				h = high[i-j]
-			}
-			if low[i-j] < l {
-				l = low[i-j]
-			}
-		}
+		h := highest[i]
+		l := lowest[i]
 		rng := h - l
 		if rng > 1e-12 {
 			kRaw[i] = ((close[i] - l) / rng) * 100.0
@@ -671,6 +800,9 @@ func builtinChange(thread *starlark.Thread, fn *starlark.Builtin, args starlark.
 	if err := starlark.UnpackArgs(fn.Name(), args, kwargs, "series", &seriesVal, "length?", &length); err != nil {
 		return nil, err
 	}
+	if length < 0 {
+		return nil, fmt.Errorf("ta.change length must be non-negative, got %d", length)
+	}
 	data, err := extractFloatSlice(seriesVal)
 	if err != nil {
 		return nil, err
@@ -700,24 +832,7 @@ func builtinHighest(thread *starlark.Thread, fn *starlark.Builtin, args starlark
 		return nil, err
 	}
 
-	res := make([]float64, len(data))
-	for i := range res {
-		res[i] = math.NaN()
-	}
-	if period <= 0 || len(data) < period {
-		return floatSliceToStarlarkList(res), nil
-	}
-
-	for i := period - 1; i < len(data); i++ {
-		h := data[i]
-		for j := 1; j < period; j++ {
-			if data[i-j] > h {
-				h = data[i-j]
-			}
-		}
-		res[i] = h
-	}
-	return floatSliceToStarlarkList(res), nil
+	return floatSliceToStarlarkList(MathHighest(data, period)), nil
 }
 
 func builtinLowest(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
@@ -733,24 +848,7 @@ func builtinLowest(thread *starlark.Thread, fn *starlark.Builtin, args starlark.
 		return nil, err
 	}
 
-	res := make([]float64, len(data))
-	for i := range res {
-		res[i] = math.NaN()
-	}
-	if period <= 0 || len(data) < period {
-		return floatSliceToStarlarkList(res), nil
-	}
-
-	for i := period - 1; i < len(data); i++ {
-		l := data[i]
-		for j := 1; j < period; j++ {
-			if data[i-j] < l {
-				l = data[i-j]
-			}
-		}
-		res[i] = l
-	}
-	return floatSliceToStarlarkList(res), nil
+	return floatSliceToStarlarkList(MathLowest(data, period)), nil
 }
 
 func builtinCrossover(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
@@ -817,8 +915,42 @@ func builtinCrossunder(thread *starlark.Thread, fn *starlark.Builtin, args starl
 	return floatSliceToStarlarkList(res), nil
 }
 
+func mapSeriesPointsToTimestamps(timestamps []int64, pts []wickra.SeriesPoint) []float64 {
+	n := len(timestamps)
+	vals := make([]float64, n)
+	for i := range vals {
+		vals[i] = math.NaN()
+	}
+	if n == 0 || len(pts) == 0 {
+		return vals
+	}
+
+	// Fast zero-alloc scan when timestamps are sorted ascending (standard time-series order).
+	ti := 0
+	for _, p := range pts {
+		for ti < n && timestamps[ti] < p.Time {
+			ti++
+		}
+		if ti < n && timestamps[ti] == p.Time {
+			vals[ti] = p.Value
+			ti++
+			continue
+		}
+		// Out-of-order or negative offset: binary search sorted timestamps.
+		idx := sort.Search(n, func(i int) bool { return timestamps[i] >= p.Time })
+		if idx < n && timestamps[idx] == p.Time {
+			vals[idx] = p.Value
+			ti = idx + 1
+		}
+	}
+	return vals
+}
+
 // makeBuiltinCatalogCall creates the `ta.call(name, inputs)` bridge to Wickra WebAssembly runtime.
-func (e *Engine) makeBuiltinCatalogCall(sCtx *ScriptContext) func(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+func (e *Engine) makeBuiltinCatalogCall(evalCtx context.Context, sCtx *ScriptContext) func(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	if evalCtx == nil {
+		evalCtx = context.Background()
+	}
 	return func(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 		var (
 			indName   string
@@ -832,9 +964,10 @@ func (e *Engine) makeBuiltinCatalogCall(sCtx *ScriptContext) func(thread *starla
 			return nil, fmt.Errorf("wickra wasm engine is not configured")
 		}
 
-		inputs := make(map[string]interface{})
+		var inputs map[string]interface{}
 		if inputsVal != nil {
-			if d, ok := inputsVal.(*starlark.Dict); ok {
+			if d, ok := inputsVal.(*starlark.Dict); ok && d.Len() > 0 {
+				inputs = make(map[string]interface{}, d.Len())
 				for _, item := range d.Items() {
 					k, _ := item[0].(starlark.String)
 					switch v := item[1].(type) {
@@ -852,17 +985,7 @@ func (e *Engine) makeBuiltinCatalogCall(sCtx *ScriptContext) func(thread *starla
 			}
 		}
 
-		candles := make([]wickra.CandleData, len(sCtx.Time))
-		for i := range candles {
-			candles[i] = wickra.CandleData{
-				Time:   sCtx.Time[i],
-				Open:   sCtx.Open[i],
-				High:   sCtx.High[i],
-				Low:    sCtx.Low[i],
-				Close:  sCtx.Close[i],
-				Volume: sCtx.Volume[i],
-			}
-		}
+		candles := sCtx.Candles()
 
 		evalInstance := wickra.EvalIndicatorInstance{
 			InstanceID:  "ta_call",
@@ -870,7 +993,7 @@ func (e *Engine) makeBuiltinCatalogCall(sCtx *ScriptContext) func(thread *starla
 			Inputs:      inputs,
 		}
 
-		res, err := e.wickraEngine.Evaluate(context.Background(), candles, []wickra.EvalIndicatorInstance{evalInstance})
+		res, err := e.wickraEngine.Evaluate(evalCtx, candles, []wickra.EvalIndicatorInstance{evalInstance})
 		if err != nil {
 			return nil, fmt.Errorf("ta.call(%s) failed: %w", indName, err)
 		}
@@ -882,40 +1005,14 @@ func (e *Engine) makeBuiltinCatalogCall(sCtx *ScriptContext) func(thread *starla
 		plots := res[0].Plots
 		if len(plots) == 1 {
 			for _, pts := range plots {
-				vals := make([]float64, len(sCtx.Time))
-				for i := range vals {
-					vals[i] = math.NaN()
-				}
-				ptMap := make(map[int64]float64, len(pts))
-				for _, p := range pts {
-					ptMap[p.Time] = p.Value
-				}
-				for i, t := range sCtx.Time {
-					if v, ok := ptMap[t]; ok {
-						vals[i] = v
-					}
-				}
-				return floatSliceToStarlarkList(vals), nil
+				return floatSliceToStarlarkList(mapSeriesPointsToTimestamps(sCtx.Time, pts)), nil
 			}
 		}
 
 		// Multi-plot result
-		outDict := starlark.StringDict{}
+		outDict := make(starlark.StringDict, len(plots))
 		for plotID, pts := range plots {
-			vals := make([]float64, len(sCtx.Time))
-			for i := range vals {
-				vals[i] = math.NaN()
-			}
-			ptMap := make(map[int64]float64, len(pts))
-			for _, p := range pts {
-				ptMap[p.Time] = p.Value
-			}
-			for i, t := range sCtx.Time {
-				if v, ok := ptMap[t]; ok {
-					vals[i] = v
-				}
-			}
-			outDict[plotID] = floatSliceToStarlarkList(vals)
+			outDict[plotID] = floatSliceToStarlarkList(mapSeriesPointsToTimestamps(sCtx.Time, pts))
 		}
 		return starlarkstruct.FromStringDict(starlark.String("TaCallResult"), outDict), nil
 	}

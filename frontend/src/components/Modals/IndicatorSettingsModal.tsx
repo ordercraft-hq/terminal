@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
-import { useSyncStore } from '../../store/syncStore';
+import { useSyncStore, createDefaultVolumeIndicator } from '../../store/syncStore';
 import { INDICATOR_REGISTRY, SOURCE_OPTIONS } from '../../indicators/registry';
 import { normalizeIndicatorId } from '../../indicators/migration';
 import type {
@@ -19,16 +19,20 @@ type TabType = 'inputs' | 'style' | 'visibility';
 export const IndicatorSettingsModal: React.FC = () => {
   const activeSettings = useSyncStore((s) => s.activeSettingsIndicator);
   const closeIndicatorSettings = useSyncStore((s) => s.closeIndicatorSettings);
-  const indicatorsMap = useSyncStore((s) => s.indicators);
+  const paneId = activeSettings?.paneId ?? '';
+  const indicatorId = activeSettings?.indicatorId ?? '';
+  const paneIndicators = useSyncStore((s) => (paneId ? s.indicators[paneId] : undefined));
   const updateIndicatorInputs = useSyncStore((s) => s.updateIndicatorInputs);
   const updateIndicatorStyles = useSyncStore((s) => s.updateIndicatorStyles);
   const updateIndicatorBands = useSyncStore((s) => s.updateIndicatorBands);
   const updateIndicatorLevels = useSyncStore((s) => s.updateIndicatorLevels);
   const updateIndicatorMeta = useSyncStore((s) => s.updateIndicatorMeta);
+  const commitSnapshot = useSyncStore((s) => s.commitSnapshot);
 
-  const paneId = activeSettings?.paneId ?? '';
-  const indicatorId = activeSettings?.indicatorId ?? '';
-  const indicator = indicatorsMap[paneId]?.find((ind) => ind.id === indicatorId);
+  const currentIndicators = paneIndicators !== undefined
+    ? paneIndicators
+    : (paneId ? [createDefaultVolumeIndicator(paneId)] : []);
+  const indicator = currentIndicators.find((ind) => ind.id === indicatorId);
   const def = indicator
     ? INDICATOR_REGISTRY[indicator.type] ||
       INDICATOR_REGISTRY[normalizeIndicatorId(indicator.type)] ||
@@ -46,6 +50,7 @@ export const IndicatorSettingsModal: React.FC = () => {
   const [localLabelsOnPriceScale, setLocalLabelsOnPriceScale] = useState<boolean>(true);
   const [localValuesInStatusLine, setLocalValuesInStatusLine] = useState<boolean>(true);
   const [localInputsInStatusLine, setLocalInputsInStatusLine] = useState<boolean>(true);
+  const [localVisibility, setLocalVisibility] = useState<Record<string, boolean>>({});
   const [showTemplateMenu, setShowTemplateMenu] = useState(false);
   const [plotTypeDropdownPlotId, setPlotTypeDropdownPlotId] = useState<string | null>(null);
 
@@ -61,7 +66,9 @@ export const IndicatorSettingsModal: React.FC = () => {
     showLabelsOnPriceScale?: boolean;
     showValuesInStatusLine?: boolean;
     showInputsInStatusLine?: boolean;
+    visibility?: Record<string, boolean>;
   } | null>(null);
+  const hasEditedRef = useRef<boolean>(false);
 
   // Sync draft when incoming indicator changes or modal opens
   useEffect(() => {
@@ -107,9 +114,9 @@ export const IndicatorSettingsModal: React.FC = () => {
         }
       }
 
-      // Backfill missing bands or styles in store if indicator was created without them
+      // Backfill missing bands or styles in store if indicator was created without them (never pollute undo stack)
       if (!indicator.bands && def?.defaultBands && def.defaultBands.length > 0) {
-        updateIndicatorBands(paneId, indicatorId, def.defaultBands);
+        updateIndicatorBands(paneId, indicatorId, def.defaultBands, true);
       }
       if (def?.defaultStyles) {
         let hasMissingStyles = false;
@@ -120,10 +127,11 @@ export const IndicatorSettingsModal: React.FC = () => {
           }
         }
         if (hasMissingStyles) {
-          updateIndicatorStyles(paneId, indicatorId, baseStyles);
+          updateIndicatorStyles(paneId, indicatorId, baseStyles, true);
         }
       }
 
+      hasEditedRef.current = false;
       const snap = {
         inputs: JSON.parse(JSON.stringify(indicator.inputs || {})),
         styles: baseStyles,
@@ -135,6 +143,7 @@ export const IndicatorSettingsModal: React.FC = () => {
         showLabelsOnPriceScale: indicator.showLabelsOnPriceScale,
         showValuesInStatusLine: indicator.showValuesInStatusLine,
         showInputsInStatusLine: indicator.showInputsInStatusLine,
+        visibility: indicator.visibility ? { ...indicator.visibility } : undefined,
       };
       originalSnapshotRef.current = snap;
       setLocalInputs(snap.inputs);
@@ -164,6 +173,7 @@ export const IndicatorSettingsModal: React.FC = () => {
       setLocalLabelsOnPriceScale(snap.showLabelsOnPriceScale !== false);
       setLocalValuesInStatusLine(snap.showValuesInStatusLine !== false);
       setLocalInputsInStatusLine(snap.showInputsInStatusLine !== false);
+      setLocalVisibility(snap.visibility || {});
       setActiveTab('inputs');
       setShowTemplateMenu(false);
       setPlotTypeDropdownPlotId(null);
@@ -259,14 +269,16 @@ export const IndicatorSettingsModal: React.FC = () => {
 
   if (!isOpen || !indicator || !def) return null;
 
-  // Real-time live update for instant interactive preview
+  // Real-time live preview without polluting undo stack on every drag frame
   const handleInputChange = (key: string, value: IndicatorInputValue) => {
+    hasEditedRef.current = true;
     const next: IndicatorInputValues = { ...localInputs, [key]: value };
     setLocalInputs(next);
-    updateIndicatorInputs(paneId, indicatorId, next);
+    updateIndicatorInputs(paneId, indicatorId, next, true);
   };
 
   const handleStyleChange = (plotId: string, partial: Partial<IndicatorPlotStyle>) => {
+    hasEditedRef.current = true;
     const defaultColor =
       plotId === 'up' ? '#089981' : plotId === 'down' ? '#f23645' : '#2962ff';
     const existing = localStyles[plotId] || def?.defaultStyles[plotId] || {
@@ -280,45 +292,51 @@ export const IndicatorSettingsModal: React.FC = () => {
       [plotId]: { ...existing, ...partial, priceLineVisible: false },
     };
     setLocalStyles(nextStyles);
-    updateIndicatorStyles(paneId, indicatorId, nextStyles);
+    updateIndicatorStyles(paneId, indicatorId, nextStyles, true);
   };
 
   const handleBandChange = (bandIndex: number, partial: Partial<IndicatorBandStyle>) => {
+    hasEditedRef.current = true;
     const nextBands = localBands.map((b, idx) =>
       idx === bandIndex ? { ...b, ...partial } : b
     );
     setLocalBands(nextBands);
-    updateIndicatorBands(paneId, indicatorId, nextBands);
+    updateIndicatorBands(paneId, indicatorId, nextBands, true);
   };
 
   const handleLevelChange = (levelIndex: number, partial: Partial<IndicatorLevelStyle>) => {
+    hasEditedRef.current = true;
     const nextLevels = localLevels.map((l, idx) =>
       idx === levelIndex ? { ...l, ...partial } : l
     );
     setLocalLevels(nextLevels);
-    updateIndicatorLevels(paneId, indicatorId, nextLevels);
+    updateIndicatorLevels(paneId, indicatorId, nextLevels, true);
   };
 
   const handleTimeframeChange = (tf: string) => {
+    hasEditedRef.current = true;
     setLocalTimeframe(tf);
-    updateIndicatorMeta(paneId, indicatorId, { timeframe: tf });
+    updateIndicatorMeta(paneId, indicatorId, { timeframe: tf }, true);
   };
 
   const handleWaitForCloseChange = (wait: boolean) => {
+    hasEditedRef.current = true;
     setLocalWaitForClose(wait);
-    updateIndicatorMeta(paneId, indicatorId, { waitForClose: wait });
+    updateIndicatorMeta(paneId, indicatorId, { waitForClose: wait }, true);
   };
 
   const handlePrecisionChange = (p: string) => {
+    hasEditedRef.current = true;
     setLocalPrecision(p);
     updateIndicatorMeta(paneId, indicatorId, {
       precision: p === 'default' ? 'default' : parseInt(p, 10),
-    });
+    }, true);
   };
 
   const handleLabelsOnPriceScaleToggle = (visible: boolean) => {
+    hasEditedRef.current = true;
     setLocalLabelsOnPriceScale(visible);
-    updateIndicatorMeta(paneId, indicatorId, { showLabelsOnPriceScale: visible });
+    updateIndicatorMeta(paneId, indicatorId, { showLabelsOnPriceScale: visible }, true);
     // Also sync to plot styles lastValueVisible
     const nextStyles: Record<string, IndicatorPlotStyle> = {};
     for (const plotId of Object.keys(def.plotLabels)) {
@@ -334,32 +352,45 @@ export const IndicatorSettingsModal: React.FC = () => {
       };
     }
     setLocalStyles(nextStyles);
-    updateIndicatorStyles(paneId, indicatorId, nextStyles);
+    updateIndicatorStyles(paneId, indicatorId, nextStyles, true);
   };
 
   const handleValuesInStatusLineToggle = (visible: boolean) => {
+    hasEditedRef.current = true;
     setLocalValuesInStatusLine(visible);
-    updateIndicatorMeta(paneId, indicatorId, { showValuesInStatusLine: visible });
+    updateIndicatorMeta(paneId, indicatorId, { showValuesInStatusLine: visible }, true);
   };
 
   const handleInputsInStatusLineToggle = (visible: boolean) => {
+    hasEditedRef.current = true;
     setLocalInputsInStatusLine(visible);
-    updateIndicatorMeta(paneId, indicatorId, { showInputsInStatusLine: visible });
+    updateIndicatorMeta(paneId, indicatorId, { showInputsInStatusLine: visible }, true);
+  };
+
+  const handleVisibilityToggle = (tfKey: string, checked: boolean) => {
+    hasEditedRef.current = true;
+    const nextVis = { ...localVisibility, [tfKey]: checked };
+    setLocalVisibility(nextVis);
+    updateIndicatorMeta(paneId, indicatorId, { visibility: nextVis }, true);
   };
 
   const handleOk = () => {
+    if (hasEditedRef.current) {
+      commitSnapshot('modify indicator settings');
+      hasEditedRef.current = false;
+    }
     closeIndicatorSettings();
   };
 
   const handleCancel = () => {
-    if (originalSnapshotRef.current) {
-      updateIndicatorInputs(paneId, indicatorId, originalSnapshotRef.current.inputs);
-      updateIndicatorStyles(paneId, indicatorId, originalSnapshotRef.current.styles);
+    if (originalSnapshotRef.current && hasEditedRef.current) {
+      updateIndicatorInputs(paneId, indicatorId, originalSnapshotRef.current.inputs, true);
+      updateIndicatorStyles(paneId, indicatorId, originalSnapshotRef.current.styles, true);
       if (originalSnapshotRef.current.bands) {
-        updateIndicatorBands(paneId, indicatorId, originalSnapshotRef.current.bands);
+        updateIndicatorBands(paneId, indicatorId, originalSnapshotRef.current.bands, true);
       }
       if (originalSnapshotRef.current.levels) {
-        updateIndicatorLevels(paneId, indicatorId, originalSnapshotRef.current.levels);
+        updateIndicatorLevels(paneId, indicatorId, originalSnapshotRef.current.levels, true);
       }
       updateIndicatorMeta(paneId, indicatorId, {
         precision: originalSnapshotRef.current.precision,
@@ -368,39 +399,110 @@ export const IndicatorSettingsModal: React.FC = () => {
         showLabelsOnPriceScale: originalSnapshotRef.current.showLabelsOnPriceScale,
         showValuesInStatusLine: originalSnapshotRef.current.showValuesInStatusLine,
         showInputsInStatusLine: originalSnapshotRef.current.showInputsInStatusLine,
-      });
+        visibility: originalSnapshotRef.current.visibility,
+      }, true);
     }
+    hasEditedRef.current = false;
     closeIndicatorSettings();
   };
 
-  const handleApplyDefaults = () => {
-    setLocalInputs(def.defaultInputs);
-    setLocalStyles(def.defaultStyles);
-    if (def.defaultBands) setLocalBands(def.defaultBands);
-    if (def.defaultLevels) setLocalLevels(def.defaultLevels);
-    setLocalPrecision('default');
-    setLocalTimeframe('chart');
-    setLocalWaitForClose(true);
-    setLocalLabelsOnPriceScale(true);
-    setLocalValuesInStatusLine(true);
-    setLocalInputsInStatusLine(true);
+  const getDefaultStorageKey = (indType: string) => `ordercraft_indicator_default_${indType}`;
 
-    updateIndicatorInputs(paneId, indicatorId, def.defaultInputs);
-    updateIndicatorStyles(paneId, indicatorId, def.defaultStyles);
-    if (def.defaultBands) updateIndicatorBands(paneId, indicatorId, def.defaultBands);
-    if (def.defaultLevels) updateIndicatorLevels(paneId, indicatorId, def.defaultLevels);
+  const handleApplyDefaults = () => {
+    hasEditedRef.current = true;
+    let nextInputs: IndicatorInputValues = { ...def.defaultInputs };
+    let nextStyles: Record<string, IndicatorPlotStyle> = { ...def.defaultStyles };
+    let nextBands = def.defaultBands;
+    let nextLevels = def.defaultLevels;
+    let nextPrecision: number | 'default' = 'default';
+    let nextTimeframe = 'chart';
+    let nextWaitForClose = true;
+    let nextLabelsOnPriceScale = true;
+    let nextValuesInStatusLine = true;
+    let nextInputsInStatusLine = true;
+    let nextVisibility: Record<string, boolean> = {};
+
+    try {
+      const savedRaw = localStorage.getItem(getDefaultStorageKey(indicator.type));
+      if (savedRaw) {
+        const parsed = JSON.parse(savedRaw) as {
+          inputs?: IndicatorInputValues;
+          styles?: Record<string, IndicatorPlotStyle>;
+          bands?: IndicatorBandStyle[];
+          levels?: IndicatorLevelStyle[];
+          precision?: number | 'default';
+          timeframe?: string;
+          waitForClose?: boolean;
+          showLabelsOnPriceScale?: boolean;
+          showValuesInStatusLine?: boolean;
+          showInputsInStatusLine?: boolean;
+          visibility?: Record<string, boolean>;
+        };
+        if (parsed.inputs) nextInputs = parsed.inputs;
+        if (parsed.styles) nextStyles = parsed.styles;
+        if (parsed.bands) nextBands = parsed.bands;
+        if (parsed.levels) nextLevels = parsed.levels;
+        if (parsed.precision !== undefined) nextPrecision = parsed.precision;
+        if (parsed.timeframe !== undefined) nextTimeframe = parsed.timeframe;
+        if (parsed.waitForClose !== undefined) nextWaitForClose = parsed.waitForClose;
+        if (parsed.showLabelsOnPriceScale !== undefined) nextLabelsOnPriceScale = parsed.showLabelsOnPriceScale;
+        if (parsed.showValuesInStatusLine !== undefined) nextValuesInStatusLine = parsed.showValuesInStatusLine;
+        if (parsed.showInputsInStatusLine !== undefined) nextInputsInStatusLine = parsed.showInputsInStatusLine;
+        if (parsed.visibility) nextVisibility = parsed.visibility;
+      }
+    } catch {
+      // Fallback to factory defaults
+    }
+
+    setLocalInputs(nextInputs);
+    setLocalStyles(nextStyles);
+    if (nextBands) setLocalBands(nextBands);
+    if (nextLevels) setLocalLevels(nextLevels);
+    setLocalPrecision(String(nextPrecision));
+    setLocalTimeframe(nextTimeframe);
+    setLocalWaitForClose(nextWaitForClose);
+    setLocalLabelsOnPriceScale(nextLabelsOnPriceScale);
+    setLocalValuesInStatusLine(nextValuesInStatusLine);
+    setLocalInputsInStatusLine(nextInputsInStatusLine);
+    setLocalVisibility(nextVisibility);
+
+    updateIndicatorInputs(paneId, indicatorId, nextInputs, true);
+    updateIndicatorStyles(paneId, indicatorId, nextStyles, true);
+    if (nextBands) updateIndicatorBands(paneId, indicatorId, nextBands, true);
+    if (nextLevels) updateIndicatorLevels(paneId, indicatorId, nextLevels, true);
     updateIndicatorMeta(paneId, indicatorId, {
-      precision: 'default',
-      timeframe: 'chart',
-      waitForClose: true,
-      showLabelsOnPriceScale: true,
-      showValuesInStatusLine: true,
-      showInputsInStatusLine: true,
-    });
+      precision: nextPrecision,
+      timeframe: nextTimeframe,
+      waitForClose: nextWaitForClose,
+      showLabelsOnPriceScale: nextLabelsOnPriceScale,
+      showValuesInStatusLine: nextValuesInStatusLine,
+      showInputsInStatusLine: nextInputsInStatusLine,
+      visibility: nextVisibility,
+    }, true);
     setShowTemplateMenu(false);
   };
 
   const handleSaveAsDefault = () => {
+    try {
+      localStorage.setItem(
+        getDefaultStorageKey(indicator.type),
+        JSON.stringify({
+          inputs: localInputs,
+          styles: localStyles,
+          bands: localBands,
+          levels: localLevels,
+          precision: localPrecision === 'default' ? 'default' : parseInt(localPrecision, 10),
+          timeframe: localTimeframe,
+          waitForClose: localWaitForClose,
+          showLabelsOnPriceScale: localLabelsOnPriceScale,
+          showValuesInStatusLine: localValuesInStatusLine,
+          showInputsInStatusLine: localInputsInStatusLine,
+          visibility: localVisibility,
+        })
+      );
+    } catch {
+      // Ignore storage quota errors
+    }
     setShowTemplateMenu(false);
   };
 
@@ -909,19 +1011,23 @@ export const IndicatorSettingsModal: React.FC = () => {
               Select which timeframe ranges this indicator is active and visible on:
             </p>
             <div className="grid grid-cols-2 gap-2.5 pt-1">
-              {['Ticks', 'Seconds', 'Minutes', 'Hours', 'Days', 'Weeks'].map((tf) => (
-                <label
-                  key={tf}
-                  className="flex items-center space-x-2 text-xs text-[#d1d4dc] cursor-pointer select-none"
-                >
-                  <input
-                    type="checkbox"
-                    defaultChecked
-                    className="rounded border-[#363a45] bg-[#131722] text-[#2962ff] focus:ring-0 cursor-pointer w-4 h-4"
-                  />
-                  <span>{tf}</span>
-                </label>
-              ))}
+              {(['ticks', 'seconds', 'minutes', 'hours', 'days', 'weeks'] as const).map((tfKey) => {
+                const label = tfKey.charAt(0).toUpperCase() + tfKey.slice(1);
+                return (
+                  <label
+                    key={tfKey}
+                    className="flex items-center space-x-2 text-xs text-[#d1d4dc] cursor-pointer select-none"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={localVisibility[tfKey] !== false}
+                      onChange={(e) => handleVisibilityToggle(tfKey, e.target.checked)}
+                      className="rounded border-[#363a45] bg-[#131722] text-[#2962ff] focus:ring-0 cursor-pointer w-4 h-4"
+                    />
+                    <span>{label}</span>
+                  </label>
+                );
+              })}
             </div>
           </div>
         )}

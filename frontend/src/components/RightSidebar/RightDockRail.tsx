@@ -10,9 +10,12 @@ import {
   Bell,
   HelpCircle,
   Bug,
+  Activity,
 } from 'lucide-react';
 import { useSyncStore } from '../../store/syncStore';
 import type { RightSidebarTab } from '../../store/syncStore';
+import type { ProvidersStatusResponse } from '../../transport/client';
+import { getSharedProvidersStatus, subscribeProvidersStatus } from './providerStatusCache';
 
 interface DockItem {
   id: NonNullable<RightSidebarTab>;
@@ -26,24 +29,42 @@ interface DockItem {
 export const RightDockRail: React.FC = () => {
   const activeTab = useSyncStore((s) => s.activeRightSidebarTab);
   const toggleTab = useSyncStore((s) => s.toggleRightSidebarTab);
-  const alertLogs = useSyncStore((s) => s.alertLogs);
+  const alertLogsCount = useSyncStore((s) => s.alertLogs.length);
   const isUpdateAvailable = useSyncStore((s) => s.updateCheckResult?.status === 'update_available');
+  const hasL2Provider = useSyncStore((s) => s.hasL2Provider);
+  const setHasL2Provider = useSyncStore((s) => s.setHasL2Provider);
   const [providerCount, setProviderCount] = React.useState<number>(3);
 
   React.useEffect(() => {
-    let mounted = true;
-    fetch('/api/providers/status')
-      .then((res) => (res.ok ? res.json() : null))
+    const controller = new AbortController();
+    const applyStatus = (data: ProvidersStatusResponse) => {
+      if (Array.isArray(data.providers)) {
+        setProviderCount(data.providers.length);
+        const hasL2 = data.providers.some(
+          (p) =>
+            p.dataTier === 'L2' ||
+            p.type === 'l2_bridge' ||
+            p.id === 'DATABRIDGE' ||
+            (p.name && p.name.toLowerCase().includes('databridge'))
+        );
+        setHasL2Provider(hasL2);
+      }
+    };
+
+    const unsubscribe = subscribeProvidersStatus(applyStatus);
+    getSharedProvidersStatus(false, controller.signal)
       .then((data) => {
-        if (mounted && data && Array.isArray(data.providers)) {
-          setProviderCount(data.providers.length);
+        if (!controller.signal.aborted) {
+          applyStatus(data);
         }
       })
       .catch(() => {});
+
     return () => {
-      mounted = false;
+      controller.abort();
+      unsubscribe();
     };
-  }, []);
+  }, [setHasL2Provider]);
 
   const dockTopItems: DockItem[] = [
     {
@@ -93,7 +114,7 @@ export const RightDockRail: React.FC = () => {
       id: 'notifications',
       label: 'Notifications & Logs',
       icon: <Bell size={18} strokeWidth={1.75} />,
-      badge: alertLogs.length > 0 ? alertLogs.length : undefined,
+      badge: alertLogsCount > 0 ? alertLogsCount : undefined,
       badgeColor: '#f23645',
     },
   ];
@@ -113,6 +134,15 @@ export const RightDockRail: React.FC = () => {
       badgeColor: '#2962ff',
     },
   ];
+
+  const orderflowDockItem: DockItem = {
+    id: 'orderflow',
+    label: 'Orderflow & Footprint Settings',
+    icon: <Activity size={18} strokeWidth={1.8} />,
+    badge: 'L2',
+    badgeColor: '#7b1fa2',
+    customColor: '#00b4d8',
+  };
 
   const renderItem = (item: DockItem) => {
     const isActive = activeTab === item.id;
@@ -164,13 +194,20 @@ export const RightDockRail: React.FC = () => {
   };
 
   return (
-    <aside className="w-11 min-w-[44px] h-full bg-[#131722] border-l border-[#2a2e39] flex flex-col items-center justify-between py-2 select-none z-40">
+    <aside className="w-11 min-w-[44px] h-full bg-[#131722] border-l border-[#2a2e39] flex flex-col items-center justify-between py-2 select-none z-20">
       {/* Top Group: Watchlist, Alerts, Object Tree, Movers, News, Calendar */}
       <div className="flex flex-col items-center w-full">
         {dockTopItems.map(renderItem)}
         <div className="w-5 h-[1px] bg-[#2a2e39] my-2" />
         {dockCenterItems.map(renderItem)}
       </div>
+
+      {/* Middle Group: Orderflow Settings (Visible only when an L2 provider exists) */}
+      {hasL2Provider && (
+        <div className="flex flex-col items-center w-full my-auto py-1">
+          {renderItem(orderflowDockItem)}
+        </div>
+      )}
 
       {/* Bottom Group: Data Providers, Notifications, Divider, Help */}
       <div className="flex flex-col items-center w-full">

@@ -2,7 +2,6 @@ package datafeed
 
 import (
 	"math"
-	"sort"
 )
 
 // SpreadOp defines the arithmetic operator applied between series.
@@ -90,132 +89,166 @@ func LinearCombination(series [][]float64, weights []float64) []float64 {
 	return out
 }
 
-// SynthesizeSpreadCandles combines two candle series into synthetic OHLCV bars.
+func isSortedUniqueCandles(candles []Candle) bool {
+	for i := 1; i < len(candles); i++ {
+		if candles[i].Time <= candles[i-1].Time {
+			return false
+		}
+	}
+	return true
+}
+
+func computeSpreadCandle(t int64, ca, cb Candle, op SpreadOp) (Candle, bool) {
+	synth := Candle{Time: t}
+
+	switch op {
+	case SpreadOpSub:
+		synth.Open = ca.Open - cb.Open
+		synth.Close = ca.Close - cb.Close
+		hDiff := ca.High - cb.Low
+		lDiff := ca.Low - cb.High
+		synth.High = math.Max(synth.Open, math.Max(synth.Close, hDiff))
+		synth.Low = math.Min(synth.Open, math.Min(synth.Close, lDiff))
+		synth.Volume = ca.Volume + cb.Volume
+
+	case SpreadOpDiv:
+		if cb.Open == 0 || cb.Close == 0 || cb.Low == 0 || cb.High == 0 || (cb.Low <= 0 && cb.High >= 0) {
+			return Candle{}, false
+		}
+		synth.Open = ca.Open / cb.Open
+		synth.Close = ca.Close / cb.Close
+		r1 := ca.High / cb.High
+		r2 := ca.High / cb.Low
+		r3 := ca.Low / cb.High
+		r4 := ca.Low / cb.Low
+		maxR := math.Max(r1, math.Max(r2, math.Max(r3, r4)))
+		minR := math.Min(r1, math.Min(r2, math.Min(r3, r4)))
+		synth.High = math.Max(synth.Open, math.Max(synth.Close, maxR))
+		synth.Low = math.Min(synth.Open, math.Min(synth.Close, minR))
+		synth.Volume = ca.Volume
+
+	case SpreadOpAdd:
+		synth.Open = ca.Open + cb.Open
+		synth.Close = ca.Close + cb.Close
+		synth.High = math.Max(synth.Open, math.Max(synth.Close, ca.High+cb.High))
+		synth.Low = math.Min(synth.Open, math.Min(synth.Close, ca.Low+cb.Low))
+		synth.Volume = ca.Volume + cb.Volume
+
+	case SpreadOpMul:
+		synth.Open = ca.Open * cb.Open
+		synth.Close = ca.Close * cb.Close
+		p1 := ca.High * cb.High
+		p2 := ca.High * cb.Low
+		p3 := ca.Low * cb.High
+		p4 := ca.Low * cb.Low
+		maxP := math.Max(p1, math.Max(p2, math.Max(p3, p4)))
+		minP := math.Min(p1, math.Min(p2, math.Min(p3, p4)))
+		synth.High = math.Max(synth.Open, math.Max(synth.Close, maxP))
+		synth.Low = math.Min(synth.Open, math.Min(synth.Close, minP))
+		synth.Volume = ca.Volume
+	}
+
+	// Enforce candle geometric invariant: High >= Low, High >= max(Open, Close), Low <= min(Open, Close)
+	if synth.High < synth.Low {
+		synth.High, synth.Low = synth.Low, synth.High
+	}
+
+	if math.IsNaN(synth.Open) || math.IsNaN(synth.High) || math.IsNaN(synth.Low) || math.IsNaN(synth.Close) ||
+		math.IsInf(synth.Open, 0) || math.IsInf(synth.High, 0) || math.IsInf(synth.Low, 0) || math.IsInf(synth.Close, 0) {
+		return Candle{}, false
+	}
+
+	return synth, true
+}
+
+// SynthesizeSpreadCandles combines two candle series into synthetic OHLCV bars
+// using a linear two-pointer merge over sorted candle slices.
 func SynthesizeSpreadCandles(a, b []Candle, op SpreadOp, mode AlignmentMode) []Candle {
 	if len(a) == 0 || len(b) == 0 {
 		return nil
 	}
 
-	// Build map for series B
-	bMap := make(map[int64]Candle, len(b))
-	for _, cb := range b {
-		bMap[cb.Time] = cb
+	if !isSortedUniqueCandles(a) {
+		a = deduplicateAndSort(a)
+	}
+	if !isSortedUniqueCandles(b) {
+		b = deduplicateAndSort(b)
 	}
 
-	// Union of sorted timestamps
-	timeSet := make(map[int64]bool)
-	for _, ca := range a {
-		timeSet[ca.Time] = true
-	}
-	if mode == AlignForwardFill {
-		for _, cb := range b {
-			timeSet[cb.Time] = true
-		}
-	}
-
-	times := make([]int64, 0, len(timeSet))
-	for t := range timeSet {
-		times = append(times, t)
-	}
-	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
-
-	aMap := make(map[int64]Candle, len(a))
-	for _, ca := range a {
-		aMap[ca.Time] = ca
-	}
-
-	var out []Candle
-	var lastA, lastB *Candle
-
-	for _, t := range times {
-		ca, hasA := aMap[t]
-		cb, hasB := bMap[t]
-
-		if mode == AlignIntersection {
-			if !hasA || !hasB {
+	if mode == AlignIntersection {
+		out := make([]Candle, 0, min(len(a), len(b)))
+		i, j := 0, 0
+		for i < len(a) && j < len(b) {
+			if a[i].Time < b[j].Time {
+				i++
 				continue
 			}
-		} else { // AlignForwardFill
-			if hasA {
-				lastA = &ca
-			} else if lastA != nil {
-				ca = Candle{Time: t, Open: lastA.Close, High: lastA.Close, Low: lastA.Close, Close: lastA.Close, Volume: 0}
-				hasA = true
+			if b[j].Time < a[i].Time {
+				j++
+				continue
 			}
-			if hasB {
-				lastB = &cb
-			} else if lastB != nil {
-				cb = Candle{Time: t, Open: lastB.Close, High: lastB.Close, Low: lastB.Close, Close: lastB.Close, Volume: 0}
+			if synth, ok := computeSpreadCandle(a[i].Time, a[i], b[j], op); ok {
+				out = append(out, synth)
+			}
+			i++
+			j++
+		}
+		return out
+	}
+
+	// AlignForwardFill: linear merge over union of timestamps
+	out := make([]Candle, 0, max(len(a), len(b)))
+	i, j := 0, 0
+	var hasLastA, hasLastB bool
+	var lastAClose, lastBClose float64
+
+	for i < len(a) || j < len(b) {
+		var t int64
+		var ca, cb Candle
+		var hasA, hasB bool
+
+		if i < len(a) && (j >= len(b) || a[i].Time < b[j].Time) {
+			ca = a[i]
+			t = ca.Time
+			lastAClose = ca.Close
+			hasLastA = true
+			hasA = true
+			i++
+			if hasLastB {
+				cb = Candle{Time: t, Open: lastBClose, High: lastBClose, Low: lastBClose, Close: lastBClose, Volume: 0}
 				hasB = true
 			}
-			if !hasA || !hasB {
-				continue
+		} else if j < len(b) && (i >= len(a) || b[j].Time < a[i].Time) {
+			cb = b[j]
+			t = cb.Time
+			lastBClose = cb.Close
+			hasLastB = true
+			hasB = true
+			j++
+			if hasLastA {
+				ca = Candle{Time: t, Open: lastAClose, High: lastAClose, Low: lastAClose, Close: lastAClose, Volume: 0}
+				hasA = true
 			}
+		} else {
+			ca = a[i]
+			cb = b[j]
+			t = ca.Time
+			lastAClose = ca.Close
+			lastBClose = cb.Close
+			hasLastA = true
+			hasLastB = true
+			hasA = true
+			hasB = true
+			i++
+			j++
 		}
 
-		var synth Candle
-		synth.Time = t
-
-		switch op {
-		case SpreadOpSub:
-			synth.Open = ca.Open - cb.Open
-			synth.Close = ca.Close - cb.Close
-			// Max possible spread difference in bar: ca.High - cb.Low
-			hDiff := ca.High - cb.Low
-			// Min possible spread difference in bar: ca.Low - cb.High
-			lDiff := ca.Low - cb.High
-			synth.High = math.Max(synth.Open, math.Max(synth.Close, hDiff))
-			synth.Low = math.Min(synth.Open, math.Min(synth.Close, lDiff))
-			synth.Volume = ca.Volume + cb.Volume
-
-		case SpreadOpDiv:
-			if cb.Open == 0 || cb.Close == 0 || cb.Low == 0 || cb.High == 0 || (cb.Low <= 0 && cb.High >= 0) {
-				continue // Skip zero-division and zero-crossing bars
-			}
-			synth.Open = ca.Open / cb.Open
-			synth.Close = ca.Close / cb.Close
-			r1 := ca.High / cb.High
-			r2 := ca.High / cb.Low
-			r3 := ca.Low / cb.High
-			r4 := ca.Low / cb.Low
-			maxR := math.Max(r1, math.Max(r2, math.Max(r3, r4)))
-			minR := math.Min(r1, math.Min(r2, math.Min(r3, r4)))
-			synth.High = math.Max(synth.Open, math.Max(synth.Close, maxR))
-			synth.Low = math.Min(synth.Open, math.Min(synth.Close, minR))
-			synth.Volume = ca.Volume
-
-		case SpreadOpAdd:
-			synth.Open = ca.Open + cb.Open
-			synth.Close = ca.Close + cb.Close
-			synth.High = math.Max(synth.Open, math.Max(synth.Close, ca.High+cb.High))
-			synth.Low = math.Min(synth.Open, math.Min(synth.Close, ca.Low+cb.Low))
-			synth.Volume = ca.Volume + cb.Volume
-
-		case SpreadOpMul:
-			synth.Open = ca.Open * cb.Open
-			synth.Close = ca.Close * cb.Close
-			p1 := ca.High * cb.High
-			p2 := ca.High * cb.Low
-			p3 := ca.Low * cb.High
-			p4 := ca.Low * cb.Low
-			maxP := math.Max(p1, math.Max(p2, math.Max(p3, p4)))
-			minP := math.Min(p1, math.Min(p2, math.Min(p3, p4)))
-			synth.High = math.Max(synth.Open, math.Max(synth.Close, maxP))
-			synth.Low = math.Min(synth.Open, math.Min(synth.Close, minP))
-			synth.Volume = ca.Volume
-		}
-
-		// Enforce candle geometric invariant: High >= Low, High >= max(Open, Close), Low <= min(Open, Close)
-		if synth.High < synth.Low {
-			synth.High, synth.Low = synth.Low, synth.High
-		}
-
-		if math.IsNaN(synth.Open) || math.IsNaN(synth.High) || math.IsNaN(synth.Low) || math.IsNaN(synth.Close) ||
-			math.IsInf(synth.Open, 0) || math.IsInf(synth.High, 0) || math.IsInf(synth.Low, 0) || math.IsInf(synth.Close, 0) {
+		if !hasA || !hasB {
 			continue
 		}
-
-		out = append(out, synth)
+		if synth, ok := computeSpreadCandle(t, ca, cb, op); ok {
+			out = append(out, synth)
+		}
 	}
 
 	return out

@@ -33,9 +33,7 @@ type BybitProvider struct {
 // NewBybitProvider creates and initializes a Bybit v5 market data provider.
 func NewBybitProvider() *BybitProvider {
 	bp := &BybitProvider{
-		client: &http.Client{
-			Timeout: 15 * time.Second,
-		},
+		client:  datafeed.NewHTTPClient(15 * time.Second),
 		baseURL: "https://api.bybit.com",
 		wsURL:   "wss://stream.bybit.com/v5/public/linear",
 		subs:    make(map[string]context.CancelFunc),

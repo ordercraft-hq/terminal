@@ -127,7 +127,7 @@ func (a *LiveAggregator) UpdateTick(price float64, timeSec int64) Candle {
 			Close:  price,
 			Volume: 1,
 		}
-	} else {
+	} else if bucket == a.current.Time {
 		if price > a.current.High {
 			a.current.High = price
 		}

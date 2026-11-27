@@ -1,7 +1,9 @@
 package server
 
 import (
+	"compress/gzip"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ordercraft-hq/terminal/internal/calendar"
@@ -36,6 +39,7 @@ type Server struct {
 	watchlistSvc    *watchlist.Service
 	alpacaProv      *providers.AlpacaProvider
 	oandaProv       *providers.OandaProvider
+	bridgeProv      *providers.DataBridgeProvider
 	indicatorEngine IndicatorEngine
 	scriptingEngine *scripting.Engine
 	mux             *http.ServeMux
@@ -57,6 +61,11 @@ func NewServer(s *storage.Storage) *Server {
 	coord.RegisterAlias("ALPACA", alpacaProv.Name())
 	oandaProv := providers.NewOandaProvider()
 	coord.RegisterProvider(oandaProv)
+
+	bridgeProv := providers.NewDataBridgeProvider()
+	coord.RegisterProvider(bridgeProv)
+	coord.RegisterAlias("BRIDGE", bridgeProv.Name())
+	coord.RegisterAlias("L2FEED", bridgeProv.Name())
 
 	// Restore any credentials saved in database
 	if s != nil {
@@ -94,6 +103,7 @@ func NewServer(s *storage.Storage) *Server {
 		screenerSvc:  screener.NewService(),
 		alpacaProv:   alpacaProv,
 		oandaProv:    oandaProv,
+		bridgeProv:   bridgeProv,
 		mux:          http.NewServeMux(),
 	}
 
@@ -165,54 +175,224 @@ func (s *Server) SetStaticFS(staticFS fs.FS) {
 	})
 }
 
-func (s *Server) routes() {
-	// CORS Middleware wrapper
-	s.mux.HandleFunc("/api/datafeed/candles", s.handleGetCandles)
-	s.mux.HandleFunc("/api/datafeed/symbols", s.handleSearchSymbols)
+var gzipWriterPool = sync.Pool{
+	New: func() any {
+		w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
+		return w
+	},
+}
 
-	// Unified real-time WebSocket stream relay
+func acceptsGzip(r *http.Request) bool {
+	ae := r.Header.Get("Accept-Encoding")
+	if ae == "" {
+		return false
+	}
+	for _, part := range strings.Split(ae, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		name, params, hasParams := strings.Cut(part, ";")
+		if !strings.EqualFold(strings.TrimSpace(name), "gzip") {
+			continue
+		}
+		if hasParams {
+			qZero := false
+			for _, p := range strings.Split(params, ";") {
+				k, v, ok := strings.Cut(strings.TrimSpace(p), "=")
+				if ok && strings.EqualFold(strings.TrimSpace(k), "q") {
+					qVal, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+					if err == nil && qVal <= 0 {
+						qZero = true
+					}
+				}
+			}
+			if qZero {
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func isWebSocketOrStreamingRequest(r *http.Request) bool {
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return true
+	}
+	if strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") {
+		return true
+	}
+	if strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/event-stream") {
+		return true
+	}
+	return r.URL.Path == "/ws" || r.URL.Path == "/ws/indicators"
+}
+
+func addVaryHeader(h http.Header, value string) {
+	for _, existing := range h.Values("Vary") {
+		for _, tok := range strings.Split(existing, ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), value) {
+				return
+			}
+		}
+	}
+	h.Add("Vary", value)
+}
+
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	gz          *gzip.Writer
+	wroteHeader bool
+	bypass      bool
+	isHead      bool
+}
+
+func (g *gzipResponseWriter) initCompression(statusCode int) {
+	if g.wroteHeader {
+		return
+	}
+	g.wroteHeader = true
+
+	ct := strings.ToLower(g.ResponseWriter.Header().Get("Content-Type"))
+	if g.isHead ||
+		statusCode == http.StatusNoContent ||
+		statusCode == http.StatusNotModified ||
+		(statusCode >= 100 && statusCode < 200) ||
+		g.ResponseWriter.Header().Get("Content-Encoding") != "" ||
+		strings.Contains(ct, "text/event-stream") {
+		g.bypass = true
+		return
+	}
+
+	g.ResponseWriter.Header().Del("Content-Length")
+	g.ResponseWriter.Header().Set("Content-Encoding", "gzip")
+	addVaryHeader(g.ResponseWriter.Header(), "Accept-Encoding")
+
+	gz := gzipWriterPool.Get().(*gzip.Writer)
+	gz.Reset(g.ResponseWriter)
+	g.gz = gz
+}
+
+func (g *gzipResponseWriter) WriteHeader(statusCode int) {
+	if g.wroteHeader {
+		return
+	}
+	g.initCompression(statusCode)
+	g.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (g *gzipResponseWriter) Write(b []byte) (int, error) {
+	if !g.wroteHeader {
+		g.WriteHeader(http.StatusOK)
+	}
+	if g.bypass || g.gz == nil {
+		return g.ResponseWriter.Write(b)
+	}
+	return g.gz.Write(b)
+}
+
+func (g *gzipResponseWriter) Flush() {
+	if !g.wroteHeader {
+		g.WriteHeader(http.StatusOK)
+	}
+	if g.gz != nil {
+		_ = g.gz.Flush()
+	}
+	if f, ok := g.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (g *gzipResponseWriter) Unwrap() http.ResponseWriter {
+	return g.ResponseWriter
+}
+
+func (g *gzipResponseWriter) Close() {
+	if g.gz != nil {
+		_ = g.gz.Close()
+		g.gz.Reset(io.Discard)
+		gzipWriterPool.Put(g.gz)
+		g.gz = nil
+	}
+}
+
+// gzipMiddleware compresses HTTP responses with gzip when accepted, skipping WebSockets and SSE streams.
+func gzipMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, alreadyWrapped := w.(*gzipResponseWriter); alreadyWrapped {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !acceptsGzip(r) || isWebSocketOrStreamingRequest(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		grw := &gzipResponseWriter{
+			ResponseWriter: w,
+			isHead:         r.Method == http.MethodHead,
+		}
+		defer grw.Close()
+		next.ServeHTTP(grw, r)
+	})
+}
+
+func (s *Server) routes() {
+	handleAPI := func(pattern string, fn http.HandlerFunc) {
+		s.mux.Handle(pattern, gzipMiddleware(fn))
+	}
+
+	// Datafeed REST endpoints
+	handleAPI("/api/datafeed/candles", s.handleGetCandles)
+	handleAPI("/api/datafeed/symbols", s.handleSearchSymbols)
+	handleAPI("/api/datafeed/footprint", s.handleGetFootprint)
+
+	// Unified real-time WebSocket stream relay (never gzip-wrapped)
 	s.mux.HandleFunc("/ws", s.streamHub.ServeHTTP)
 	s.mux.HandleFunc("/ws/indicators", s.streamHub.ServeHTTP)
 
 	// Indicator Engine REST endpoints
-	s.mux.HandleFunc("/api/indicators/catalog", s.handleIndicatorsCatalog)
-	s.mux.HandleFunc("/api/indicators/eval", s.handleIndicatorsEval)
-	s.mux.HandleFunc("/api/indicators/script/eval", s.handleIndicatorScriptEval)
-	s.mux.HandleFunc("/api/indicators/user", s.handleUserIndicators)
-	s.mux.HandleFunc("/api/indicators/user/", s.handleUserIndicators)
+	handleAPI("/api/indicators/catalog", s.handleIndicatorsCatalog)
+	handleAPI("/api/indicators/eval", s.handleIndicatorsEval)
+	handleAPI("/api/indicators/script/eval", s.handleIndicatorScriptEval)
+	handleAPI("/api/indicators/user", s.handleUserIndicators)
+	handleAPI("/api/indicators/user/", s.handleUserIndicators)
 
 	// Watchlist batch quotes and search
-	s.mux.HandleFunc("/api/watchlist/quotes", s.handleWatchlistQuotes)
-	s.mux.HandleFunc("/api/watchlist/search", s.handleWatchlistSearch)
+	handleAPI("/api/watchlist/quotes", s.handleWatchlistQuotes)
+	handleAPI("/api/watchlist/search", s.handleWatchlistSearch)
 
 	// Economic Calendar endpoints
-	s.mux.HandleFunc("/api/calendar", s.handleCalendar)
+	handleAPI("/api/calendar", s.handleCalendar)
 
 	// Financial News endpoints
-	s.mux.HandleFunc("/api/news", s.handleNews)
+	handleAPI("/api/news", s.handleNews)
 
 	// Market Movers / Screener endpoints
-	s.mux.HandleFunc("/api/movers", s.handleMovers)
+	handleAPI("/api/movers", s.handleMovers)
 
 	// Data Providers & Health Status endpoints
-	s.mux.HandleFunc("/api/providers/status", s.handleProvidersStatus)
-	s.mux.HandleFunc("/api/providers/configure", s.handleProviderConfigure)
+	handleAPI("/api/providers/status", s.handleProvidersStatus)
+	handleAPI("/api/providers/configure", s.handleProviderConfigure)
 	s.mux.Handle("/docs/", http.StripPrefix("/docs/", http.FileServer(http.Dir("./docs"))))
 
 	// Layout endpoints
-	s.mux.HandleFunc("/api/layout/", s.handleLayouts)
+	handleAPI("/api/layout/", s.handleLayouts)
 
 	// Drawing endpoints
-	s.mux.HandleFunc("/api/drawings", s.handleDrawings)
+	handleAPI("/api/drawings", s.handleDrawings)
 
 	// Drawing Templates endpoints
-	s.mux.HandleFunc("/api/templates/drawings", s.handleDrawingTemplates)
+	handleAPI("/api/templates/drawings", s.handleDrawingTemplates)
 
 	// Chart Templates endpoints
-	s.mux.HandleFunc("/api/templates/charts", s.handleChartTemplates)
+	handleAPI("/api/templates/charts", s.handleChartTemplates)
+
+	// Orderflow Imbalance Presets endpoints (SQLite persistent)
+	handleAPI("/api/orderflow/imbalances", s.handleImbalanceRules)
 
 	// Version check
-	s.mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
+	handleAPI("/api/version", func(w http.ResponseWriter, r *http.Request) {
 		if !enableCORS(w, r) {
 			return
 		}
@@ -223,7 +403,7 @@ func (s *Server) routes() {
 	})
 
 	// Health check
-	s.mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+	handleAPI("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		if !enableCORS(w, r) {
 			return
 		}
@@ -236,6 +416,19 @@ func (s *Server) routes() {
 			"loopback":     IsLoopbackHost(s.bindHost),
 		}
 		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	// Server time synchronization endpoint (for client clock skew compensation)
+	handleAPI("/api/time", func(w http.ResponseWriter, r *http.Request) {
+		if !enableCORS(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		now := time.Now()
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"server_time":    now.Unix(),
+			"server_time_ms": now.UnixMilli(),
+		})
 	})
 }
 
@@ -288,6 +481,42 @@ func (s *Server) handleSearchSymbols(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(results)
+}
+
+func (s *Server) handleGetFootprint(w http.ResponseWriter, r *http.Request) {
+	if !enableCORS(w, r) {
+		return
+	}
+
+	q := r.URL.Query()
+	fullSymbol := q.Get("symbol")
+	if fullSymbol == "" {
+		fullSymbol = "DATABRIDGE:ENQZ26"
+	}
+	resolution := q.Get("resolution")
+	if resolution == "" {
+		resolution = "1m"
+	}
+
+	from, _ := strconv.ParseInt(q.Get("from"), 10, 64)
+	to, _ := strconv.ParseInt(q.Get("to"), 10, 64)
+	count, _ := strconv.Atoi(q.Get("count"))
+	if count <= 0 {
+		count = 200
+	}
+
+	bars, err := s.coordinator.GetFootprint(r.Context(), fullSymbol, resolution, from, to, count)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"bars":   bars,
+		"s":      "ok",
+		"symbol": fullSymbol,
+	})
 }
 
 func (s *Server) handleLayouts(w http.ResponseWriter, r *http.Request) {
@@ -576,6 +805,60 @@ func (s *Server) handleChartTemplates(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleImbalanceRules(w http.ResponseWriter, r *http.Request) {
+	if !enableCORS(w, r) {
+		return
+	}
+
+	ctx := r.Context()
+
+	switch r.Method {
+	case http.MethodGet:
+		rules, err := s.storage.GetImbalanceRules(ctx)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if rules == nil {
+			rules = []storage.ImbalanceRule{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(rules)
+
+	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
+		var rule storage.ImbalanceRule
+		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+			http.Error(w, "invalid json body", http.StatusBadRequest)
+			return
+		}
+		if rule.ID == "" {
+			rule.ID = fmt.Sprintf("imb_%d", time.Now().UnixMilli())
+		}
+		if err := s.storage.SaveImbalanceRule(ctx, &rule); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(rule)
+
+	case http.MethodDelete:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			http.Error(w, "missing rule id", http.StatusBadRequest)
+			return
+		}
+		if err := s.storage.DeleteImbalanceRule(ctx, id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 func (s *Server) handleWatchlistQuotes(w http.ResponseWriter, r *http.Request) {
 	if !enableCORS(w, r) {
 		return
@@ -719,13 +1002,25 @@ func (s *Server) handleProvidersStatus(w http.ResponseWriter, r *http.Request) {
 		for _, p := range s.coordinator.Providers() {
 			id := strings.ToUpper(p.Name())
 			intervals := p.SupportedResolutions()
+			tier := "L1"
+			if l2p, ok := p.(datafeed.L2DataProvider); ok && l2p.GetDataTier() == datafeed.DataTierL2 {
+				tier = "L2"
+			}
 			info := map[string]interface{}{
 				"id":                 id,
 				"name":               p.Name(),
 				"status":             "connected",
 				"supportedIntervals": intervals,
+				"dataTier":           tier,
 			}
 			switch id {
+			case "DATABRIDGE":
+				info["name"] = "DataBridge (Level 2 Orderflow Bridge)"
+				info["type"] = "l2_bridge"
+				info["latencyMs"] = 1
+				info["dataTier"] = "L2"
+				info["docUrl"] = "https://github.com/ordercraft-hq/terminal"
+				provList = append(provList, info)
 			case "BINANCE":
 				info["name"] = "Binance Public Spot & Futures"
 				info["type"] = "crypto"
@@ -788,6 +1083,7 @@ func (s *Server) handleProvidersStatus(w http.ResponseWriter, r *http.Request) {
 						"category":     "Stocks & Multi-Asset",
 						"authType":     "API Key + Secret",
 						"status":       "available",
+						"dataTier":     "L1",
 						"docUrl":       "https://github.com/ordercraft-hq/terminal/blob/main/docs/provider-setup/Alpaca.md",
 						"accountId":    accountID,
 						"maskedApiKey": maskedKey,
@@ -851,6 +1147,7 @@ func (s *Server) handleProvidersStatus(w http.ResponseWriter, r *http.Request) {
 						"category":     "Forex & CFD",
 						"authType":     "Personal Access Token",
 						"status":       "available",
+						"dataTier":     "L1",
 						"docUrl":       "https://github.com/ordercraft-hq/terminal/blob/main/docs/provider-setup/Oanda.md",
 						"accountId":    accountID,
 						"maskedApiKey": maskedKey,
@@ -1055,12 +1352,23 @@ func (s *Server) handleProviderConfigure(w http.ResponseWriter, r *http.Request)
 				_ = s.storage.SaveAPIKey(r.Context(), "ALPACA", string(keyData))
 			}
 		case "OANDA":
+			envLower := strings.ToLower(strings.TrimSpace(apiSecret))
+			if envLower == "" {
+				envLower = "practice"
+			}
+			if envLower != "practice" && envLower != "live" {
+				http.Error(w, `{"error":"invalid OANDA environment: expected 'practice' or 'live'"}`, http.StatusBadRequest)
+				return
+			}
+			saved.APISecret = envLower
 			if s.oandaProv != nil {
-				s.oandaProv.SetCredentials(accountID, apiKey, apiSecret)
+				s.oandaProv.SetCredentials(accountID, apiKey, envLower)
 			}
 			if s.storage != nil {
 				keyData, _ := json.Marshal(saved)
-				_ = s.storage.SaveAPIKey(r.Context(), "OANDA", string(keyData))
+				if err := s.storage.SaveAPIKey(r.Context(), "OANDA", string(keyData)); err != nil {
+					log.Printf("[Server] Failed to persist OANDA credentials: %v\n", err)
+				}
 			}
 		case "TWELVEDATA", "IBKR":
 			http.Error(w, fmt.Sprintf(`{"error":"%s feed adapter is in development for an upcoming release"}`, provID), http.StatusBadRequest)
@@ -1173,15 +1481,31 @@ func (s *Server) Version() string {
 	if s.version != "" {
 		return s.version
 	}
-	return "v0.2.0"
+	return "v0.3.0"
+}
+
+func isAllowedHost(hostHeader string) bool {
+	raw := strings.TrimSpace(hostHeader)
+	if raw == "" {
+		return false
+	}
+	host := raw
+	if h, _, err := net.SplitHostPort(raw); err == nil {
+		host = h
+	} else if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		host = raw[1 : len(raw)-1]
+	}
+	h := strings.ToLower(host)
+	return h == "localhost" || h == "127.0.0.1" || h == "::1" || strings.HasPrefix(h, "127.")
 }
 
 func (s *Server) ValidateAuth(r *http.Request) bool {
 	if s.authToken == "" {
 		return true // No authentication required in local loopback mode
 	}
+	expected := []byte(s.authToken)
 	// Check query param (needed for WebSockets and simple curls)
-	if token := r.URL.Query().Get("token"); token == s.authToken {
+	if token := r.URL.Query().Get("token"); subtle.ConstantTimeCompare([]byte(token), expected) == 1 {
 		return true
 	}
 	// Check Authorization header
@@ -1190,16 +1514,24 @@ func (s *Server) ValidateAuth(r *http.Request) bool {
 		if strings.HasPrefix(auth, "Bearer ") {
 			auth = strings.TrimPrefix(auth, "Bearer ")
 		}
-		if auth == s.authToken {
+		if subtle.ConstantTimeCompare([]byte(auth), expected) == 1 {
 			return true
 		}
 	}
 	return false
 }
 
-// Handler returns the HTTP handler wrapped with optional token authentication middleware.
+// Handler returns the HTTP handler wrapped with optional token authentication, loopback Host verification, and gzip compression middleware.
 func (s *Server) Handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return gzipMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.authToken == "" && s.bindHost != "" && IsLoopbackHost(s.bindHost) {
+			if !isAllowedHost(r.Host) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				w.Write([]byte(`{"error":"forbidden host"}`))
+				return
+			}
+		}
 		if s.authToken != "" {
 			// Health check, docs, and non-API static assets are public
 			isPublic := r.URL.Path == "/api/health" || strings.HasPrefix(r.URL.Path, "/docs/") || !strings.HasPrefix(r.URL.Path, "/api/")
@@ -1211,7 +1543,7 @@ func (s *Server) Handler() http.Handler {
 			}
 		}
 		s.mux.ServeHTTP(w, r)
-	})
+	}))
 }
 
 func (s *Server) Start(addr string) error {
@@ -1242,6 +1574,12 @@ func (s *Server) Serve(listener net.Listener) error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.bridgeProv != nil {
+		_ = s.bridgeProv.Close()
+	}
+	if s.streamHub != nil {
+		s.streamHub.Close()
+	}
 	if s.server != nil {
 		return s.server.Shutdown(ctx)
 	}

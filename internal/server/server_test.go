@@ -2,13 +2,21 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/ordercraft-hq/terminal/internal/storage"
+	"nhooyr.io/websocket"
+	"nhooyr.io/websocket/wsjson"
 )
 
 func TestDrawingTemplatesAPI(t *testing.T) {
@@ -353,4 +361,184 @@ func TestProviderConfigureAndMasking(t *testing.T) {
 			t.Fatalf("Expected ALPACA to not be connected after delete")
 		}
 	}
+}
+
+func TestImbalanceRulesAPI(t *testing.T) {
+	tmpDir := t.TempDir()
+	st, err := storage.NewStorage(filepath.Join(tmpDir, "test_imb.db"))
+	if err != nil {
+		t.Fatalf("Failed to init storage: %v", err)
+	}
+	defer st.Close()
+
+	srv := NewServer(st)
+
+	// 1. Initially GET should return empty array []
+	req := httptest.NewRequest(http.MethodGet, "/api/orderflow/imbalances", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected 200, got %d", w.Code)
+	}
+	var rules []storage.ImbalanceRule
+	if err := json.Unmarshal(w.Body.Bytes(), &rules); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if len(rules) != 0 {
+		t.Fatalf("Expected 0 rules, got %d", len(rules))
+	}
+
+	// 2. POST create rule
+	payload := map[string]interface{}{
+		"id":       "imb_test_1",
+		"name":     "300% Delta 15",
+		"settings": `{"imbalancePercent":300,"deltaFilter":15,"sellColor":"#d8b4e2","buyColor":"#8da9c4"}`,
+	}
+	bodyBytes, _ := json.Marshal(payload)
+	req = httptest.NewRequest(http.MethodPost, "/api/orderflow/imbalances", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected 200 on POST, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 3. GET verify
+	req = httptest.NewRequest(http.MethodGet, "/api/orderflow/imbalances", nil)
+	w = httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+	if err := json.Unmarshal(w.Body.Bytes(), &rules); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if len(rules) != 1 || rules[0].ID != "imb_test_1" {
+		t.Fatalf("Expected 1 rule with id imb_test_1, got %+v", rules)
+	}
+
+	// 4. DELETE verify
+	req = httptest.NewRequest(http.MethodDelete, "/api/orderflow/imbalances?id=imb_test_1", nil)
+	w = httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("Expected 204 on DELETE, got %d", w.Code)
+	}
+
+	// 5. GET verify empty
+	req = httptest.NewRequest(http.MethodGet, "/api/orderflow/imbalances", nil)
+	w = httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+	rules = nil
+	_ = json.Unmarshal(w.Body.Bytes(), &rules)
+	if len(rules) != 0 {
+		t.Fatalf("Expected 0 rules after delete, got %d", len(rules))
+	}
+}
+
+func TestGzipMiddleware(t *testing.T) {
+	tmpDir := t.TempDir()
+	st, err := storage.NewStorage(filepath.Join(tmpDir, "test_gzip.db"))
+	if err != nil {
+		t.Fatalf("Failed to init storage: %v", err)
+	}
+	defer st.Close()
+
+	srv := NewServer(st)
+	srv.SetIndicatorEngine(NewMockIndicatorEngine())
+
+	// 1. REST JSON endpoint WITH Accept-Encoding: gzip -> compressed
+	req := httptest.NewRequest(http.MethodGet, "/api/indicators/catalog", nil)
+	req.Header.Set("Accept-Encoding", "gzip, deflate")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected 200, got %d", w.Code)
+	}
+	if got := w.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Expected Content-Encoding gzip, got %q", got)
+	}
+	gr, err := gzip.NewReader(bytes.NewReader(w.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("Failed to create gzip reader: %v", err)
+	}
+	decompressed, err := io.ReadAll(gr)
+	_ = gr.Close()
+	if err != nil {
+		t.Fatalf("Failed to decompress gzip response: %v", err)
+	}
+	var catResp struct {
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal(decompressed, &catResp); err != nil {
+		t.Fatalf("Failed to unmarshal decompressed JSON: %v", err)
+	}
+	if catResp.Count != 3 {
+		t.Fatalf("Expected count 3 from decompressed catalog, got %d", catResp.Count)
+	}
+
+	// 2. REST JSON endpoint WITHOUT Accept-Encoding: gzip or with gzip;q=0 -> uncompressed
+	for _, ae := range []string{"", "gzip;q=0"} {
+		req = httptest.NewRequest(http.MethodGet, "/api/health", nil)
+		if ae != "" {
+			req.Header.Set("Accept-Encoding", ae)
+		}
+		w = httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("Expected 200 for Accept-Encoding=%q, got %d", ae, w.Code)
+		}
+		if got := w.Header().Get("Content-Encoding"); got != "" {
+			t.Fatalf("Expected empty Content-Encoding for Accept-Encoding=%q, got %q", ae, got)
+		}
+	}
+
+	// 3. 204 No Content must not set Content-Encoding: gzip or write a body
+	req = httptest.NewRequest(http.MethodDelete, "/api/orderflow/imbalances?id=nonexistent", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	w = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("Expected 204, got %d", w.Code)
+	}
+	if got := w.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("Expected no Content-Encoding on 204, got %q", got)
+	}
+	if w.Body.Len() != 0 {
+		t.Fatalf("Expected empty body on 204, got %d bytes", w.Body.Len())
+	}
+
+	// 4. SSE streaming response must skip gzip compression
+	sseHandler := gzipMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: ping\n\n"))
+	}))
+	req = httptest.NewRequest(http.MethodGet, "/api/stream", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	w = httptest.NewRecorder()
+	sseHandler.ServeHTTP(w, req)
+	if got := w.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("Expected SSE response to skip gzip, got Content-Encoding=%q", got)
+	}
+	if w.Body.String() != "data: ping\n\n" {
+		t.Fatalf("Unexpected SSE body: %q", w.Body.String())
+	}
+
+	// 5. WebSocket upgrade with Accept-Encoding: gzip must bypass gzip middleware
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer httpSrv.Close()
+	defer srv.Shutdown(context.Background())
+
+	wsURL := "ws" + strings.TrimPrefix(httpSrv.URL, "http") + "/ws"
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Accept-Encoding": []string{"gzip"}},
+	})
+	if err != nil {
+		t.Fatalf("WebSocket dial with Accept-Encoding: gzip failed: %v", err)
+	}
+	_ = wsjson.Write(ctx, conn, map[string]string{"action": "subscribe", "symbol": "TEST:GZIP", "resolution": "1m"})
+	_ = conn.Close(websocket.StatusNormalClosure, "ok")
 }

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
   Flame,
   RefreshCw,
@@ -12,30 +12,10 @@ import {
   Building2,
   Globe2,
 } from 'lucide-react';
+import { transport, type MoverCategoryInfo, type MoversResponse } from '../../../transport/client';
+import { useSyncStore } from '../../../store/syncStore';
 
-interface MoverItem {
-  symbol: string;
-  name?: string;
-  lastPrice: number;
-  change: number;
-  changePct: number;
-  high?: number;
-  low?: number;
-  volumeQuote: number;
-}
-
-interface CategoryInfo {
-  id: string;
-  name: string;
-  description?: string;
-  group: string;
-}
-
-interface MoversResponse {
-  gainers: MoverItem[];
-  losers: MoverItem[];
-  volume: MoverItem[];
-}
+type CategoryInfo = MoverCategoryInfo;
 
 const DEFAULT_CATEGORIES: CategoryInfo[] = [
   {
@@ -113,6 +93,9 @@ const DEFAULT_CATEGORIES: CategoryInfo[] = [
 ];
 
 export const MoversPanel: React.FC = () => {
+  const setSymbol = useSyncStore((s) => s.setSymbol);
+  const activeSymbol = useSyncStore((s) => (s.activePaneId && s.panes[s.activePaneId]?.symbol) || s.symbol);
+
   const [activeTab, setActiveTab] = useState<'gainers' | 'losers' | 'volume'>('gainers');
   const [selectedCategory, setSelectedCategory] = useState<string>('day_movers');
   const [categories, setCategories] = useState<CategoryInfo[]>(DEFAULT_CATEGORIES);
@@ -124,6 +107,17 @@ export const MoversPanel: React.FC = () => {
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
 
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const spinTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current?.abort();
+      if (spinTimerRef.current !== null) {
+        window.clearTimeout(spinTimerRef.current);
+      }
+    };
+  }, []);
 
   // Close category picker on click outside
   useEffect(() => {
@@ -138,8 +132,17 @@ export const MoversPanel: React.FC = () => {
     return () => document.removeEventListener('mousedown', handleOutsideClick);
   }, [isCategoryOpen]);
 
-  // Fetch movers by category with optional force-refresh
-  const fetchMovers = async (cat = selectedCategory, force = false) => {
+  // Fetch movers by category with optional force-refresh via transport
+  const fetchMovers = useCallback(async (cat: string, force = false) => {
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    if (spinTimerRef.current !== null) {
+      window.clearTimeout(spinTimerRef.current);
+      spinTimerRef.current = null;
+    }
+
     if (force) {
       setIsRefreshing(true);
     } else {
@@ -148,37 +151,40 @@ export const MoversPanel: React.FC = () => {
 
     const startTime = Date.now();
     try {
-      const url = `/api/movers?category=${encodeURIComponent(cat)}${
-        force ? '&refresh=true&_t=' + Date.now() : ''
-      }`;
-      const resp = await fetch(url);
-      if (resp.ok) {
-        const json = await resp.json();
-        setData({
-          gainers: json.gainers || [],
-          losers: json.losers || [],
-          volume: json.volume || [],
-        });
-        if (Array.isArray(json.categories) && json.categories.length > 0) {
-          setCategories(json.categories);
-        }
-        setLastUpdated(new Date());
+      const json = await transport.getMovers(cat, {
+        refresh: force,
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) return;
+
+      setData({
+        gainers: json.gainers || [],
+        losers: json.losers || [],
+        volume: json.volume || [],
+      });
+      if (Array.isArray(json.categories) && json.categories.length > 0) {
+        setCategories(json.categories);
       }
+      setLastUpdated(new Date());
     } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') return;
       console.warn('Failed to fetch movers:', err);
     } finally {
-      const elapsed = Date.now() - startTime;
-      const minSpinDelay = force ? Math.max(0, 450 - elapsed) : 0;
-      setTimeout(() => {
-        setLoading(false);
-        setIsRefreshing(false);
-      }, minSpinDelay);
+      if (!controller.signal.aborted) {
+        const elapsed = Date.now() - startTime;
+        const minSpinDelay = force ? Math.max(0, 450 - elapsed) : 0;
+        spinTimerRef.current = window.setTimeout(() => {
+          setLoading(false);
+          setIsRefreshing(false);
+          spinTimerRef.current = null;
+        }, minSpinDelay);
+      }
     }
-  };
+  }, []);
 
   useEffect(() => {
     fetchMovers(selectedCategory, false);
-  }, [selectedCategory]);
+  }, [selectedCategory, fetchMovers]);
 
   const activeCategoryInfo = useMemo(() => {
     return categories.find((c) => c.id === selectedCategory) || categories[0];
@@ -369,13 +375,17 @@ export const MoversPanel: React.FC = () => {
           </div>
         ) : (
           currentList.map((item) => {
-            const isSelected = item.symbol === selectedSymbol;
+            const isSelected = item.symbol === selectedSymbol || item.symbol === activeSymbol;
             const isPositive = item.changePct >= 0;
 
             return (
               <div
                 key={item.symbol}
-                onClick={() => setSelectedSymbol(item.symbol)}
+                onClick={() => {
+                  setSelectedSymbol(item.symbol);
+                  setSymbol(item.symbol);
+                }}
+                title={`Load ${item.symbol} on active chart`}
                 className={`grid grid-cols-12 items-center px-3 py-2 cursor-pointer transition-colors ${
                   isSelected
                     ? 'bg-[#2962ff]/15 text-white font-medium'

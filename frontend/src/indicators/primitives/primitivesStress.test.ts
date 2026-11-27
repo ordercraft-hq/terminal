@@ -45,6 +45,7 @@ class MockCanvasContext {
   fillRect(x: number, y: number, w: number, h: number) { this.record('fillRect', [x, y, w, h]); }
   strokeRect(x: number, y: number, w: number, h: number) { this.record('strokeRect', [x, y, w, h]); }
   fillText(text: string, x: number, y: number) { this.record('fillText', [text, x, y]); }
+  setLineDash(segments: number[]) { this.record('setLineDash', segments); }
 }
 
 class MockRenderingTarget {
@@ -375,6 +376,87 @@ console.log('\n--- 8. FOOTPRINT: INVERTED PRICE SCALE DELTA BADGE POSITIONING --
   assert(
     badgeY > 200,
     `Delta badge on inverted price scale must be positioned below visual bar bottom (got badgeY=${badgeY}, expected > 200)`
+  );
+}
+
+console.log('\n--- 9. FOOTPRINT: IMBALANCES & STACKED ZONES VERIFICATION ---');
+{
+  const bar1 = {
+    time: 1000,
+    open: 100,
+    high: 105,
+    low: 100,
+    close: 104,
+    totalVolume: 500,
+    delta: 120,
+    levels: [
+      { price: 100, bidVolume: 10, askVolume: 100 },
+      { price: 101, bidVolume: 10, askVolume: 90 },
+      { price: 102, bidVolume: 10, askVolume: 80 },
+      { price: 103, bidVolume: 10, askVolume: 70 },
+      { price: 104, bidVolume: 10, askVolume: 60 },
+    ],
+  };
+  const bar2 = {
+    time: 1060,
+    open: 104,
+    high: 106,
+    low: 103,
+    close: 105,
+    totalVolume: 300,
+    delta: 50,
+    levels: [
+      { price: 103, bidVolume: 20, askVolume: 30 },
+      { price: 104, bidVolume: 30, askVolume: 40 },
+      { price: 105, bidVolume: 40, askVolume: 50 },
+    ],
+  };
+
+  const fp = new FootprintPrimitive(
+    {
+      imbalanceRules: [
+        {
+          id: 'test_rule',
+          name: '300% Delta 15',
+          enabled: true,
+          imbalancePercent: 300,
+          deltaFilter: 15,
+          deltaFilterEnabled: true,
+          sellColor: '#d8b4e2',
+          sellLineWidth: 1.0,
+          sellLineStyle: 'solid',
+          sellDisplay: true,
+          buyColor: '#8da9c4',
+          buyLineWidth: 1.0,
+          buyLineStyle: 'solid',
+          buyDisplay: true,
+        },
+      ],
+      imbalanceGlobalSettings: {
+        skipZeroValues: false,
+        showStackedImbalances: true,
+        showMitigatedZones: true,
+        drawZoneBorders: false,
+        stackedMinLevels: 3,
+      },
+    },
+    [bar1, bar2]
+  );
+
+  const { attachedParam } = createMockEnvironment();
+  const target = new MockRenderingTarget();
+  fp.attached(attachedParam as any);
+  fp.paneViews()[0]?.renderer()?.draw(target as any);
+
+  assert(
+    target.ctx.nonFiniteCalls.length === 0,
+    `FootprintPrimitive imbalance rendering produced ${target.ctx.nonFiniteCalls.length} non-finite canvas calls`
+  );
+
+  const fpStateStr = JSON.stringify(fp);
+  assert(
+    !fpStateStr.includes('"x"') && !fpStateStr.includes('"y"'),
+    'FootprintPrimitive with imbalance zones maintains strictly logical coordinates'
   );
 }
 

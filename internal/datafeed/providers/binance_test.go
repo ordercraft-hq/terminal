@@ -98,3 +98,38 @@ func TestBinanceProviderUS_Switch(t *testing.T) {
 		t.Fatalf("Expected candles from Binance.US, got 0")
 	}
 }
+
+func TestBinanceSubscribeRespectsContextCancel(t *testing.T) {
+	bp := &BinanceProvider{
+		client:  datafeed.NewHTTPClient(5 * time.Second),
+		baseURL: "http://127.0.0.1:0",
+		wsHost:  "127.0.0.1:0",
+		subs:    make(map[string]binanceSubEntry),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := bp.Subscribe(ctx, "BINANCE:BTCUSDT", "1m", func(c datafeed.Candle) {}); err != nil {
+		t.Fatalf("Subscribe failed: %v", err)
+	}
+
+	bp.mu.Lock()
+	subCount := len(bp.subs)
+	bp.mu.Unlock()
+	if subCount != 1 {
+		t.Fatalf("expected 1 active subscription, got %d", subCount)
+	}
+
+	cancel()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		bp.mu.Lock()
+		remaining := len(bp.subs)
+		bp.mu.Unlock()
+		if remaining == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expected cancelled subscription context to clean up bp.subs entry")
+}

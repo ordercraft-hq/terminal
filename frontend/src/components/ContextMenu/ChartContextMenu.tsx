@@ -5,8 +5,30 @@ import {
   ChevronRight,
   Check,
 } from 'lucide-react';
-import { useSyncStore } from '../../store/syncStore';
+import { useShallow } from 'zustand/react/shallow';
+import {
+  useSyncStore,
+  createDefaultVolumeIndicator,
+  type UserDrawing,
+} from '../../store/syncStore';
 import { transport } from '../../transport/client';
+import { chartTemplateManager, type ChartTemplate } from '../../templates/ChartTemplateManager';
+
+const DRAWING_CLIPBOARD_KEY = 'ordercraft_drawing_clipboard';
+
+function readDrawingClipboard(): UserDrawing | null {
+  try {
+    const raw = localStorage.getItem(DRAWING_CLIPBOARD_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as UserDrawing;
+    if (parsed && typeof parsed.type === 'string' && Array.isArray(parsed.anchors)) {
+      return parsed;
+    }
+  } catch {
+    // Ignore malformed clipboard
+  }
+  return null;
+}
 
 export interface ChartContextMenuProps {
   isOpen: boolean;
@@ -32,27 +54,67 @@ export const ChartContextMenu: React.FC<ChartContextMenuProps> = ({
   onOpenTableView,
 }) => {
   const menuRef = useRef<HTMLDivElement>(null);
+  const copyTimerRef = useRef<number | null>(null);
   const [isTemplateHovered, setIsTemplateHovered] = useState(false);
   const [copiedPrice, setCopiedPrice] = useState(false);
+  const [clipboardDrawing, setClipboardDrawing] = useState<UserDrawing | null>(null);
+  const [templates, setTemplates] = useState<ChartTemplate[]>(() =>
+    chartTemplateManager.getAllTemplates()
+  );
 
   const {
     drawings,
+    addDrawing,
     clearDrawings,
+    selectedDrawingId,
     crosshairLock,
     toggleLock,
     symbol,
     activePaneId,
-    panes,
     syncDrawingsAcrossCharts,
-  } = useSyncStore();
+    layoutId,
+    chartSettings,
+    updatePaneSettings,
+  } = useSyncStore(
+    useShallow((s) => ({
+      drawings: s.drawings,
+      addDrawing: s.addDrawing,
+      clearDrawings: s.clearDrawings,
+      selectedDrawingId: s.selectedDrawingId,
+      crosshairLock: s.crosshairLock,
+      toggleLock: s.toggleLock,
+      symbol: s.symbol,
+      activePaneId: s.activePaneId,
+      syncDrawingsAcrossCharts: s.syncDrawingsAcrossCharts,
+      layoutId: s.layoutId,
+      chartSettings: s.chartSettings,
+      updatePaneSettings: s.updatePaneSettings,
+    }))
+  );
 
   const currentPaneId = paneId || activePaneId || 'pane-1';
-  const activePane = panes[currentPaneId];
+  const activePane = useSyncStore((s) => s.panes[currentPaneId]);
   const activeSymbol = activePane?.symbol || symbol;
-  const indicatorsMap = useSyncStore((s) => s.indicators);
-  const paneIndicators = indicatorsMap[currentPaneId] || [];
+  const rawPaneIndicators = useSyncStore((s) => s.indicators[currentPaneId]);
+  const paneIndicators = rawPaneIndicators !== undefined
+    ? rawPaneIndicators
+    : [createDefaultVolumeIndicator(currentPaneId)];
   const indicatorsCount = paneIndicators.length;
   const hasIndicators = indicatorsCount > 0;
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    setClipboardDrawing(readDrawingClipboard());
+    setTemplates(chartTemplateManager.getAllTemplates());
+  }, [isOpen]);
 
   const chartDrawings = drawings.filter((d) => {
     if (d.symbol && d.symbol !== activeSymbol) return false;
@@ -109,19 +171,65 @@ export const ChartContextMenu: React.FC<ChartContextMenuProps> = ({
 
   if (!isOpen) return null;
 
+  const selectedDrawing = selectedDrawingId
+    ? chartDrawings.find((d) => d.id === selectedDrawingId) || null
+    : null;
+
   const handleCopyPrice = (e: React.MouseEvent) => {
     e.stopPropagation();
     navigator.clipboard.writeText(formattedPrice).catch(() => {});
     setCopiedPrice(true);
-    setTimeout(() => {
+    if (copyTimerRef.current !== null) {
+      window.clearTimeout(copyTimerRef.current);
+    }
+    copyTimerRef.current = window.setTimeout(() => {
       setCopiedPrice(false);
+      copyTimerRef.current = null;
       onClose();
     }, 400);
   };
 
+  const handleCopyDrawing = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!selectedDrawing) return;
+    try {
+      localStorage.setItem(DRAWING_CLIPBOARD_KEY, JSON.stringify(selectedDrawing));
+      setClipboardDrawing(selectedDrawing);
+    } catch {
+      // Ignore storage failure
+    }
+    onClose();
+  };
+
   const handlePaste = (e: React.MouseEvent) => {
     e.stopPropagation();
-    navigator.clipboard.readText().catch(() => {});
+    if (!clipboardDrawing) return;
+    const basePrice = clipboardDrawing.anchors[0]?.price;
+    const priceDelta =
+      price !== null && !isNaN(price) && basePrice !== undefined
+        ? price - basePrice
+        : (basePrice || 0) * 0.002;
+    const newId = `draw_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const pasted: UserDrawing = {
+      ...clipboardDrawing,
+      id: newId,
+      symbol: activeSymbol,
+      paneId: currentPaneId,
+      anchors: clipboardDrawing.anchors.map((a) => ({
+        time: a.time,
+        price: a.price + priceDelta,
+      })),
+    };
+    addDrawing(pasted);
+    transport
+      .saveDrawing({
+        id: pasted.id,
+        layout_id: layoutId || 'default',
+        tool_type: pasted.type,
+        symbol: activeSymbol,
+        data: JSON.stringify(pasted),
+      })
+      .catch(console.error);
     onClose();
   };
 
@@ -190,14 +298,31 @@ export const ChartContextMenu: React.FC<ChartContextMenuProps> = ({
           </div>
         </button>
 
-        {/* 3. Paste */}
+        {/* 3. Copy selected drawing (when selected) & Paste drawing */}
+        {selectedDrawing && (
+          <button
+            onClick={handleCopyDrawing}
+            className="w-full flex items-center justify-between px-3 py-1.5 hover:bg-[#2a2e39] hover:text-white transition-colors cursor-pointer text-left"
+          >
+            <div className="flex items-center space-x-2.5">
+              <div className="w-4 h-4 shrink-0" />
+              <span>Copy drawing</span>
+            </div>
+          </button>
+        )}
+
         <button
           onClick={handlePaste}
-          className="w-full flex items-center justify-between px-3 py-1.5 hover:bg-[#2a2e39] hover:text-white transition-colors cursor-pointer text-left"
+          disabled={!clipboardDrawing}
+          className={`w-full flex items-center justify-between px-3 py-1.5 transition-colors text-left ${
+            clipboardDrawing
+              ? 'hover:bg-[#2a2e39] hover:text-white cursor-pointer'
+              : 'text-[#50535e] cursor-not-allowed'
+          }`}
         >
           <div className="flex items-center space-x-2.5">
             <div className="w-4 h-4 shrink-0" />
-            <span>Paste</span>
+            <span>Paste drawing</span>
           </div>
           <span className="font-mono text-xs text-[#787b86] tracking-tight">Ctrl + V</span>
         </button>
@@ -252,42 +377,44 @@ export const ChartContextMenu: React.FC<ChartContextMenuProps> = ({
           </div>
         </button>
 
-        {/* 7. Chart template (with flyout submenu) */}
-        <div
-          className="relative"
-          onMouseEnter={() => setIsTemplateHovered(true)}
-          onMouseLeave={() => setIsTemplateHovered(false)}
-        >
-          <button
-            className="w-full flex items-center justify-between px-3 py-1.5 hover:bg-[#2a2e39] hover:text-white transition-colors cursor-pointer text-left"
+        {/* 7. Chart template (with flyout submenu wired to ChartTemplateManager) */}
+        {templates.length > 0 && (
+          <div
+            className="relative"
+            onMouseEnter={() => setIsTemplateHovered(true)}
+            onMouseLeave={() => setIsTemplateHovered(false)}
           >
-            <div className="flex items-center space-x-2.5">
-              <div className="w-4 h-4 shrink-0" />
-              <span>Chart template</span>
-            </div>
-            <ChevronRight size={14} className="text-[#787b86]" />
-          </button>
+            <button
+              className="w-full flex items-center justify-between px-3 py-1.5 hover:bg-[#2a2e39] hover:text-white transition-colors cursor-pointer text-left"
+            >
+              <div className="flex items-center space-x-2.5">
+                <div className="w-4 h-4 shrink-0" />
+                <span>Chart template</span>
+              </div>
+              <ChevronRight size={14} className="text-[#787b86]" />
+            </button>
 
-          {isTemplateHovered && (
-            <div className="absolute left-[98%] top-0 w-44 bg-[#1e222d] border border-[#2a2e39] rounded-md shadow-2xl py-1 text-[13px] text-[#d1d4dc] z-50 animate-in fade-in zoom-in-95 duration-75">
-              {['Dark Pro (Default)', 'Midnight Blue', 'Monochrome Minimal', 'High Contrast'].map(
-                (tpl, idx) => (
+            {isTemplateHovered && (
+              <div className="absolute left-[98%] top-0 w-48 max-h-64 overflow-y-auto bg-[#1e222d] border border-[#2a2e39] rounded-md shadow-2xl py-1 text-[13px] text-[#d1d4dc] z-50 animate-in fade-in zoom-in-95 duration-75">
+                {templates.map((tmpl) => (
                   <button
-                    key={tpl}
+                    key={tmpl.id}
                     onClick={() => {
+                      const currentSettings = activePane?.settings || chartSettings;
+                      const applied = chartTemplateManager.applyTemplate(currentSettings, tmpl);
+                      updatePaneSettings(currentPaneId, applied);
                       setIsTemplateHovered(false);
                       onClose();
                     }}
                     className="w-full text-left px-3 py-1.5 hover:bg-[#2a2e39] hover:text-white transition-colors cursor-pointer flex items-center justify-between"
                   >
-                    <span>{tpl}</span>
-                    {idx === 0 && <Check size={12} className="text-[#2962ff]" />}
+                    <span className="truncate">{tmpl.name}</span>
                   </button>
-                )
-              )}
-            </div>
-          )}
-        </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="h-[1px] bg-[#2a2e39] my-1" />
 

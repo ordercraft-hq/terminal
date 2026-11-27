@@ -2,9 +2,13 @@ package watchlist
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestNormalizeToYahooTicker(t *testing.T) {
@@ -98,6 +102,60 @@ func TestWatchlistQuotesAndSearch(t *testing.T) {
 	}
 	if len(searchRes) != 1 || searchRes[0].Symbol != "AAPL" {
 		t.Errorf("expected 1 result with AAPL, got: %+v", searchRes)
+	}
+}
+
+func TestWatchlistSingleFlightAndCacheBound(t *testing.T) {
+	var quoteCalls atomic.Int32
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/test/getcrumb" {
+			w.Write([]byte("crumb_1"))
+			return
+		}
+		if r.URL.Path == "/v7/finance/quote" {
+			quoteCalls.Add(1)
+			time.Sleep(30 * time.Millisecond)
+			sym := r.URL.Query().Get("symbols")
+			fmt.Fprintf(w, `{"quoteResponse":{"result":[{"symbol":%q,"regularMarketPrice":100.0}]}}`, sym)
+			return
+		}
+	}))
+	defer mockServer.Close()
+
+	svc := NewService()
+	svc.maxCacheEntries = 2
+	svc.SetEndpoints(
+		mockServer.URL+"/v7/finance/quote",
+		mockServer.URL+"/v1/test/getcrumb",
+		mockServer.URL+"/v1/finance/search",
+	)
+
+	// 1. Concurrent identical requests coalesce into 1 HTTP quote call
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			q, err := svc.GetQuotes(context.Background(), []string{"AAPL"})
+			if err != nil || len(q) != 1 {
+				t.Errorf("unexpected quote result: %v, %+v", err, q)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := quoteCalls.Load(); got != 1 {
+		t.Fatalf("expected 1 coalesced quote request, got %d", got)
+	}
+
+	// 2. Cache stays bounded at maxCacheEntries (2)
+	_, _ = svc.GetQuotes(context.Background(), []string{"MSFT"})
+	_, _ = svc.GetQuotes(context.Background(), []string{"NVDA"})
+	svc.mu.RLock()
+	cacheLen := len(svc.quotesCache)
+	svc.mu.RUnlock()
+	if cacheLen > 2 {
+		t.Fatalf("expected quotesCache bounded at <= 2 entries, got %d", cacheLen)
 	}
 }
 

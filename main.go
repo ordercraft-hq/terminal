@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ordercraft-hq/terminal/internal/datafeed"
 	"github.com/ordercraft-hq/terminal/internal/server"
 	"github.com/ordercraft-hq/terminal/internal/storage"
 )
@@ -27,7 +28,7 @@ import (
 var embeddedFrontend embed.FS
 
 // version is set at compile time via -ldflags="-X main.version=..." during releases
-var version = "v0.2.0"
+var version = "v0.3.0"
 
 const defaultWorkstationPort = 8448
 
@@ -57,33 +58,8 @@ func bindWithFallback(host string, startPort int, maxAttempts int) (net.Listener
 	return nil, 0, fmt.Errorf("failed to bind to ports %d-%d after %d attempts", startPort, startPort+maxAttempts-1, maxAttempts)
 }
 
-// loadDotEnv parses key-value pairs from .env files and injects them into os.Environ
-// without overriding any environment variables already set in the current process.
-func loadDotEnv(paths ...string) {
-	for _, p := range paths {
-		data, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) == 2 {
-				key := strings.TrimSpace(parts[0])
-				val := strings.Trim(strings.TrimSpace(parts[1]), "\"'")
-				if _, exists := os.LookupEnv(key); !exists && key != "" {
-					_ = os.Setenv(key, val)
-				}
-			}
-		}
-	}
-}
-
 func main() {
-	loadDotEnv(".env")
+	datafeed.LoadDotEnv(".env")
 	defaultPort := resolveDefaultPort()
 	port := flag.Int("port", defaultPort, "Port for the HTTP and WebSocket server (supports PORT env var)")
 	host := flag.String("host", "127.0.0.1", "Host address to bind the server")
@@ -99,10 +75,15 @@ func main() {
 	log.Println("==================================================")
 
 	// Security advisory check for network host binding
-	if !server.IsLoopbackHost(*host) {
+	effectiveHost := strings.TrimSpace(*host)
+	if effectiveHost == "" {
+		// net.Listen(":port") binds all interfaces; do not misclassify empty host as loopback.
+		effectiveHost = "0.0.0.0"
+	}
+	if !server.IsLoopbackHost(effectiveHost) {
 		if *tokenFlag == "" {
 			log.Println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-			log.Printf("  [SECURITY WARNING] Non-loopback host binding detected: %s\n", *host)
+			log.Printf("  [SECURITY WARNING] Non-loopback host binding detected: %s\n", effectiveHost)
 			log.Println("  OrderCraft is running WITHOUT authentication on a network-accessible host.")
 			log.Println("  Exposing port 8448 allows any device on your local network or the internet")
 			log.Println("  to view and modify workspace layouts, drawings, and configured API credentials!")
@@ -112,7 +93,7 @@ func main() {
 			log.Println("    --token=<secret>  or  export ORDERCRAFT_AUTH_TOKEN=<secret>")
 			log.Println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 		} else {
-			log.Printf("[Security] Binding to network interface %s with token authentication enabled.\n", *host)
+			log.Printf("[Security] Binding to network interface %s with token authentication enabled.\n", effectiveHost)
 		}
 	}
 
@@ -125,7 +106,7 @@ func main() {
 
 	srv := server.NewServer(s)
 	srv.SetVersion(version)
-	srv.SetBindHost(*host)
+	srv.SetBindHost(effectiveHost)
 	if *tokenFlag != "" {
 		srv.SetAuthToken(*tokenFlag)
 		log.Println("[Security] Token authentication active for all /api/ endpoints and /ws.")

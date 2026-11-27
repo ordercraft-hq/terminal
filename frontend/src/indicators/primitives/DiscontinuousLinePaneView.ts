@@ -48,6 +48,10 @@ export type DiscontinuousLineSeriesApi = ISeriesApi<
 export class DiscontinuousLineRenderer implements ICustomSeriesPaneRenderer {
   private _data: PaneRendererCustomData<Time, DiscontinuousLineData> | null = null;
   private _options: DiscontinuousLineOptions | null = null;
+  private _markerX: number[] = [];
+  private _markerY: number[] = [];
+  private _markerColor: string[] = [];
+  private _markerCount = 0;
 
   public update(
     data: PaneRendererCustomData<Time, DiscontinuousLineData>,
@@ -80,10 +84,12 @@ export class DiscontinuousLineRenderer implements ICustomSeriesPaneRenderer {
 
       ctx.save();
       const lineWidth = Math.max(1, options.lineWidth || 2);
+      const defaultColor = options.color || '#2962ff';
       ctx.lineWidth = lineWidth;
       ctx.lineJoin = 'round';
       ctx.lineCap = 'round';
-      ctx.strokeStyle = options.color || '#2962ff';
+      let currentStrokeColor = defaultColor;
+      ctx.strokeStyle = currentStrokeColor;
 
       // Configure dash pattern matching LineStyle enum
       if (options.lineStyle === LineStyle.Dashed) {
@@ -95,6 +101,9 @@ export class DiscontinuousLineRenderer implements ICustomSeriesPaneRenderer {
       }
 
       const isStepLine = options.lineType === LineType.WithSteps;
+      const collectMarkers = Boolean(options.pointMarkersVisible);
+      this._markerCount = 0;
+
       let inSegment = false;
       let segmentLength = 0;
       let segmentStartX = 0;
@@ -141,17 +150,31 @@ export class DiscontinuousLineRenderer implements ICustomSeriesPaneRenderer {
         }
 
         const x = bar.x;
+        const pointColor = bar.originalData?.color || defaultColor;
+
+        if (collectMarkers && i >= visibleRange.from && i < visibleRange.to) {
+          const mIdx = this._markerCount++;
+          this._markerX[mIdx] = x;
+          this._markerY[mIdx] = y;
+          this._markerColor[mIdx] = pointColor;
+        }
 
         // DISCONTINUITY & GAP DETECTION:
         // A gap occurs if:
         // 1. Logical time scale index difference != 1 (missing candle between points)
         // 2. Physical horizontal distance > 1.5 * barSpacing or reversed (x - lastX < 0)
+        // 3. Per-point regime color changed
         const isTimeIndexGap = inSegment && (bar.time !== prevBarIndex + 1);
         const isPhysicalGap = inSegment && ((x - lastX) > barSpacing * 1.5 || (x - lastX) < 0);
-        const isGap = isTimeIndexGap || isPhysicalGap;
+        const isColorChange = inSegment && pointColor !== currentStrokeColor;
+        const isGap = isTimeIndexGap || isPhysicalGap || isColorChange;
 
         if (!inSegment || isGap) {
           flushSegment();
+          if (pointColor !== currentStrokeColor) {
+            currentStrokeColor = pointColor;
+            ctx.strokeStyle = currentStrokeColor;
+          }
           ctx.beginPath();
           ctx.moveTo(x, y);
           inSegment = true;
@@ -175,21 +198,19 @@ export class DiscontinuousLineRenderer implements ICustomSeriesPaneRenderer {
 
       flushSegment();
 
-      // Render point markers if requested (e.g. plotType === 'circles' || 'cross')
-      if (options.pointMarkersVisible) {
+      // Render point markers if requested (reusing computed coordinates & colors)
+      if (collectMarkers && this._markerCount > 0) {
         const radius = options.pointMarkersRadius || lineWidth / 2 + 2;
-        ctx.fillStyle = options.color || '#2962ff';
-        for (let i = visibleRange.from; i < visibleRange.to; i++) {
-          const bar = bars[i];
-          const val = bar.originalData?.value;
-          if (val !== null && val !== undefined && Number.isFinite(val)) {
-            const y = priceConverter(val);
-            if (y !== null && Number.isFinite(y)) {
-              ctx.beginPath();
-              ctx.arc(bar.x, y, radius, 0, Math.PI * 2);
-              ctx.fill();
-            }
+        let currentFillColor = '';
+        for (let i = 0; i < this._markerCount; i++) {
+          const fillCol = this._markerColor[i];
+          if (fillCol !== currentFillColor) {
+            currentFillColor = fillCol;
+            ctx.fillStyle = fillCol;
           }
+          ctx.beginPath();
+          ctx.arc(this._markerX[i], this._markerY[i], radius, 0, Math.PI * 2);
+          ctx.fill();
         }
       }
 

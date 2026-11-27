@@ -363,6 +363,34 @@ export const RenkoIcon: React.FC<BarTypeIconProps> = ({
   </svg>
 );
 
+export const FootprintIcon: React.FC<BarTypeIconProps> = ({
+  size = 16,
+  className = '',
+  strokeWidth = 1.6,
+  ...props
+}) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={strokeWidth}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    {/* Split Cluster Box */}
+    <rect x="4" y="5" width="16" height="14" rx="1" />
+    <line x1="12" y1="2" x2="12" y2="22" />
+    <line x1="5.5" y1="9" x2="10.5" y2="9" />
+    <line x1="13.5" y1="9" x2="18.5" y2="9" />
+    <line x1="5.5" y1="14" x2="9.5" y2="14" />
+    <line x1="13.5" y1="14" x2="19.5" y2="14" />
+  </svg>
+);
+
 export const BarTypeIcon: React.FC<{
   type: ChartType;
   size?: number;
@@ -396,6 +424,8 @@ export const BarTypeIcon: React.FC<{
       return <HeikinAshiIcon size={size} className={className} strokeWidth={strokeWidth} />;
     case 'renko':
       return <RenkoIcon size={size} className={className} strokeWidth={strokeWidth} />;
+    case 'footprint':
+      return <FootprintIcon size={size} className={className} strokeWidth={strokeWidth} />;
     default:
       return <CandlesIcon size={size} className={className} strokeWidth={strokeWidth} />;
   }
@@ -404,11 +434,11 @@ export const BarTypeIcon: React.FC<{
 export interface BarTypeItem {
   id: ChartType;
   label: string;
-  category: 'candles_bars' | 'lines' | 'area_bands' | 'exotic';
+  category: 'candles_bars' | 'lines' | 'area_bands' | 'exotic' | 'orderflow';
 }
 
 export const BAR_TYPE_CATEGORIES: {
-  category: 'candles_bars' | 'lines' | 'area_bands' | 'exotic';
+  category: 'candles_bars' | 'lines' | 'area_bands' | 'exotic' | 'orderflow';
   label: string;
   items: BarTypeItem[];
 }[] = [
@@ -421,6 +451,13 @@ export const BAR_TYPE_CATEGORIES: {
       { id: 'hollow_candles', label: 'Hollow candles', category: 'candles_bars' },
       { id: 'volume_candles', label: 'Volume candles', category: 'candles_bars' },
       { id: 'hlc_bars', label: 'HLC bars', category: 'candles_bars' },
+    ],
+  },
+  {
+    category: 'orderflow',
+    label: 'Orderflow (L2)',
+    items: [
+      { id: 'footprint', label: 'Footprint (Bid/Ask Clusters)', category: 'orderflow' },
     ],
   },
   {

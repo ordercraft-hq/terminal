@@ -45,6 +45,18 @@ export const PROVIDER_SUPPORTED_TIMEFRAMES: Record<string, string[]> = {
     '1h', '2h', '3h', '4h', '6h', '8h', '12h',
     '1D', '1d', '1W', '1w', '1M', '1mo',
   ],
+  DATABRIDGE: [
+    '1s', '5s', '15s', '30s',
+    '1m', '2m', '3m', '5m', '10m', '15m', '30m',
+    '1h', '2h', '3h', '4h', '12h',
+    '1D', '1d', '1W', '1w',
+  ],
+  BRIDGE: [
+    '1s', '5s', '15s', '30s',
+    '1m', '2m', '3m', '5m', '10m', '15m', '30m',
+    '1h', '2h', '3h', '4h', '12h',
+    '1D', '1d', '1W', '1w',
+  ],
 };
 
 /**
@@ -81,6 +93,30 @@ export function getProviderFromSymbol(symbol: string): string {
     }
     return prefix;
   }
+  // Check for common futures symbols without prefix (e.g. ENQ, ENQZ26, @NQ, ES, MES)
+  if (
+    clean.startsWith('ENQ') ||
+    clean.startsWith('MNQ') ||
+    clean.startsWith('ES') ||
+    clean.startsWith('MES') ||
+    clean.startsWith('YM') ||
+    clean.startsWith('MYM') ||
+    clean.startsWith('RTY') ||
+    clean.startsWith('M2K') ||
+    clean.startsWith('CL') ||
+    clean.startsWith('QM') ||
+    clean.startsWith('GC') ||
+    clean.startsWith('MGC') ||
+    clean.startsWith('SI') ||
+    clean.startsWith('SIL') ||
+    clean.startsWith('ZB') ||
+    clean.startsWith('ZN') ||
+    clean.startsWith('ZF') ||
+    clean.startsWith('ZT') ||
+    clean.startsWith('@')
+  ) {
+    return 'DATABRIDGE';
+  }
   return 'BINANCE';
 }
 
@@ -101,6 +137,9 @@ export function getProviderDisplayName(provider: string): string {
       return 'Alpaca';
     case 'OANDA':
       return 'OANDA';
+    case 'DATABRIDGE':
+    case 'BRIDGE':
+      return 'DataBridge';
     default:
       return provider;
   }

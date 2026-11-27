@@ -89,3 +89,50 @@ func TestCandleCacheInvalidateSymbol(t *testing.T) {
 		t.Fatal("expected BINANCE:ETHUSDT:15m to remain valid")
 	}
 }
+
+func TestCandleCacheExpiredTombstonesDoNotEvictLive(t *testing.T) {
+	cache := NewCandleCache(2, 30*time.Millisecond)
+
+	// 1. Insert entries that will expire and be read (formerly left tombstones in keys slice)
+	cache.Set("exp1", []Candle{{Time: 1, Close: 10}})
+	cache.Set("exp2", []Candle{{Time: 2, Close: 20}})
+
+	time.Sleep(45 * time.Millisecond)
+
+	if _, ok := cache.Get("exp1"); ok {
+		t.Fatal("expected exp1 to be expired")
+	}
+	if _, ok := cache.Get("exp2"); ok {
+		t.Fatal("expected exp2 to be expired")
+	}
+	if cache.Len() != 0 {
+		t.Fatalf("expected 0 entries after expired Gets, got %d", cache.Len())
+	}
+
+	// Insert two live entries with long TTL; neither should be evicted by old tombstones
+	cache.SetWithTTL("live1", []Candle{{Time: 3, Close: 30}}, 2*time.Second)
+	cache.SetWithTTL("live2", []Candle{{Time: 4, Close: 40}}, 2*time.Second)
+
+	if _, ok := cache.Get("live1"); !ok {
+		t.Fatal("expected live1 to remain cached without premature eviction")
+	}
+	if _, ok := cache.Get("live2"); !ok {
+		t.Fatal("expected live2 to remain cached")
+	}
+
+	// 2. Also verify unread expired entries are purged before evicting live entries
+	cache.Clear()
+	cache.SetWithTTL("short_live", []Candle{{Time: 5, Close: 50}}, 20*time.Millisecond)
+	cache.SetWithTTL("long_live", []Candle{{Time: 6, Close: 60}}, 2*time.Second)
+
+	time.Sleep(35 * time.Millisecond)
+
+	// Adding a third key should evict expired short_live, NOT long_live
+	cache.SetWithTTL("new_live", []Candle{{Time: 7, Close: 70}}, 2*time.Second)
+	if _, ok := cache.Get("long_live"); !ok {
+		t.Fatal("expected long_live to survive when short_live was already expired")
+	}
+	if _, ok := cache.Get("new_live"); !ok {
+		t.Fatal("expected new_live to be cached")
+	}
+}

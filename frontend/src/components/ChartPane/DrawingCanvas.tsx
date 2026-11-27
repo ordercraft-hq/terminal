@@ -1,6 +1,16 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { useShallow } from 'zustand/react/shallow';
-import { LineStyle, type IChartApi, type ISeriesApi, type IPriceLine } from 'lightweight-charts';
+import {
+  LineStyle,
+  type IChartApi,
+  type IPrimitivePaneRenderer,
+  type IPrimitivePaneView,
+  type IPriceLine,
+  type ISeriesApi,
+  type ISeriesPrimitive,
+  type SeriesType,
+  type Time,
+} from 'lightweight-charts';
 import { useSyncStore } from '../../store/syncStore';
 import type { UserDrawing, LogicalAnchor, DrawingToolType } from '../../store/syncStore';
 import { transport } from '../../transport/client';
@@ -29,9 +39,129 @@ import { AnchoredVWAPTool } from '../../drawings/tools/AnchoredVWAPTool';
 import { AnchoredVolumeProfileTool } from '../../drawings/tools/AnchoredVolumeProfileTool';
 import { drawMeasureOverlay, type MeasureState } from '../../drawings/helpers/measureRenderer';
 
+/**
+ * Lightweight Charts v5 series primitive hook that synchronizes DrawingCanvas
+ * rendering inside the exact Frame-N LWC canvas paint pass so drawings remain
+ * lockstep with candlesticks during pan, zoom, and price-scale interactions.
+ */
+class DrawingViewportSyncRenderer implements IPrimitivePaneRenderer {
+  private readonly _onPaint: () => void;
+  constructor(onPaint: () => void) {
+    this._onPaint = onPaint;
+  }
+  draw(): void {
+    this._onPaint();
+  }
+}
+
+class DrawingViewportSyncView implements IPrimitivePaneView {
+  private readonly _renderer: DrawingViewportSyncRenderer;
+  constructor(onPaint: () => void) {
+    this._renderer = new DrawingViewportSyncRenderer(onPaint);
+  }
+  renderer(): IPrimitivePaneRenderer {
+    return this._renderer;
+  }
+}
+
+class DrawingViewportSyncPrimitive implements ISeriesPrimitive<Time> {
+  private readonly _views: readonly IPrimitivePaneView[];
+  constructor(onPaint: () => void) {
+    this._views = [new DrawingViewportSyncView(onPaint)];
+  }
+  paneViews(): readonly IPrimitivePaneView[] {
+    return this._views;
+  }
+}
+
+interface InternalChartModel {
+  _internal_paneForSource?: (source: unknown) => unknown;
+  _internal_setAndSaveCurrentPosition?: (
+    x: number,
+    y: number,
+    event: unknown,
+    pane: unknown,
+    forceUpdate: boolean
+  ) => void;
+}
+
+interface InternalChartWidget {
+  _internal_model?: () => InternalChartModel;
+}
+
+interface ChartWithPrivateCrosshair {
+  _private__chartWidget?: InternalChartWidget;
+  _private__seriesMap?: Map<ISeriesApi<SeriesType>, unknown>;
+}
+
+/**
+ * Safely attempts pixel-exact crosshair positioning via optional lightweight-charts
+ * internal widget methods, returning false if private fields differ or are unavailable.
+ */
+function trySetInternalCrosshair(
+  chart: IChartApi,
+  series: ISeriesApi<SeriesType>,
+  x: number,
+  y: number
+): boolean {
+  try {
+    const internal = chart as unknown as ChartWithPrivateCrosshair;
+    const widget = internal._private__chartWidget;
+    const seriesMap = internal._private__seriesMap;
+    if (!widget || !seriesMap || typeof seriesMap.get !== 'function') return false;
+    if (typeof widget._internal_model !== 'function') return false;
+
+    const model = widget._internal_model();
+    if (
+      !model ||
+      typeof model._internal_paneForSource !== 'function' ||
+      typeof model._internal_setAndSaveCurrentPosition !== 'function'
+    ) {
+      return false;
+    }
+
+    const s = seriesMap.get(series);
+    if (!s) return false;
+
+    const pane = model._internal_paneForSource(s);
+    if (!pane) return false;
+
+    model._internal_setAndSaveCurrentPosition(x, y, null, pane, true);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const CULL_VIEWPORT_MARGIN = 150;
+
+function isHorizontallyExtended(d: UserDrawing): boolean {
+  if (
+    d.type === 'horizontal_line' ||
+    d.type === 'horizontal_ray' ||
+    d.type === 'vertical_line' ||
+    d.type === 'cross_line' ||
+    d.type === 'ray' ||
+    d.type === 'anchored_vwap' ||
+    d.type === 'anchored_volume_profile' ||
+    d.type === 'circle'
+  ) {
+    return true;
+  }
+  const opts = d.options as Record<string, unknown> | undefined;
+  if (!opts) return false;
+  if (opts.extendLeft === true || opts.extendRight === true || opts.extend === true) {
+    return true;
+  }
+  if (opts.extend === 'left' || opts.extend === 'right' || opts.extend === 'both') {
+    return true;
+  }
+  return false;
+}
+
 interface DrawingCanvasProps {
   chart: IChartApi | null;
-  series: ISeriesApi<'Candlestick'> | null;
+  series: ISeriesApi<SeriesType> | null;
   candles: Candle[];
   containerRef: React.RefObject<HTMLDivElement | null>;
   paneSymbol?: string;
@@ -51,7 +181,7 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
   paneSymbol,
   paneId,
   isActive = false,
-  isGrid = false,
+  isGrid: _isGrid = false,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -177,40 +307,21 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
       if (!chart || !series) return;
       if (isNaN(anchor.price) || isNaN(anchor.time)) return;
 
-      try {
-        const chartObj = chart as any;
-        const chartWidget = chartObj._private__chartWidget;
-        const seriesMap = chartObj._private__seriesMap;
-        if (chartWidget && seriesMap) {
-          const s = seriesMap.get(series);
-          if (s) {
-            const pane = chartWidget._internal_model()._internal_paneForSource(s);
-            if (pane) {
-              chartWidget._internal_model()._internal_setAndSaveCurrentPosition(x, y, null, pane, true);
-              if (useSyncStore.getState().crosshairLock) {
-                useSyncStore.getState().setSyncCrosshair({
-                  sourceId: paneId || 'main',
-                  time: anchor.time,
-                  price: anchor.price,
-                });
-              }
-              return;
-            }
-          }
-        }
-        // Standard public lightweight-charts API fallback
-        chart.setCrosshairPosition(anchor.price, anchor.time as any, series);
-        if (useSyncStore.getState().crosshairLock) {
-          useSyncStore.getState().setSyncCrosshair({
-            sourceId: paneId || 'main',
-            time: anchor.time,
-            price: anchor.price,
-          });
-        }
-      } catch {
+      const positioned = trySetInternalCrosshair(chart, series, x, y);
+      if (!positioned) {
         try {
-          chart.setCrosshairPosition(anchor.price, anchor.time as any, series);
-        } catch {}
+          chart.setCrosshairPosition(anchor.price, anchor.time as Time, series);
+        } catch {
+          return;
+        }
+      }
+
+      if (useSyncStore.getState().crosshairLock) {
+        useSyncStore.getState().setSyncCrosshair({
+          sourceId: paneId || 'main',
+          time: anchor.time,
+          price: anchor.price,
+        });
       }
     },
     [chart, series, paneId]
@@ -272,10 +383,15 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
 
   const renderCanvasRef = useRef<() => void>(() => {});
   const pendingRafRef = useRef<number | null>(null);
+  const needsDrawRef = useRef<boolean>(true);
+  const lastViewportSigRef = useRef<string>('');
+
   const scheduleRender = useCallback(() => {
+    needsDrawRef.current = true;
     if (pendingRafRef.current === null) {
       pendingRafRef.current = requestAnimationFrame(() => {
         pendingRafRef.current = null;
+        needsDrawRef.current = false;
         renderCanvasRef.current();
       });
     }
@@ -461,6 +577,37 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
     ]
   );
 
+  // Stable refs for container DOM listeners so pointer/dblclick handlers are not torn down
+  // and re-attached on every selection, drawing mutation, or 250ms candle tick.
+  const visibleDrawingsRef = useRef(visibleDrawings);
+  visibleDrawingsRef.current = visibleDrawings;
+  const selectedDrawingIdRef = useRef(selectedDrawingId);
+  selectedDrawingIdRef.current = selectedDrawingId;
+  const paneIdRef = useRef(paneId);
+  paneIdRef.current = paneId;
+  const drawingsLockedRef = useRef(drawingsLocked);
+  drawingsLockedRef.current = drawingsLocked;
+  const hitTestDrawingRef = useRef(hitTestDrawing);
+  hitTestDrawingRef.current = hitTestDrawing;
+  const canvasToAnchorRef = useRef(canvasToAnchor);
+  canvasToAnchorRef.current = canvasToAnchor;
+  const getExactPlotDimensionsRef = useRef(getExactPlotDimensions);
+  getExactPlotDimensionsRef.current = getExactPlotDimensions;
+  const snapToCandleOHLCRef = useRef(snapToCandleOHLC);
+  snapToCandleOHLCRef.current = snapToCandleOHLC;
+  const updateChartCrosshairRef = useRef(updateChartCrosshair);
+  updateChartCrosshairRef.current = updateChartCrosshair;
+  const clearChartCrosshairRef = useRef(clearChartCrosshair);
+  clearChartCrosshairRef.current = clearChartCrosshair;
+  const scheduleRenderRef = useRef(scheduleRender);
+  scheduleRenderRef.current = scheduleRender;
+  const setActivePaneIdRef = useRef(setActivePaneId);
+  setActivePaneIdRef.current = setActivePaneId;
+  const setSelectedDrawingIdRef = useRef(setSelectedDrawingId);
+  setSelectedDrawingIdRef.current = setSelectedDrawingId;
+  const setActiveToolRef = useRef(setActiveTool);
+  setActiveToolRef.current = setActiveTool;
+
   // In cursor mode, detect clicking on drawings from the container to select or drag them
   useEffect(() => {
     const container = containerRef.current;
@@ -476,8 +623,10 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
         return;
       }
 
+      const curActiveTool = activeToolRef.current;
+      const curPaneId = paneIdRef.current;
       const isShift = Boolean(e.shiftKey || isShiftPressedRef.current);
-      const isMeasureTool = activeTool === 'price_range' || activeTool === 'date_price_range';
+      const isMeasureTool = curActiveTool === 'price_range' || curActiveTool === 'date_price_range';
 
       // 1. If a measurement is already placed, clicking anywhere (without shift) dismisses it
       if (measureStateRef.current?.isPlaced) {
@@ -485,8 +634,8 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
           e.stopPropagation();
           e.preventDefault();
           setMeasureState(null);
-          clearChartCrosshair();
-          scheduleRender();
+          clearChartCrosshairRef.current();
+          scheduleRenderRef.current();
           return;
         }
         setMeasureState(null);
@@ -498,9 +647,9 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
         e.preventDefault();
         setMeasureState((prev) => (prev ? { ...prev, isPlaced: true } : null));
         if (isMeasureTool) {
-          setActiveTool('cursor');
+          setActiveToolRef.current('cursor');
         }
-        scheduleRender();
+        scheduleRenderRef.current();
         return;
       }
 
@@ -509,12 +658,12 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
         e.stopPropagation();
         e.preventDefault();
 
-        if (paneId) {
-          setActivePaneId(paneId);
+        if (curPaneId) {
+          setActivePaneIdRef.current(curPaneId);
         }
 
         const rect = container.getBoundingClientRect();
-        const { width, height } = getExactPlotDimensions();
+        const { width, height } = getExactPlotDimensionsRef.current();
         if (width <= 0 || height <= 0) return;
 
         const rawX = e.clientX - rect.left;
@@ -522,10 +671,10 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
         const x = Math.max(0, Math.min(width, rawX));
         const y = Math.max(0, Math.min(height, rawY));
 
-        const rawAnchor = canvasToAnchor(x, y);
+        const rawAnchor = canvasToAnchorRef.current(x, y);
         if (rawAnchor) {
           const isCtrl = Boolean(e.ctrlKey || e.metaKey);
-          const { anchor, snapCoord } = snapToCandleOHLC(rawAnchor, x, y, isCtrl);
+          const { anchor, snapCoord } = snapToCandleOHLCRef.current(rawAnchor, x, y, isCtrl);
           const targetX = snapCoord ? snapCoord.x : x;
           const targetY = snapCoord ? snapCoord.y : y;
           setMeasureState({
@@ -536,34 +685,34 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
             currentPoint: { x: targetX, y: targetY },
             isDragging: true,
           });
-          updateChartCrosshair(anchor, targetX, targetY);
-          scheduleRender();
+          updateChartCrosshairRef.current(anchor, targetX, targetY);
+          scheduleRenderRef.current();
         }
         return;
       }
 
       // When a drawing tool is drafting, canvas handles pointer events
-      if (activeTool !== 'cursor') return;
+      if (curActiveTool !== 'cursor') return;
 
       const rect = container.getBoundingClientRect();
       const x = e.clientX - rect.left;
       const y = e.clientY - rect.top;
 
-      const hit = hitTestDrawing(x, y);
+      const hit = hitTestDrawingRef.current(x, y);
       if (hit) {
         e.stopPropagation();
         e.preventDefault();
 
-        if (paneId) {
-          setActivePaneId(paneId);
+        if (curPaneId) {
+          setActivePaneIdRef.current(curPaneId);
         }
-        setSelectedDrawingId(hit.drawingId);
+        setSelectedDrawingIdRef.current(hit.drawingId);
 
-        const targetDrawing = visibleDrawings.find((d) => d.id === hit.drawingId);
-        const isLocked = drawingsLocked || !!targetDrawing?.locked;
+        const targetDrawing = visibleDrawingsRef.current.find((d) => d.id === hit.drawingId);
+        const isLocked = drawingsLockedRef.current || !!targetDrawing?.locked;
 
         if (!isLocked && targetDrawing) {
-          const rawAnchor = canvasToAnchor(x, y);
+          const rawAnchor = canvasToAnchorRef.current(x, y);
           if (rawAnchor) {
             const isCtrl = Boolean(e.ctrlKey || e.metaKey || isCtrlPressedRef.current);
             if (isCtrl) {
@@ -600,19 +749,45 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
         }
       } else {
         cloneOnDragRef.current = null;
-        if (selectedDrawingId) {
-          setSelectedDrawingId(null);
+        if (selectedDrawingIdRef.current) {
+          setSelectedDrawingIdRef.current(null);
         }
       }
     };
 
     let moveRafId: number | null = null;
-    let pendingMoveEvent: { clientX: number; clientY: number; target: EventTarget | null } | null = null;
+    let pendingMoveEvent: { clientX: number; clientY: number; target: EventTarget | null; buttons: number } | null = null;
+    let isPanningChart = false;
+
+    const clearPanningFlag = () => {
+      isPanningChart = false;
+    };
+
+    const handleContainerPointerDownWithPan = (e: PointerEvent) => {
+      if (e.button === 0 && activeToolRef.current === 'cursor') {
+        const rect = container.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        const hit = hitTestDrawingRef.current(x, y);
+        if (!hit) {
+          isPanningChart = true;
+        }
+      }
+      handleContainerPointerDown(e);
+    };
 
     const processPointerMove = () => {
       moveRafId = null;
       if (!pendingMoveEvent) return;
-      if (activeTool !== 'cursor' || draggedHandle || draggedDrawing) return;
+      if (
+        isPanningChart ||
+        pendingMoveEvent.buttons !== 0 ||
+        activeToolRef.current !== 'cursor' ||
+        draggedHandleRef.current ||
+        draggedDrawingRef.current
+      ) {
+        return;
+      }
 
       const target = pendingMoveEvent.target as HTMLElement | null;
       if (target && target.closest('.floating-drawing-toolbar, button, input, select, [role="button"]')) {
@@ -626,13 +801,13 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
       const x = pendingMoveEvent.clientX - rect.left;
       const y = pendingMoveEvent.clientY - rect.top;
 
-      const hit = hitTestDrawing(x, y);
+      const hit = hitTestDrawingRef.current(x, y);
       const newHoveredId = hit ? hit.drawingId : null;
       setHoveredDrawingId((prev) => (prev === newHoveredId ? prev : newHoveredId));
 
       if (hit) {
-        const targetDrawing = visibleDrawings.find((d) => d.id === hit.drawingId);
-        const isLocked = drawingsLocked || !!targetDrawing?.locked;
+        const targetDrawing = visibleDrawingsRef.current.find((d) => d.id === hit.drawingId);
+        const isLocked = drawingsLockedRef.current || !!targetDrawing?.locked;
         let cur = 'move';
         if (isLocked) {
           cur = 'pointer';
@@ -664,14 +839,24 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
     };
 
     const handleContainerPointerMove = (e: PointerEvent) => {
-      if (activeTool !== 'cursor' || draggedHandle || draggedDrawing) return;
-      pendingMoveEvent = { clientX: e.clientX, clientY: e.clientY, target: e.target };
+      if (e.buttons === 0) isPanningChart = false;
+      if (
+        isPanningChart ||
+        e.buttons !== 0 ||
+        activeToolRef.current !== 'cursor' ||
+        draggedHandleRef.current ||
+        draggedDrawingRef.current
+      ) {
+        return;
+      }
+      pendingMoveEvent = { clientX: e.clientX, clientY: e.clientY, target: e.target, buttons: e.buttons };
       if (moveRafId === null) {
         moveRafId = requestAnimationFrame(processPointerMove);
       }
     };
 
     const handleContainerPointerLeave = () => {
+      isPanningChart = false;
       if (moveRafId !== null) {
         cancelAnimationFrame(moveRafId);
         moveRafId = null;
@@ -693,44 +878,36 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
       const rect = container.getBoundingClientRect();
       const x = e.clientX - rect.left;
       const y = e.clientY - rect.top;
-      const hit = hitTestDrawing(x, y);
+      const hit = hitTestDrawingRef.current(x, y);
       if (hit) {
         e.stopPropagation();
         e.preventDefault();
-        setSelectedDrawingId(hit.drawingId);
+        setSelectedDrawingIdRef.current(hit.drawingId);
         setIsSettingsModalOpen(true);
       }
     };
 
-    container.addEventListener('pointerdown', handleContainerPointerDown, { capture: true });
+    container.addEventListener('pointerdown', handleContainerPointerDownWithPan, { capture: true });
     container.addEventListener('pointermove', handleContainerPointerMove);
     container.addEventListener('pointerleave', handleContainerPointerLeave);
     container.addEventListener('dblclick', handleContainerDblClick);
+    window.addEventListener('pointerup', clearPanningFlag);
+    window.addEventListener('pointercancel', clearPanningFlag);
     return () => {
       if (moveRafId !== null) {
         cancelAnimationFrame(moveRafId);
         moveRafId = null;
       }
-      container.removeEventListener('pointerdown', handleContainerPointerDown, { capture: true });
+      container.removeEventListener('pointerdown', handleContainerPointerDownWithPan, { capture: true });
       container.removeEventListener('pointermove', handleContainerPointerMove);
       container.removeEventListener('pointerleave', handleContainerPointerLeave);
       container.removeEventListener('dblclick', handleContainerDblClick);
+      window.removeEventListener('pointerup', clearPanningFlag);
+      window.removeEventListener('pointercancel', clearPanningFlag);
       container.style.cursor = '';
       container.removeAttribute('data-active-cursor');
     };
-  }, [
-    containerRef,
-    activeTool,
-    hitTestDrawing,
-    paneId,
-    drawingsLocked,
-    canvasToAnchor,
-    visibleDrawings,
-    selectedDrawingId,
-    setActivePaneId,
-    setSelectedDrawingId,
-    setIsSettingsModalOpen,
-  ]);
+  }, [containerRef]);
 
   // Window pointer listeners while a measurement is active (in-progress)
   useEffect(() => {
@@ -843,9 +1020,7 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
       }
 
       hasDrawnRef.current = true;
-      const baseDpr = window.devicePixelRatio || 1;
-      // In multi-pane grid mode, clamp DPR to 1.25 to save up to 75% VRAM per pane
-      const dpr = isGrid ? Math.min(baseDpr, 1.25) : baseDpr;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const { width, height } = getExactPlotDimensions();
       if (width <= 0 || height <= 0) return;
 
@@ -929,6 +1104,29 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
       const isSelected = isActive && d.id === selectedDrawingId;
       const isHovered = isActive && d.id === hoveredDrawingId;
       const drawingToRender = (activeDraggedId === d.id && transient) ? { ...d, anchors: transient } : d;
+
+      // Viewport X-culling: skip drawings whose anchor bounds fall completely outside
+      // [-CULL_VIEWPORT_MARGIN, width + CULL_VIEWPORT_MARGIN] (excluding extended tools)
+      if (!isHorizontallyExtended(drawingToRender) && drawingToRender.anchors && drawingToRender.anchors.length > 0) {
+        let minX = Infinity;
+        let maxX = -Infinity;
+        let projectedCount = 0;
+        for (let i = 0; i < drawingToRender.anchors.length; i++) {
+          const pt = anchorToCanvas(drawingToRender.anchors[i]);
+          if (pt && Number.isFinite(pt.x)) {
+            if (pt.x < minX) minX = pt.x;
+            if (pt.x > maxX) maxX = pt.x;
+            projectedCount++;
+          }
+        }
+        if (
+          projectedCount === drawingToRender.anchors.length &&
+          (maxX < -CULL_VIEWPORT_MARGIN || minX > width + CULL_VIEWPORT_MARGIN)
+        ) {
+          return;
+        }
+      }
+
       if (drawingRegistry.has(d.type)) {
         drawingRegistry.get(d.type)!.render(
           {
@@ -1166,46 +1364,117 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
     snapToCandleOHLC,
     plotSize,
     getExactPlotDimensions,
-    isGrid,
   ]);
 
-  renderCanvasRef.current = renderCanvas;
+  // Synchronize viewport transform signature so synchronous LWC draw-pass hooks
+  // only repaint DrawingCanvas when coordinates or drawing state actually changed.
+  const computeViewportSig = useCallback((): string => {
+    if (!chart || !series) return '';
+    try {
+      const lr = chart.timeScale().getVisibleLogicalRange();
+      const dims = getExactPlotDimensions();
+      const topP = series.coordinateToPrice(0);
+      const botP = series.coordinateToPrice(Math.max(10, dims.height));
+      const lrKey = lr ? `${lr.from.toFixed(4)}:${lr.to.toFixed(4)}` : 'n';
+      const topKey = topP !== null && !isNaN(topP) ? topP.toFixed(6) : 'n';
+      const botKey = botP !== null && !isNaN(botP) ? botP.toFixed(6) : 'n';
+      return `${lrKey}|${topKey}|${botKey}|${dims.width}x${dims.height}`;
+    } catch {
+      return '';
+    }
+  }, [chart, series, getExactPlotDimensions]);
 
-  // Hook to redraw whenever chart timeScale pans, zooms, or price scales
+  const computeViewportSigRef = useRef<() => string>(() => '');
+  computeViewportSigRef.current = computeViewportSig;
+
+  const wrappedRenderCanvas = useCallback(() => {
+    renderCanvas();
+    const sig = computeViewportSigRef.current();
+    if (sig) {
+      lastViewportSigRef.current = sig;
+    }
+    needsDrawRef.current = false;
+  }, [renderCanvas]);
+
+  renderCanvasRef.current = wrappedRenderCanvas;
+
+  const syncRenderNow = useCallback((force = false) => {
+    if (!force && !needsDrawRef.current) {
+      const sig = computeViewportSigRef.current();
+      if (sig && sig === lastViewportSigRef.current) {
+        return;
+      }
+    }
+    if (pendingRafRef.current !== null) {
+      cancelAnimationFrame(pendingRafRef.current);
+      pendingRafRef.current = null;
+    }
+    renderCanvasRef.current();
+  }, []);
+
+  const syncRenderNowRef = useRef<(force?: boolean) => void>(() => {});
+  syncRenderNowRef.current = syncRenderNow;
+
+  // Hook to redraw synchronously in the exact LWC paint pass whenever the chart
+  // pans, zooms, price scales, or auto-scales (zero frame lag).
   useEffect(() => {
     if (!chart) return;
     const timeScale = chart.timeScale();
     const handleRangeChange = () => {
-      scheduleRender();
+      syncRenderNowRef.current();
     };
 
     timeScale.subscribeVisibleTimeRangeChange(handleRangeChange);
     timeScale.subscribeVisibleLogicalRangeChange(handleRangeChange);
 
+    let syncPrim: DrawingViewportSyncPrimitive | null = null;
+    if (series) {
+      syncPrim = new DrawingViewportSyncPrimitive(() => {
+        syncRenderNowRef.current();
+      });
+      try {
+        series.attachPrimitive(syncPrim);
+      } catch {
+        syncPrim = null;
+      }
+    }
+
     const container = containerRef.current;
-    let isDragging = false;
+    let isPriceScaleDragging = false;
 
     const onPointerMove = () => {
-      if (isDragging) {
-        scheduleRender();
+      if (isPriceScaleDragging) {
+        syncRenderNowRef.current();
       }
     };
 
     const onPointerUp = () => {
-      isDragging = false;
-      window.removeEventListener('pointermove', onPointerMove);
-      window.removeEventListener('pointerup', onPointerUp);
-      scheduleRender();
+      if (isPriceScaleDragging) {
+        isPriceScaleDragging = false;
+        window.removeEventListener('pointermove', onPointerMove);
+        window.removeEventListener('pointerup', onPointerUp);
+        syncRenderNowRef.current(true);
+      }
     };
 
-    const onPointerDown = () => {
-      isDragging = true;
-      window.addEventListener('pointermove', onPointerMove);
-      window.addEventListener('pointerup', onPointerUp);
+    const onPointerDown = (e: PointerEvent) => {
+      if (!container || !visibleDrawingsRef.current.some((d) => !d.hidden)) return;
+      const { width } = getExactPlotDimensions();
+      const rect = container.getBoundingClientRect();
+      // Only track pointermove redraws when dragging the right price axis;
+      // time-axis panning already fires subscribeVisibleTimeRangeChange/LogicalRangeChange
+      // and LWC's synchronous primitive draw hook handles all vertical drags.
+      if (e.clientX - rect.left >= width) {
+        isPriceScaleDragging = true;
+        window.addEventListener('pointermove', onPointerMove);
+        window.addEventListener('pointerup', onPointerUp);
+      }
     };
 
     const onWheel = () => {
-      scheduleRender();
+      if (visibleDrawingsRef.current.some((d) => !d.hidden)) {
+        syncRenderNowRef.current();
+      }
     };
 
     if (container) {
@@ -1220,6 +1489,11 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
         timeScale.unsubscribeVisibleTimeRangeChange(handleRangeChange);
         timeScale.unsubscribeVisibleLogicalRangeChange(handleRangeChange);
       } catch {}
+      if (syncPrim && series) {
+        try {
+          series.detachPrimitive(syncPrim);
+        } catch {}
+      }
       if (container) {
         container.removeEventListener('pointerdown', onPointerDown);
         container.removeEventListener('wheel', onWheel);
@@ -1227,7 +1501,7 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('pointerup', onPointerUp);
     };
-  }, [chart, containerRef, scheduleRender]);
+  }, [chart, series, containerRef, scheduleRender, getExactPlotDimensions]);
 
   // Redraw canvas whenever drawings, selection, active tool, or drafting/snap changes
   useEffect(() => {
@@ -1794,7 +2068,7 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
     let finalDrawing = drawing;
     if (drawing.type === 'fixed_range_volume_profile' && drawing.anchors.length >= 2) {
       const tool = drawingRegistry.get('fixed_range_volume_profile') as FixedRangeVolumeProfileTool | undefined;
-      const profile = tool?.computeProfile?.(drawing.anchors, candlesRef.current, (drawing.options as FRVPOptions) || {});
+      const profile = tool?.getOrComputeProfile?.(drawing, candlesRef.current, (drawing.options as FRVPOptions) || {});
       if (profile) {
         const tStart = Math.min(drawing.anchors[0].time, drawing.anchors[1].time);
         const tEnd = Math.max(drawing.anchors[0].time, drawing.anchors[1].time);
@@ -2276,13 +2550,73 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
 
   // Native price scale labels using lightweight-charts createPriceLine
   // Pinned directly to the hardware-accelerated price scale canvas (144fps lockstep sync)
-  const priceLinesMapRef = useRef<Map<string, IPriceLine[]>>(new Map());
+  interface PriceLineDescriptor {
+    price: number;
+    color: string;
+    axisLabelColor: string;
+  }
+  interface PriceLineEntry {
+    lines: IPriceLine[];
+    descriptors: PriceLineDescriptor[];
+  }
+  const priceLinesMapRef = useRef<Map<string, PriceLineEntry>>(new Map());
 
   useEffect(() => {
     if (!series) return;
 
     const currentMap = priceLinesMapRef.current;
     const activeDrawingIds = new Set<string>();
+
+    const syncPriceLines = (drawingId: string, nextDescriptors: PriceLineDescriptor[]) => {
+      activeDrawingIds.add(drawingId);
+      const existing = currentMap.get(drawingId);
+
+      if (existing && existing.lines.length === nextDescriptors.length) {
+        for (let idx = 0; idx < nextDescriptors.length; idx++) {
+          const prev = existing.descriptors[idx];
+          const next = nextDescriptors[idx];
+          if (
+            !prev ||
+            prev.price !== next.price ||
+            prev.color !== next.color ||
+            prev.axisLabelColor !== next.axisLabelColor
+          ) {
+            existing.lines[idx].applyOptions({
+              price: next.price,
+              color: next.color,
+              axisLabelColor: next.axisLabelColor,
+              axisLabelTextColor: '#ffffff',
+              lineVisible: false,
+              axisLabelVisible: true,
+            });
+            existing.descriptors[idx] = next;
+          }
+        }
+        return;
+      }
+
+      if (existing) {
+        existing.lines.forEach((l) => {
+          try {
+            series.removePriceLine(l);
+          } catch {}
+        });
+      }
+
+      const newLines = nextDescriptors.map((desc) =>
+        series.createPriceLine({
+          price: desc.price,
+          color: desc.color,
+          lineWidth: 1,
+          lineStyle: LineStyle.Solid,
+          lineVisible: false,
+          axisLabelVisible: true,
+          axisLabelColor: desc.axisLabelColor,
+          axisLabelTextColor: '#ffffff',
+        })
+      );
+      currentMap.set(drawingId, { lines: newLines, descriptors: nextDescriptors });
+    };
 
     if (!drawingsHidden) {
       visibleDrawings.forEach((d) => {
@@ -2292,48 +2626,19 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
         if (d.type === 'anchored_vwap') {
           const vwapOpts = (d.options as AnchoredVWAPOptions) || {};
           if (vwapOpts.showPriceLabel !== false) {
-            activeDrawingIds.add(d.id);
             const tool = drawingRegistry.get('anchored_vwap') as AnchoredVWAPTool | undefined;
             let latestPrice = d.anchors[0].price;
             if (tool && candles && candles.length > 0) {
-              const data = tool.computeVWAPData(d.anchors[0], candles, vwapOpts);
+              const data = tool.getOrComputeVWAPData(d, d.anchors[0], candles, vwapOpts);
               if (data.length > 0) {
                 latestPrice = data[data.length - 1].vwap;
               }
             }
 
             const labelColor = d.color || vwapOpts.color || '#2962ff';
-            const lines = currentMap.get(d.id);
-
-            if (lines && lines.length === 1) {
-              lines[0].applyOptions({
-                price: latestPrice,
-                color: labelColor,
-                axisLabelColor: labelColor,
-                axisLabelTextColor: '#ffffff',
-                lineVisible: false,
-                axisLabelVisible: true,
-              });
-            } else {
-              if (lines) {
-                lines.forEach((l) => {
-                  try {
-                    series.removePriceLine(l);
-                  } catch {}
-                });
-              }
-              const newLine = series.createPriceLine({
-                price: latestPrice,
-                color: labelColor,
-                lineWidth: 1,
-                lineStyle: LineStyle.Solid,
-                lineVisible: false,
-                axisLabelVisible: true,
-                axisLabelColor: labelColor,
-                axisLabelTextColor: '#ffffff',
-              });
-              currentMap.set(d.id, [newLine]);
-            }
+            syncPriceLines(d.id, [
+              { price: latestPrice, color: labelColor, axisLabelColor: labelColor },
+            ]);
           }
           return;
         }
@@ -2344,42 +2649,13 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
           if (avpOpts.showPriceLabels !== false && avpOpts.showPOC !== false) {
             const tool = drawingRegistry.get('anchored_volume_profile') as AnchoredVolumeProfileTool | undefined;
             if (tool && candles && candles.length > 0) {
-              const profile = tool.computeProfile(d.anchors, candles, avpOpts);
+              const profile = tool.getOrComputeProfile(d, candles, avpOpts);
               if (profile) {
-                activeDrawingIds.add(d.id);
                 const pocPrice = profile.pocPrice;
                 const pocColor = avpOpts.pocColor || '#000000';
-                const lines = currentMap.get(d.id);
-
-                if (lines && lines.length === 1) {
-                  lines[0].applyOptions({
-                    price: pocPrice,
-                    color: pocColor,
-                    axisLabelColor: pocColor,
-                    axisLabelTextColor: '#ffffff',
-                    lineVisible: false,
-                    axisLabelVisible: true,
-                  });
-                } else {
-                  if (lines) {
-                    lines.forEach((l: any) => {
-                      try {
-                        series.removePriceLine(l);
-                      } catch {}
-                    });
-                  }
-                  const newLine = series.createPriceLine({
-                    price: pocPrice,
-                    color: pocColor,
-                    lineWidth: 1,
-                    lineStyle: LineStyle.Solid,
-                    lineVisible: false,
-                    axisLabelVisible: true,
-                    axisLabelColor: pocColor,
-                    axisLabelTextColor: '#ffffff',
-                  });
-                  currentMap.set(d.id, [newLine]);
-                }
+                syncPriceLines(d.id, [
+                  { price: pocPrice, color: pocColor, axisLabelColor: pocColor },
+                ]);
               }
             }
           }
@@ -2393,8 +2669,6 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
 
         const opts = (d.options as TrendlineOptions) || {};
         if (opts.showPriceLabels) {
-          activeDrawingIds.add(d.id);
-          const lines = currentMap.get(d.id);
           const getAnchorLabelColor = (idx: number) => {
             if (d.type === 'long_position' || d.type === 'short_position') {
               if (idx === 1) return '#089981';
@@ -2407,47 +2681,21 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
             return '#434651';
           };
 
-          if (lines && lines.length === d.anchors.length) {
-            d.anchors.forEach((a, idx) => {
-              lines[idx].applyOptions({
-                price: a.price,
-                color: d.color || '#2962ff',
-                axisLabelColor: getAnchorLabelColor(idx),
-                axisLabelTextColor: '#ffffff',
-                lineVisible: false,
-                axisLabelVisible: true,
-              });
-            });
-          } else {
-            if (lines) {
-              lines.forEach((l) => {
-                try {
-                  series.removePriceLine(l);
-                } catch {}
-              });
-            }
-            const newLines = d.anchors.map((a, idx) =>
-              series.createPriceLine({
-                price: a.price,
-                color: d.color || '#2962ff',
-                lineWidth: 1,
-                lineStyle: LineStyle.Solid,
-                lineVisible: false,
-                axisLabelVisible: true,
-                axisLabelColor: getAnchorLabelColor(idx),
-                axisLabelTextColor: '#ffffff',
-              })
-            );
-            currentMap.set(d.id, newLines);
-          }
+          const baseColor = d.color || '#2962ff';
+          const nextDescriptors = d.anchors.map((a, idx) => ({
+            price: a.price,
+            color: baseColor,
+            axisLabelColor: getAnchorLabelColor(idx),
+          }));
+          syncPriceLines(d.id, nextDescriptors);
         }
       });
     }
 
     // Clean up price lines for drawings that are deleted, hidden, or showPriceLabels toggled off
-    for (const [id, lines] of currentMap.entries()) {
+    for (const [id, entry] of currentMap.entries()) {
       if (!activeDrawingIds.has(id)) {
-        lines.forEach((l) => {
+        entry.lines.forEach((l) => {
           try {
             series.removePriceLine(l);
           } catch {}
@@ -2461,8 +2709,8 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
     const map = priceLinesMapRef.current;
     return () => {
       if (series && map) {
-        for (const lines of map.values()) {
-          lines.forEach((l) => {
+        for (const entry of map.values()) {
+          entry.lines.forEach((l) => {
             try {
               series.removePriceLine(l);
             } catch {}
@@ -2482,6 +2730,90 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
 
   // Selected drawing object for this pane
   const selectedDrawingObj = visibleDrawings.find((d) => d.id === selectedDrawingId);
+
+  const getToolbarCoords = useCallback(
+    (d: UserDrawing): { x: number; y: number } | undefined => {
+      const liveCandles = candlesRef.current;
+      const toCanvas = (anchor: LogicalAnchor) => anchorToCanvasHelper(anchor, chart, series, liveCandles);
+
+      if (d.anchors.length > 2) {
+        const pts = d.anchors
+          .map((a) => toCanvas(a))
+          .filter((p): p is { x: number; y: number } => p !== null && !isNaN(p.x) && !isNaN(p.y));
+        if (pts.length > 0) {
+          let minX = Infinity;
+          let maxX = -Infinity;
+          let minY = Infinity;
+          for (const pt of pts) {
+            if (pt.x < minX) minX = pt.x;
+            if (pt.x > maxX) maxX = pt.x;
+            if (pt.y < minY) minY = pt.y;
+          }
+          return {
+            x: (minX + maxX) / 2,
+            y: minY,
+          };
+        }
+      }
+      if (d.type === 'fixed_range_volume_profile') {
+        const p0 = toCanvas(d.anchors[0]);
+        const p1 = d.anchors[1] ? toCanvas(d.anchors[1]) : null;
+        if (p0 && p1) {
+          const tool = drawingRegistry.get('fixed_range_volume_profile') as FixedRangeVolumeProfileTool | undefined;
+          const profile = tool?.getOrComputeProfile?.(d, liveCandles, (d.options as FRVPOptions) || {});
+          let topY = Math.min(p0.y, p1.y);
+          if (profile && series) {
+            try {
+              const yMinBox = series.priceToCoordinate(profile.maxPrice);
+              const yMaxBox = series.priceToCoordinate(profile.minPrice);
+              if (yMinBox !== null && yMaxBox !== null) {
+                topY = Math.min(topY, yMinBox, yMaxBox);
+              }
+            } catch {}
+          }
+          return {
+            x: (p0.x + p1.x) / 2,
+            y: topY,
+          };
+        }
+      }
+      if (d.type === 'anchored_volume_profile') {
+        const p0 = toCanvas(d.anchors[0]);
+        if (p0) {
+          const tool = drawingRegistry.get('anchored_volume_profile') as AnchoredVolumeProfileTool | undefined;
+          const profile = tool?.getOrComputeProfile?.(d, liveCandles, (d.options as AVPOptions) || {});
+          let bottomY = p0.y;
+          if (profile && series) {
+            try {
+              const yMinBox = series.priceToCoordinate(profile.maxPrice);
+              const yMaxBox = series.priceToCoordinate(profile.minPrice);
+              if (yMinBox !== null && yMaxBox !== null) {
+                bottomY = Math.max(yMinBox, yMaxBox);
+              }
+            } catch {}
+          }
+          const lastCandle = liveCandles.length > 0 ? liveCandles[liveCandles.length - 1] : null;
+          const xLive = lastCandle
+            ? (toCanvas({ time: lastCandle.time, price: d.anchors[0].price })?.x ?? p0.x + 100)
+            : p0.x + 100;
+          return {
+            x: (p0.x + xLive) / 2,
+            y: bottomY + 30,
+          };
+        }
+      }
+      const p0 = toCanvas(d.anchors[0]);
+      const p1 = d.anchors[1] ? toCanvas(d.anchors[1]) : null;
+      if (p0 && p1) {
+        return {
+          x: (p0.x + p1.x) / 2,
+          y: Math.min(p0.y, p1.y),
+        };
+      }
+      return p0 ? { x: p0.x, y: p0.y } : undefined;
+    },
+    [chart, series]
+  );
 
   const priceScaleWidth = chart ? (chart.priceScale('right')?.width() || 65) : 65;
   const timeScaleHeight = chart ? (chart.timeScale()?.height() || 26) : 26;
@@ -2565,83 +2897,9 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = React.memo(({
       {isActive && selectedDrawingId && selectedDrawingObj && !selectedDrawingObj.hidden && !drawingsHidden && !isDragging && (
         <DrawingQuickToolbar
           drawing={selectedDrawingObj}
-          initialCoords={(() => {
-            if (selectedDrawingObj.anchors.length > 2) {
-              const pts = selectedDrawingObj.anchors
-                .map((a) => anchorToCanvas(a))
-                .filter((p): p is { x: number; y: number } => p !== null && !isNaN(p.x) && !isNaN(p.y));
-              if (pts.length > 0) {
-                let minX = Infinity;
-                let maxX = -Infinity;
-                let minY = Infinity;
-                for (const pt of pts) {
-                  if (pt.x < minX) minX = pt.x;
-                  if (pt.x > maxX) maxX = pt.x;
-                  if (pt.y < minY) minY = pt.y;
-                }
-                return {
-                  x: (minX + maxX) / 2,
-                  y: minY,
-                };
-              }
-            }
-            if (selectedDrawingObj.type === 'fixed_range_volume_profile') {
-              const p0 = anchorToCanvas(selectedDrawingObj.anchors[0]);
-              const p1 = selectedDrawingObj.anchors[1] ? anchorToCanvas(selectedDrawingObj.anchors[1]) : null;
-              if (p0 && p1) {
-                const tool = drawingRegistry.get('fixed_range_volume_profile') as FixedRangeVolumeProfileTool | undefined;
-                const profile = tool?.computeProfile?.(selectedDrawingObj.anchors, candles, (selectedDrawingObj.options as FRVPOptions) || {});
-                let topY = Math.min(p0.y, p1.y);
-                if (profile && series) {
-                  try {
-                    const yMinBox = series.priceToCoordinate(profile.maxPrice);
-                    const yMaxBox = series.priceToCoordinate(profile.minPrice);
-                    if (yMinBox !== null && yMaxBox !== null) {
-                      topY = Math.min(topY, yMinBox, yMaxBox);
-                    }
-                  } catch {}
-                }
-                return {
-                  x: (p0.x + p1.x) / 2,
-                  y: topY,
-                };
-              }
-            }
-            if (selectedDrawingObj.type === 'anchored_volume_profile') {
-              const p0 = anchorToCanvas(selectedDrawingObj.anchors[0]);
-              if (p0) {
-                const tool = drawingRegistry.get('anchored_volume_profile') as AnchoredVolumeProfileTool | undefined;
-                const profile = tool?.computeProfile?.(selectedDrawingObj.anchors, candles, (selectedDrawingObj.options as AVPOptions) || {});
-                let bottomY = p0.y;
-                if (profile && series) {
-                  try {
-                    const yMinBox = series.priceToCoordinate(profile.maxPrice);
-                    const yMaxBox = series.priceToCoordinate(profile.minPrice);
-                    if (yMinBox !== null && yMaxBox !== null) {
-                      bottomY = Math.max(yMinBox, yMaxBox);
-                    }
-                  } catch {}
-                }
-                const lastCandle = candles.length > 0 ? candles[candles.length - 1] : null;
-                const xLive = lastCandle
-                  ? (anchorToCanvas({ time: lastCandle.time, price: selectedDrawingObj.anchors[0].price })?.x ?? p0.x + 100)
-                  : p0.x + 100;
-                return {
-                  x: (p0.x + xLive) / 2,
-                  y: bottomY + 30,
-                };
-              }
-            }
-            const p0 = anchorToCanvas(selectedDrawingObj.anchors[0]);
-            const p1 = selectedDrawingObj.anchors[1] ? anchorToCanvas(selectedDrawingObj.anchors[1]) : null;
-            if (p0 && p1) {
-              return {
-                x: (p0.x + p1.x) / 2,
-                y: Math.min(p0.y, p1.y),
-              };
-            }
-            return p0 ? { x: p0.x, y: p0.y } : undefined;
-          })()}
+          chart={chart}
+          initialCoords={getToolbarCoords(selectedDrawingObj)}
+          getDrawingCoords={() => getToolbarCoords(selectedDrawingObj)}
           containerBounds={plotSize}
           onUpdate={(updates) => {
             if (selectedDrawingId) {

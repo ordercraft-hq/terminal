@@ -1,6 +1,58 @@
-import type { IChartApi, ISeriesApi, Time } from 'lightweight-charts';
+import { PriceScaleMode, type IChartApi, type ISeriesApi, type Logical, type SeriesType, type Time } from 'lightweight-charts';
 import type { Candle } from '../../transport/client';
 import type { LogicalAnchor, MagnetMode } from '../../store/syncStore';
+
+interface ChartWithPaneSize {
+  paneSize?: (paneIndex: number) => { width: number; height: number };
+}
+
+function isLogarithmicScale(series: ISeriesApi<SeriesType>): boolean {
+  try {
+    return series.priceScale().options().mode === PriceScaleMode.Logarithmic;
+  } catch {
+    return false;
+  }
+}
+
+function extrapolateYForPrice(series: ISeriesApi<SeriesType>, price: number): number | null {
+  const yA = 20;
+  const yB = 200;
+  const pA = series.coordinateToPrice(yA) as number | null;
+  const pB = series.coordinateToPrice(yB) as number | null;
+  if (pA !== null && pB !== null && !isNaN(pA) && !isNaN(pB) && pA !== pB) {
+    if (isLogarithmicScale(series) && pA > 0 && pB > 0 && price > 0) {
+      const logA = Math.log(pA);
+      const logB = Math.log(pB);
+      const logSlope = (logB - logA) / (yB - yA);
+      if (logSlope !== 0) {
+        return yA + (Math.log(price) - logA) / logSlope;
+      }
+    }
+    const slope = (pB - pA) / (yB - yA);
+    if (slope !== 0) {
+      return yA + (price - pA) / slope;
+    }
+  }
+  return null;
+}
+
+function extrapolatePriceForY(series: ISeriesApi<SeriesType>, y: number): number | null {
+  const yA = 20;
+  const yB = 200;
+  const pA = series.coordinateToPrice(yA) as number | null;
+  const pB = series.coordinateToPrice(yB) as number | null;
+  if (pA !== null && pB !== null && !isNaN(pA) && !isNaN(pB) && pA !== pB) {
+    if (isLogarithmicScale(series) && pA > 0 && pB > 0) {
+      const logA = Math.log(pA);
+      const logB = Math.log(pB);
+      const logSlope = (logB - logA) / (yB - yA);
+      return Math.exp(logA + logSlope * (y - yA));
+    }
+    const slope = (pB - pA) / (yB - yA);
+    return pA + slope * (y - yA);
+  }
+  return null;
+}
 
 /**
  * Calculates exact plot surface dimensions, excluding right price scale and bottom time scale.
@@ -15,7 +67,7 @@ export function getPlotDimensions(
 
   if (chart) {
     try {
-      const size = (chart as any).paneSize?.(0);
+      const size = (chart as unknown as ChartWithPaneSize).paneSize?.(0);
       if (size && size.width > 0 && size.height > 0) {
         w = size.width;
         h = size.height;
@@ -78,7 +130,7 @@ export function snapToCandleOHLC(
   isCtrlHeld: boolean,
   magnetMode: MagnetMode,
   chart: IChartApi | null,
-  series: ISeriesApi<'Candlestick'> | null,
+  series: ISeriesApi<SeriesType> | null,
   candles: Candle[]
 ): { anchor: LogicalAnchor; snapCoord: { x: number; y: number } | null } {
   const isSnappingActive = isCtrlHeld || magnetMode === 'weak' || magnetMode === 'strong';
@@ -133,22 +185,16 @@ export function snapToCandleOHLC(
 export function anchorToCanvas(
   anchor: LogicalAnchor,
   chart: IChartApi | null,
-  series: ISeriesApi<'Candlestick'> | null,
+  series: ISeriesApi<SeriesType> | null,
   candles: Candle[]
 ): { x: number; y: number } | null {
   if (!chart || !series) return null;
 
-  // 1. Convert price to coordinate (with continuous off-screen linear extrapolation)
+  // 1. Convert price to coordinate (with continuous off-screen linear/logarithmic extrapolation)
   let y: number | null = series.priceToCoordinate(anchor.price) as number | null;
   if (y === null || isNaN(y)) {
-    const yA = 20;
-    const yB = 200;
-    const pA = series.coordinateToPrice(yA as any) as number | null;
-    const pB = series.coordinateToPrice(yB as any) as number | null;
-    if (pA !== null && pB !== null && pA !== pB) {
-      const slope = (pB - pA) / (yB - yA);
-      y = yA + (anchor.price - pA) / slope;
-    } else {
+    y = extrapolateYForPrice(series, anchor.price);
+    if (y === null || isNaN(y)) {
       return null;
     }
   }
@@ -169,10 +215,10 @@ export function anchorToCanvas(
     if (anchor.time >= last.time) {
       const lastIdx = candles.length - 1;
       const xLast =
-        (chart.timeScale().logicalToCoordinate(lastIdx as any) as number | null) ??
+        (chart.timeScale().logicalToCoordinate(lastIdx as Logical) as number | null) ??
         (chart.timeScale().timeToCoordinate(last.time as Time) as number | null);
       const xPrev =
-        (chart.timeScale().logicalToCoordinate((lastIdx - 1) as any) as number | null) ??
+        (chart.timeScale().logicalToCoordinate((lastIdx - 1) as Logical) as number | null) ??
         (candles.length >= 2
           ? (chart.timeScale().timeToCoordinate(candles[candles.length - 2].time as Time) as number | null)
           : null);
@@ -188,10 +234,10 @@ export function anchorToCanvas(
     // Case B: Past extrapolation
     if (anchor.time <= first.time) {
       const xFirst =
-        (chart.timeScale().logicalToCoordinate(0 as any) as number | null) ??
+        (chart.timeScale().logicalToCoordinate(0 as Logical) as number | null) ??
         (chart.timeScale().timeToCoordinate(first.time as Time) as number | null);
       const xSecond =
-        (chart.timeScale().logicalToCoordinate(1 as any) as number | null) ??
+        (chart.timeScale().logicalToCoordinate(1 as Logical) as number | null) ??
         (candles.length >= 2
           ? (chart.timeScale().timeToCoordinate(candles[1].time as Time) as number | null)
           : null);
@@ -245,21 +291,17 @@ export function canvasToAnchor(
   x: number,
   y: number,
   chart: IChartApi | null,
-  series: ISeriesApi<'Candlestick'> | null,
+  series: ISeriesApi<SeriesType> | null,
   candles: Candle[]
 ): LogicalAnchor | null {
   if (!chart || !series) return null;
 
-  // 1. Convert y coordinate to price
-  let price: number | null = series.coordinateToPrice(y as any) as number | null;
+  // 1. Convert y coordinate to price (with continuous off-screen linear/logarithmic extrapolation)
+  let price: number | null = series.coordinateToPrice(y) as number | null;
   if (price === null || isNaN(price)) {
-    const yA = 20;
-    const yB = 200;
-    const pA = series.coordinateToPrice(yA as any) as number | null;
-    const pB = series.coordinateToPrice(yB as any) as number | null;
-    if (pA !== null && pB !== null && pA !== pB) {
-      const slope = (pB - pA) / (yB - yA);
-      price = pA + slope * (y - yA);
+    const extrapolated = extrapolatePriceForY(series, y);
+    if (extrapolated !== null && !isNaN(extrapolated)) {
+      price = extrapolated;
     } else if (candles.length > 0) {
       price = candles[candles.length - 1].close;
     } else {
@@ -276,8 +318,8 @@ export function canvasToAnchor(
         const barDt = N >= 2 ? Math.max(1, candles[N - 1].time - candles[N - 2].time) : 60;
         const intLog = Math.floor(logical as number);
 
-        const x0 = chart.timeScale().logicalToCoordinate(intLog as any) as number | null;
-        const x1 = chart.timeScale().logicalToCoordinate((intLog + 1) as any) as number | null;
+        const x0 = chart.timeScale().logicalToCoordinate(intLog as Logical) as number | null;
+        const x1 = chart.timeScale().logicalToCoordinate((intLog + 1) as Logical) as number | null;
         let frac = 0;
         if (x0 !== null && x1 !== null && x1 !== x0) {
           frac = (x - x0) / (x1 - x0);

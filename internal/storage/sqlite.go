@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ordercraft-hq/terminal/internal/security"
@@ -58,22 +59,34 @@ type UserIndicator struct {
 	UpdatedAt   int64    `json:"updatedAt"`
 }
 
+type ImbalanceRule struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Settings  string `json:"settings"`
+	CreatedAt int64  `json:"created_at"`
+}
+
 type Storage struct {
-	db     *sql.DB
-	cipher *security.Cipher
+	db      *sql.DB
+	writeMu sync.Mutex
+	cipher  *security.Cipher
 }
 
 // NewStorage opens an embedded SQLite database using pure-Go modernc.org/sqlite.
 func NewStorage(dbPath string) (*Storage, error) {
-	if dir := filepath.Dir(dbPath); dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			return nil, fmt.Errorf("failed to create db directory: %w", err)
+	isMemory := dbPath == ":memory:" || strings.Contains(dbPath, "mode=memory")
+	if !isMemory {
+		if dir := filepath.Dir(dbPath); dir != "." && dir != "" {
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				return nil, fmt.Errorf("failed to create db directory: %w", err)
+			}
+			_ = security.EnforcePrivateDirPermissions(dir)
 		}
 	}
 
 	// Resolve master encryption key and initialize credential cipher
 	keyPath := ""
-	if dbPath != ":memory:" && !strings.Contains(dbPath, "mode=memory") {
+	if !isMemory {
 		keyPath = filepath.Join(filepath.Dir(dbPath), ".ordercraft.key")
 	}
 	masterKey, err := security.ResolveMasterKey(keyPath)
@@ -85,15 +98,25 @@ func NewStorage(dbPath string) (*Storage, error) {
 		return nil, fmt.Errorf("failed to initialize credential cipher: %w", err)
 	}
 
+	// Pre-create and restrict dbPath permissions before SQLite WAL initialization and schema migration.
+	if !isMemory {
+		if f, openErr := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR, 0600); openErr == nil {
+			_ = f.Close()
+		}
+		_ = security.EnforcePrivateFilePermissions(dbPath)
+	}
+
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}
 
-	// Tune SQLite connection pool for concurrent readers in WAL mode
-	db.SetMaxOpenConns(16)
-	db.SetMaxIdleConns(8)
-	db.SetConnMaxLifetime(30 * time.Minute)
+	// Single persistent connection in WAL mode: guarantees connection-scoped PRAGMAs
+	// (busy_timeout, foreign_keys, synchronous, cache_size) remain active and eliminates
+	// SQLITE_BUSY write contention under modernc.org/sqlite.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
 
 	// Recommended SQLite PRAGMAs for high-performance WAL mode & memory-mapped caching
 	pragmas := []string{
@@ -120,9 +143,13 @@ func NewStorage(dbPath string) (*Storage, error) {
 	// Migrate any existing unencrypted legacy API keys to AES-256-GCM
 	_ = s.migrateLegacyKeys(context.Background())
 
-	// Enforce 0600 file permissions on database file so only file owner can read/write API credentials
-	if info, err := os.Stat(dbPath); err == nil && !info.IsDir() {
-		_ = os.Chmod(dbPath, 0600)
+	// Enforce owner-only file permissions on database and WAL/SHM sidecar files
+	if !isMemory {
+		for _, targetPath := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+			if info, statErr := os.Stat(targetPath); statErr == nil && !info.IsDir() {
+				_ = security.EnforcePrivateFilePermissions(targetPath)
+			}
+		}
 	}
 
 	return s, nil
@@ -130,6 +157,12 @@ func NewStorage(dbPath string) (*Storage, error) {
 
 func (s *Storage) Close() error {
 	return s.db.Close()
+}
+
+func (s *Storage) execWrite(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.db.ExecContext(ctx, query, args...)
 }
 
 func (s *Storage) initSchema() error {
@@ -193,6 +226,14 @@ func (s *Storage) initSchema() error {
 		updated_at INTEGER NOT NULL
 	);
 	CREATE INDEX IF NOT EXISTS idx_user_indicators_updated ON user_indicators (updated_at DESC);
+
+	CREATE TABLE IF NOT EXISTS orderflow_imbalances (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		settings TEXT NOT NULL,
+		created_at INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_orderflow_imbalances_created ON orderflow_imbalances (created_at ASC);
 	`
 	_, err := s.db.Exec(query)
 	if err != nil {
@@ -259,7 +300,7 @@ func (s *Storage) SaveLayout(ctx context.Context, l *Layout) error {
 		timestamp = excluded.timestamp,
 		is_favorite = excluded.is_favorite;
 	`
-	_, err := s.db.ExecContext(ctx, query, l.ID, l.Name, l.Symbol, l.Resolution, l.Content, l.Timestamp, favInt)
+	_, err := s.execWrite(ctx, query, l.ID, l.Name, l.Symbol, l.Resolution, l.Content, l.Timestamp, favInt)
 	return err
 }
 
@@ -269,24 +310,24 @@ func (s *Storage) UpdateLayoutMeta(ctx context.Context, id string, name *string,
 		if *isFavorite {
 			favInt = 1
 		}
-		_, err := s.db.ExecContext(ctx, "UPDATE layouts SET name = ?, is_favorite = ?, timestamp = ? WHERE id = ?", *name, favInt, time.Now().Unix(), id)
+		_, err := s.execWrite(ctx, "UPDATE layouts SET name = ?, is_favorite = ?, timestamp = ? WHERE id = ?", *name, favInt, time.Now().Unix(), id)
 		return err
 	} else if name != nil {
-		_, err := s.db.ExecContext(ctx, "UPDATE layouts SET name = ?, timestamp = ? WHERE id = ?", *name, time.Now().Unix(), id)
+		_, err := s.execWrite(ctx, "UPDATE layouts SET name = ?, timestamp = ? WHERE id = ?", *name, time.Now().Unix(), id)
 		return err
 	} else if isFavorite != nil {
 		favInt := 0
 		if *isFavorite {
 			favInt = 1
 		}
-		_, err := s.db.ExecContext(ctx, "UPDATE layouts SET is_favorite = ? WHERE id = ?", favInt, id)
+		_, err := s.execWrite(ctx, "UPDATE layouts SET is_favorite = ? WHERE id = ?", favInt, id)
 		return err
 	}
 	return nil
 }
 
 func (s *Storage) DeleteLayout(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM layouts WHERE id = ?", id)
+	_, err := s.execWrite(ctx, "DELETE FROM layouts WHERE id = ?", id)
 	return err
 }
 
@@ -322,29 +363,29 @@ func (s *Storage) SaveDrawing(ctx context.Context, d *Drawing) error {
 		data = excluded.data,
 		timestamp = excluded.timestamp;
 	`
-	_, err := s.db.ExecContext(ctx, query, d.ID, d.LayoutID, d.ToolType, d.Symbol, d.Data, d.Timestamp)
+	_, err := s.execWrite(ctx, query, d.ID, d.LayoutID, d.ToolType, d.Symbol, d.Data, d.Timestamp)
 	return err
 }
 
 func (s *Storage) DeleteDrawing(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM drawings WHERE id = ?", id)
+	_, err := s.execWrite(ctx, "DELETE FROM drawings WHERE id = ?", id)
 	return err
 }
 
 func (s *Storage) ClearDrawings(ctx context.Context, layoutID, symbol string) error {
 	if layoutID == "" && symbol == "" {
-		_, err := s.db.ExecContext(ctx, "DELETE FROM drawings")
+		_, err := s.execWrite(ctx, "DELETE FROM drawings")
 		return err
 	}
 	if layoutID != "" && symbol != "" {
-		_, err := s.db.ExecContext(ctx, "DELETE FROM drawings WHERE layout_id = ? AND symbol = ?", layoutID, symbol)
+		_, err := s.execWrite(ctx, "DELETE FROM drawings WHERE layout_id = ? AND symbol = ?", layoutID, symbol)
 		return err
 	}
 	if layoutID != "" {
-		_, err := s.db.ExecContext(ctx, "DELETE FROM drawings WHERE layout_id = ?", layoutID)
+		_, err := s.execWrite(ctx, "DELETE FROM drawings WHERE layout_id = ?", layoutID)
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, "DELETE FROM drawings WHERE symbol = ?", symbol)
+	_, err := s.execWrite(ctx, "DELETE FROM drawings WHERE symbol = ?", symbol)
 	return err
 }
 
@@ -387,12 +428,12 @@ func (s *Storage) SaveDrawingTemplate(ctx context.Context, t *DrawingTemplate) e
 		settings = excluded.settings,
 		created_at = excluded.created_at;
 	`
-	_, err := s.db.ExecContext(ctx, query, t.ID, t.Name, t.ToolType, t.Settings, t.CreatedAt)
+	_, err := s.execWrite(ctx, query, t.ID, t.Name, t.ToolType, t.Settings, t.CreatedAt)
 	return err
 }
 
 func (s *Storage) DeleteDrawingTemplate(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM drawing_templates WHERE id = ?", id)
+	_, err := s.execWrite(ctx, "DELETE FROM drawing_templates WHERE id = ?", id)
 	return err
 }
 
@@ -428,12 +469,53 @@ func (s *Storage) SaveChartTemplate(ctx context.Context, t *ChartTemplate) error
 		settings = excluded.settings,
 		created_at = excluded.created_at;
 	`
-	_, err := s.db.ExecContext(ctx, query, t.ID, t.Name, t.Settings, t.CreatedAt)
+	_, err := s.execWrite(ctx, query, t.ID, t.Name, t.Settings, t.CreatedAt)
 	return err
 }
 
 func (s *Storage) DeleteChartTemplate(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM chart_templates WHERE id = ?", id)
+	_, err := s.execWrite(ctx, "DELETE FROM chart_templates WHERE id = ?", id)
+	return err
+}
+
+// Imbalance Rule operations
+
+func (s *Storage) GetImbalanceRules(ctx context.Context) ([]ImbalanceRule, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT id, name, settings, created_at FROM orderflow_imbalances ORDER BY created_at ASC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []ImbalanceRule
+	for rows.Next() {
+		var r ImbalanceRule
+		if err := rows.Scan(&r.ID, &r.Name, &r.Settings, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, rows.Err()
+}
+
+func (s *Storage) SaveImbalanceRule(ctx context.Context, r *ImbalanceRule) error {
+	if r.CreatedAt == 0 {
+		r.CreatedAt = time.Now().Unix()
+	}
+	query := `
+	INSERT INTO orderflow_imbalances (id, name, settings, created_at)
+	VALUES (?, ?, ?, ?)
+	ON CONFLICT(id) DO UPDATE SET
+		name = excluded.name,
+		settings = excluded.settings,
+		created_at = excluded.created_at;
+	`
+	_, err := s.execWrite(ctx, query, r.ID, r.Name, r.Settings, r.CreatedAt)
+	return err
+}
+
+func (s *Storage) DeleteImbalanceRule(ctx context.Context, id string) error {
+	_, err := s.execWrite(ctx, "DELETE FROM orderflow_imbalances WHERE id = ?", id)
 	return err
 }
 
@@ -456,7 +538,7 @@ func (s *Storage) SaveAPIKey(ctx context.Context, provider, keyData string) erro
 		key_data = excluded.key_data,
 		updated_at = excluded.updated_at;
 	`
-	_, err := s.db.ExecContext(ctx, query, provider, storedData, time.Now().Unix())
+	_, err := s.execWrite(ctx, query, provider, storedData, time.Now().Unix())
 	return err
 }
 
@@ -482,7 +564,7 @@ func (s *Storage) GetAPIKey(ctx context.Context, provider string) (string, error
 }
 
 func (s *Storage) DeleteAPIKey(ctx context.Context, provider string) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM api_keys WHERE provider = ?", provider)
+	_, err := s.execWrite(ctx, "DELETE FROM api_keys WHERE provider = ?", provider)
 	return err
 }
 
@@ -520,7 +602,7 @@ func (s *Storage) migrateLegacyKeys(ctx context.Context) error {
 // UserIndicator operations
 
 func (s *Storage) GetUserIndicators(ctx context.Context) ([]UserIndicator, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT id, name, description, code, permissions, created_at, updated_at FROM user_indicators ORDER BY updated_at DESC")
+	rows, err := s.db.QueryContext(ctx, "SELECT id, name, description, code, permissions, created_at, updated_at FROM user_indicators ORDER BY updated_at DESC LIMIT 500")
 	if err != nil {
 		return nil, err
 	}
@@ -592,12 +674,12 @@ func (s *Storage) SaveUserIndicator(ctx context.Context, ind *UserIndicator) err
 		permissions = excluded.permissions,
 		updated_at = excluded.updated_at
 	`
-	_, err = s.db.ExecContext(ctx, query, ind.ID, ind.Name, ind.Description, ind.Code, string(permsBytes), ind.CreatedAt, ind.UpdatedAt)
+	_, err = s.execWrite(ctx, query, ind.ID, ind.Name, ind.Description, ind.Code, string(permsBytes), ind.CreatedAt, ind.UpdatedAt)
 	return err
 }
 
 func (s *Storage) DeleteUserIndicator(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM user_indicators WHERE id = ?", id)
+	_, err := s.execWrite(ctx, "DELETE FROM user_indicators WHERE id = ?", id)
 	return err
 }
 

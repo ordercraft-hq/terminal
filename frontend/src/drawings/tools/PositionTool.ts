@@ -243,8 +243,7 @@ export abstract class BasePositionTool extends BaseDrawingTool<PositionOptions> 
       const pillH = lines.length * lineHeight + padY * 2 - 2;
 
       c.fillStyle = bgColor;
-      c.beginPath();
-      c.roundRect(x - pillW / 2, y - pillH / 2, pillW, pillH, 4);
+      BaseDrawingTool.drawRoundedRect(c, x - pillW / 2, y - pillH / 2, pillW, pillH, 4);
       c.fill();
 
       c.strokeStyle = borderColor;

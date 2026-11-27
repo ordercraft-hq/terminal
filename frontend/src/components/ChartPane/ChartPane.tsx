@@ -29,10 +29,24 @@ import { transport } from '../../transport/client';
 import type { Candle } from '../../transport/client';
 import { DrawingCanvas } from './DrawingCanvas';
 import { PriceCountdownPrimitive } from './PriceCountdownPrimitive';
+import {
+  FootprintPrimitive,
+  adaptBackendFootprintBar,
+  synthesizeFormingFootprintBar,
+  type FootprintBar,
+} from '../../indicators/primitives/FootprintPrimitive';
 import { UniversalIndicatorConnector, isVolumeIndicatorType } from '../../indicators/UniversalIndicatorConnector';
-import { IndicatorLegend, IndicatorLegendItem } from './IndicatorLegend';
+import {
+  ChartHudController,
+  ChartOhlcReadout,
+  ChartOverlayLegend,
+  ChartSubpaneLegendItem,
+  ChartCollapsedIndicatorValues,
+} from './ChartHudController';
+import { mergeLiveCandleTick } from './liveCandleMerge';
 import type { IndicatorInstance } from '../../indicators/types';
 import { isLightColor } from '../../utils/colorUtils';
+import { getServerTimeSec, getServerTimeMs, recordServerTimestamp } from '../../utils/serverTime';
 import {
   transformHeikinAshi,
   transformHollowCandles,
@@ -40,6 +54,7 @@ import {
   transformHighLow,
   transformRenko,
 } from '../../utils/barTypeTransformers';
+import { isChartTypeSupported } from '../../utils/chartTypeSupport';
 import { Globe, Clock, ChevronUp, ArrowUp, ArrowDown, Trash2, Minus, Maximize2, Minimize2, ChevronsRight, Code } from 'lucide-react';
 import { ChartContextMenu } from '../ContextMenu/ChartContextMenu';
 
@@ -58,162 +73,84 @@ import {
   snapSyncedPrice,
   formatSyncedCrosshairPrice,
 } from '../../utils/priceFormatting';
+import {
+  ALL_TIMEZONES,
+  getTimezoneOffsetSeconds,
+  formatTickMarkInTimezone,
+  formatCrosshairTimeInTimezone,
+  type TimezoneItem,
+} from '../../utils/timezones';
 
-export interface TimezoneItem {
-  label: string;
-  value: string;
-  offsetSec: number;
+export { ALL_TIMEZONES, getTimezoneOffsetSeconds, type TimezoneItem };
+
+function findCandleByTime(candles: readonly Candle[], targetTime: number): Candle | undefined {
+  let lo = 0;
+  let hi = candles.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const t = candles[mid].time;
+    if (t === targetTime) return candles[mid];
+    if (t < targetTime) {
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return undefined;
 }
 
-export const ALL_TIMEZONES: TimezoneItem[] = [
-  { label: 'UTC-12:00 (Baker Island, Howland Island)', value: 'UTC-12', offsetSec: -12 * 3600 },
-  { label: 'UTC-11:00 (Pago Pago, Samoa, Midway)', value: 'UTC-11', offsetSec: -11 * 3600 },
-  { label: 'UTC-10:00 (Honolulu, Hawaii / HST)', value: 'UTC-10', offsetSec: -10 * 3600 },
-  { label: 'UTC-9:30 (Marquesas Islands)', value: 'UTC-9:30', offsetSec: -9.5 * 3600 },
-  { label: 'UTC-9:00 (Anchorage, Alaska / AKST)', value: 'UTC-9', offsetSec: -9 * 3600 },
-  { label: 'UTC-8:00 (Los Angeles, San Francisco, Vancouver / PST)', value: 'UTC-8', offsetSec: -8 * 3600 },
-  { label: 'UTC-7:00 (Denver, Phoenix, Calgary / MST)', value: 'UTC-7', offsetSec: -7 * 3600 },
-  { label: 'UTC-6:00 (Chicago, Mexico City, Dallas, Houston / CST)', value: 'UTC-6', offsetSec: -6 * 3600 },
-  { label: 'UTC-5:00 (New York, Toronto, Miami, Bogota / EST)', value: 'UTC-5', offsetSec: -5 * 3600 },
-  { label: 'UTC-4:00 (New York, Toronto, Miami / EDT, Santiago, Caracas, Bermuda / AST)', value: 'UTC-4', offsetSec: -4 * 3600 },
-  { label: 'UTC-3:30 (St. John\'s, Newfoundland / NST)', value: 'UTC-3:30', offsetSec: -3.5 * 3600 },
-  { label: 'UTC-3:00 (São Paulo, Buenos Aires, Montevideo)', value: 'UTC-3', offsetSec: -3 * 3600 },
-  { label: 'UTC-2:00 (Fernando de Noronha, South Georgia)', value: 'UTC-2', offsetSec: -2 * 3600 },
-  { label: 'UTC-1:00 (Cape Verde, Azores)', value: 'UTC-1', offsetSec: -1 * 3600 },
-  { label: 'UTC+0:00 (London, Dublin, Lisbon, Reykjavik / GMT)', value: 'UTC', offsetSec: 0 },
-  { label: 'UTC+1:00 (Berlin, Paris, Madrid, Rome, Zurich, Frankfurt, Amsterdam, Lagos / CET)', value: 'UTC+1', offsetSec: 1 * 3600 },
-  { label: 'UTC+2:00 (Athens, Cairo, Johannesburg, Helsinki, Jerusalem, Kyiv / EET)', value: 'UTC+2', offsetSec: 2 * 3600 },
-  { label: 'UTC+3:00 (Moscow, Istanbul, Riyadh, Doha, Nairobi, Kuwait / MSK)', value: 'UTC+3', offsetSec: 3 * 3600 },
-  { label: 'UTC+3:30 (Tehran / IRST)', value: 'UTC+3:30', offsetSec: 3.5 * 3600 },
-  { label: 'UTC+4:00 (Dubai, Abu Dhabi, Baku, Muscat, Tbilisi / GST)', value: 'UTC+4', offsetSec: 4 * 3600 },
-  { label: 'UTC+4:30 (Kabul / AFT)', value: 'UTC+4:30', offsetSec: 4.5 * 3600 },
-  { label: 'UTC+5:00 (Karachi, Tashkent, Islamabad / PKT)', value: 'UTC+5', offsetSec: 5 * 3600 },
-  { label: 'UTC+5:30 (Kolkata, Mumbai, New Delhi, Colombo / IST)', value: 'UTC+5:30', offsetSec: 5.5 * 3600 },
-  { label: 'UTC+5:45 (Kathmandu / NPT)', value: 'UTC+5:45', offsetSec: 5.75 * 3600 },
-  { label: 'UTC+6:00 (Dhaka, Almaty, Astana / BST)', value: 'UTC+6', offsetSec: 6 * 3600 },
-  { label: 'UTC+6:30 (Yangon, Cocos Islands / MMT)', value: 'UTC+6:30', offsetSec: 6.5 * 3600 },
-  { label: 'UTC+7:00 (Bangkok, Jakarta, Ho Chi Minh, Hanoi / ICT)', value: 'UTC+7', offsetSec: 7 * 3600 },
-  { label: 'UTC+8:00 (Singapore, Hong Kong, Shanghai, Beijing, Taipei, Perth / SGT, HKT)', value: 'UTC+8', offsetSec: 8 * 3600 },
-  { label: 'UTC+8:45 (Eucla / ACWST)', value: 'UTC+8:45', offsetSec: 8.75 * 3600 },
-  { label: 'UTC+9:00 (Tokyo, Seoul, Osaka / JST, KST)', value: 'UTC+9', offsetSec: 9 * 3600 },
-  { label: 'UTC+9:30 (Adelaide, Darwin / ACST)', value: 'UTC+9:30', offsetSec: 9.5 * 3600 },
-  { label: 'UTC+10:00 (Sydney, Melbourne, Brisbane, Vladivostok, Guam / AEST)', value: 'UTC+10', offsetSec: 10 * 3600 },
-  { label: 'UTC+10:30 (Lord Howe Island / LHST)', value: 'UTC+10:30', offsetSec: 10.5 * 3600 },
-  { label: 'UTC+11:00 (Solomon Islands, New Caledonia, Magadan)', value: 'UTC+11', offsetSec: 11 * 3600 },
-  { label: 'UTC+11:30 (Norfolk Island / NFT)', value: 'UTC+11:30', offsetSec: 11.5 * 3600 },
-  { label: 'UTC+12:00 (Auckland, Wellington, Fiji, Marshall Islands / NZST)', value: 'UTC+12', offsetSec: 12 * 3600 },
-  { label: 'UTC+12:45 (Chatham Islands / CHAST)', value: 'UTC+12:45', offsetSec: 12.75 * 3600 },
-  { label: 'UTC+13:00 (Nuku\'alofa, Samoa, Phoenix Islands / TOT)', value: 'UTC+13', offsetSec: 13 * 3600 },
-  { label: 'UTC+14:00 (Kiritimati, Line Islands / LINT)', value: 'UTC+14', offsetSec: 14 * 3600 },
-];
-
-export function getTimezoneOffsetSeconds(tz: string): number {
-  if (!tz || tz === 'UTC' || tz === 'UTC+0' || tz === 'UTC+0:00' || tz === 'GMT') return 0;
-  
-  // Fast exact match from comprehensive array
-  const found = ALL_TIMEZONES.find((item) => item.value === tz);
-  if (found) return found.offsetSec;
-
-  // Regex parse: UTC+5:30, UTC-8, UTC+05:00
-  const match = tz.match(/UTC([+-])(\d+)(?::(\d+))?/i);
-  if (match) {
-    const sign = match[1] === '-' ? -1 : 1;
-    const hours = parseInt(match[2], 10);
-    const minutes = match[3] ? parseInt(match[3], 10) : 0;
-    return sign * (hours * 3600 + minutes * 60);
+function getEffectiveBarStep(candles: readonly Candle[], tf: string): number {
+  const dur = getTimeframeDurationSeconds(tf);
+  if (dur > 0) return dur;
+  if (candles.length >= 2) {
+    return Math.max(1, candles[candles.length - 1].time - candles[candles.length - 2].time);
   }
-
-  // Fallback for decimal UTC+5.5
-  const decMatch = tz.match(/UTC([+-]\d+(?:\.\d+)?)/i);
-  if (decMatch) {
-    return Math.round(parseFloat(decMatch[1]) * 3600);
-  }
-
-  return 0;
+  return 60;
 }
 
-// Format the tick marks directly on the X-axis in the chosen timezone
-function formatTickMarkInTimezone(
-  time: Time,
-  tickMarkType: number,
-  timezone: string,
-  showSeconds = false
-): string | null {
-  let ts: number;
-  if (typeof time === 'number') {
-    ts = time;
-  } else if (typeof time === 'object' && time !== null && 'year' in time) {
-    ts = Math.floor(Date.UTC((time as any).year, (time as any).month - 1, (time as any).day) / 1000);
-  } else {
-    return null;
+function logicalIndexToTimestamp(candles: readonly Candle[], tf: string, logicalIdx: number): number | null {
+  if (candles.length === 0) return null;
+  const step = getEffectiveBarStep(candles, tf);
+  const i0 = Math.floor(logicalIdx);
+  if (i0 < 0) {
+    return candles[0].time + logicalIdx * step;
   }
-
-  const offset = getTimezoneOffsetSeconds(timezone);
-  const adjusted = ts + offset;
-  const d = new Date(adjusted * 1000);
-
-  const hours = String(d.getUTCHours()).padStart(2, '0');
-  const minutes = String(d.getUTCMinutes()).padStart(2, '0');
-  const seconds = String(d.getUTCSeconds()).padStart(2, '0');
-  const day = d.getUTCDate();
-  const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  const month = monthNames[d.getUTCMonth()];
-  const year = d.getUTCFullYear();
-
-  switch (tickMarkType) {
-    case 0: // Year
-      return String(year);
-    case 1: // Month
-      return month;
-    case 2: // DayOfMonth
-      return `${day} ${month}`;
-    case 3: // Time
-      if (showSeconds && d.getUTCSeconds() !== 0) {
-        return `${hours}:${minutes}:${seconds}`;
-      }
-      return `${hours}:${minutes}`;
-    case 4: // TimeWithSeconds
-      return `${hours}:${minutes}:${seconds}`;
-    default:
-      if (showSeconds) {
-        return `${hours}:${minutes}:${seconds}`;
-      }
-      return `${hours}:${minutes}`;
+  if (i0 >= candles.length - 1) {
+    return candles[candles.length - 1].time + (logicalIdx - (candles.length - 1)) * step;
   }
+  const frac = logicalIdx - i0;
+  return candles[i0].time + frac * (candles[i0 + 1].time - candles[i0].time);
 }
 
-// Format the crosshair date/time pill in the chosen timezone
-function formatCrosshairTimeInTimezone(
-  time: Time,
-  timezone: string,
-  showSeconds = false
-): string {
-  let ts: number;
-  if (typeof time === 'number') {
-    ts = time;
-  } else if (typeof time === 'object' && time !== null && 'year' in time) {
-    ts = Math.floor(Date.UTC((time as any).year, (time as any).month - 1, (time as any).day) / 1000);
-  } else {
-    return '';
+function timestampToLogicalIndex(candles: readonly Candle[], tf: string, ts: number): number {
+  if (candles.length === 0) return 0;
+  const step = getEffectiveBarStep(candles, tf);
+  if (ts <= candles[0].time) {
+    return (ts - candles[0].time) / step;
+  }
+  const lastIdx = candles.length - 1;
+  if (ts >= candles[lastIdx].time) {
+    return lastIdx + (ts - candles[lastIdx].time) / step;
   }
 
-  const offset = getTimezoneOffsetSeconds(timezone);
-  const adjusted = ts + offset;
-  const d = new Date(adjusted * 1000);
-
-  const hours = String(d.getUTCHours()).padStart(2, '0');
-  const minutes = String(d.getUTCMinutes()).padStart(2, '0');
-  const seconds = String(d.getUTCSeconds()).padStart(2, '0');
-  const day = d.getUTCDate();
-  const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  const month = monthNames[d.getUTCMonth()];
-  const year = String(d.getUTCFullYear()).slice(-2);
-
-  if (showSeconds || d.getUTCSeconds() !== 0) {
-    return `${day} ${month} '${year}  ${hours}:${minutes}:${seconds}`;
+  let lo = 0;
+  let hi = lastIdx - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (candles[mid].time <= ts && ts < candles[mid + 1].time) {
+      const span = candles[mid + 1].time - candles[mid].time;
+      return span > 0 ? mid + (ts - candles[mid].time) / span : mid;
+    }
+    if (candles[mid].time < ts) {
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
   }
-  return `${day} ${month} '${year}  ${hours}:${minutes}`;
+  return lo;
 }
+
+const paneSyncRegistry = new Map<string, { getCandles: () => Candle[]; getTimeframe: () => string }>();
 
 // Helper: duration of current timeframe in seconds (unambiguous parser)
 function getTimeframeDurationSeconds(tf: string): number {
@@ -396,6 +333,18 @@ function getWatermarkLines(
   return { isVisible, lines };
 }
 
+type ActivePriceSeries = ISeriesApi<'Candlestick' | 'Bar' | 'Line' | 'Area' | 'Baseline'>;
+
+interface DerivedBarsState {
+  ct: ChartType;
+  bars: CandlestickData<Time>[];
+  renkoBrickSize: number;
+  renkoPrevBase: number;
+  renkoPrevLastClose: number;
+  renkoCurBase: number;
+  renkoCurLastClose: number;
+}
+
 export const ChartPane: React.FC<ChartPaneProps> = ({
   paneId = 'pane-1',
   isGrid = false,
@@ -409,13 +358,32 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
   const lineSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
   const areaSeriesRef = useRef<ISeriesApi<'Area'> | null>(null);
   const baselineSeriesRef = useRef<ISeriesApi<'Baseline'> | null>(null);
+  const [chartInstance, setChartInstance] = useState<IChartApi | null>(null);
+  const [activeSeriesInstance, setActiveSeriesInstance] = useState<ActivePriceSeries | null>(null);
+  const activeSeriesInstanceRef = useRef<ActivePriceSeries | null>(null);
   const futureWhitespaceSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
   const priceCountdownPrimitiveRef = useRef<PriceCountdownPrimitive | null>(null);
+  const footprintPrimitiveRef = useRef<FootprintPrimitive | null>(null);
   const activeSeriesForCountdownRef = useRef<ISeriesApi<SeriesType, Time> | null>(null);
   const futureBarCountRef = useRef<number>(300);
+  const whitespaceStateRef = useRef<{
+    symbol: string;
+    tf: string;
+    anchorTime: number;
+    step: number;
+    count: number;
+  } | null>(null);
+  const derivedBarsRef = useRef<DerivedBarsState | null>(null);
   const prevLoadedTimeframeRef = useRef<string | null>(null);
   const candlesRef = useRef<Candle[]>([]);
   const [candlesData, setCandlesData] = useState<Candle[]>([]);
+
+  const syncActiveSeriesState = useCallback((series: ActivePriceSeries | null) => {
+    if (activeSeriesInstanceRef.current !== series) {
+      activeSeriesInstanceRef.current = series;
+      setActiveSeriesInstance(series);
+    }
+  }, []);
 
   const activePaneId = useSyncStore((s) => s.activePaneId);
   const isActive = activePaneId === paneId;
@@ -437,12 +405,17 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
   const isSecondsTf = getTimeframeDurationSeconds(timeframe) < 60 || timeframe.trim().toLowerCase().endsWith('s');
   const marketStatus = getMarketStatus(symbol);
   const [pricePrecision, setPricePrecision] = useState<number>(() => getPriceDecimals(symbol));
+  const pricePrecisionRef = useRef<number>(pricePrecision);
+  pricePrecisionRef.current = pricePrecision;
   const [tickSize, setTickSize] = useState<number>(() => detectTickSizeFromCandles([], symbol));
   const tickSizeRef = useRef<number>(tickSize);
   tickSizeRef.current = tickSize;
   const chartSettings = useSyncStore((s) => s.panes[paneId]?.settings || s.chartSettings);
   const chartSettingsRef = useRef(chartSettings);
   chartSettingsRef.current = chartSettings;
+  const orderflowSettings = useSyncStore((s) => s.panes[paneId]?.orderflowSettings || s.orderflowSettings);
+  const orderflowSettingsRef = useRef(orderflowSettings);
+  orderflowSettingsRef.current = orderflowSettings;
   const openChartSettings = useSyncStore((s) => s.openChartSettings);
   const [showScrollToLatest, setShowScrollToLatest] = useState(false);
 
@@ -505,15 +478,21 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
   const indicatorsRef = useRef<IndicatorInstance[]>([]);
   indicatorsRef.current = indicators;
 
-  const [indicatorLatestValues, setIndicatorLatestValues] = useState<
-    Record<string, Record<string, number | null>>
-  >({});
-  const [hoveredIndicatorValues, setHoveredIndicatorValues] = useState<
-    Record<string, Record<string, number | null>> | null
-  >(null);
-  const [paneOffsets, setPaneOffsets] = useState<Record<number, number>>({});
+  // Ensure newly created pane registers its default indicators in global store if uninitialized
+  useEffect(() => {
+    if (useSyncStore.getState().indicators[paneId] === undefined) {
+      useSyncStore.setState((state) => ({
+        indicators: {
+          ...state.indicators,
+          [paneId]: [createDefaultVolumeIndicator(paneId)],
+        },
+      }));
+    }
+  }, [paneId]);
 
-  const displayIndicatorValues = hoveredIndicatorValues || indicatorLatestValues;
+  const hudController = useMemo(() => new ChartHudController(), []);
+  const showScrollToLatestRef = useRef<boolean>(false);
+  const [paneOffsets, setPaneOffsets] = useState<Record<number, number>>({});
   const subpaneIndicators = indicators.filter((ind) => ind.category === 'subpane');
   const subpaneIndicatorIds = useMemo(
     () => indicators.filter((ind) => ind.category === 'subpane').map((s) => s.id).join(','),
@@ -962,59 +941,6 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
   const pendingSeriesFlushRef = useRef<boolean>(false);
   const reconcileCatchUpRef = useRef<(reason?: string) => Promise<void>>(() => Promise.resolve());
 
-  const [hoveredOHLC, setHoveredOHLC] = useState<{
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number;
-    change: number;
-    changePercent: number;
-  } | null>(null);
-
-  const [syncHoveredOHLC, setSyncHoveredOHLC] = useState<{
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number;
-    change: number;
-    changePercent: number;
-  } | null>(null);
-
-  const [liveOHLC, setLiveOHLC] = useState<{
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number;
-    change: number;
-    changePercent: number;
-  } | null>(null);
-
-  // Derived display OHLC combining local cursor hover, synchronized crosshair time, or real-time live bar
-  const displayOHLC = useMemo(() => {
-    if (hoveredOHLC) return hoveredOHLC;
-    if (crosshairLock && syncHoveredOHLC) return syncHoveredOHLC;
-    if (liveOHLC) return liveOHLC;
-    const arr = candlesRef.current;
-    if (arr.length > 0) {
-      const last = arr[arr.length - 1];
-      const change = last.close - last.open;
-      const changePercent = (change / last.open) * 100;
-      return {
-        open: last.open,
-        high: last.high,
-        low: last.low,
-        close: last.close,
-        volume: last.volume,
-        change,
-        changePercent,
-      };
-    }
-    return null;
-  }, [hoveredOHLC, syncHoveredOHLC, liveOHLC, crosshairLock]);
-
   // Imperative direct DOM crosshair refs — ZERO React re-renders during mouse move!
   const syncVLineRef = useRef<HTMLDivElement | null>(null);
   const syncHLineRef = useRef<HTMLDivElement | null>(null);
@@ -1024,8 +950,6 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
   timezoneRef.current = timezone;
   const isSecondsTfRef = useRef<boolean>(isSecondsTf);
   isSecondsTfRef.current = isSecondsTf;
-  const pricePrecisionRef = useRef<number>(pricePrecision);
-  pricePrecisionRef.current = pricePrecision;
 
   // Synchronized crosshair subscription driving direct GPU translate3d transforms
   useEffect(() => {
@@ -1048,26 +972,36 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
         hline.style.display = 'none';
         if (lastSyncBarTime !== null) {
           lastSyncBarTime = null;
-          setSyncHoveredOHLC(null);
+          hudController.setSyncHoveredOHLC(null);
         }
         return;
       }
 
       const containerW = chartContainerRef.current?.clientWidth || 0;
       const containerH = chartContainerRef.current?.clientHeight || 0;
-      if (containerW <= 0 || containerH <= 0 || !chartApiRef.current) {
+      const chart = chartApiRef.current;
+      if (containerW <= 0 || containerH <= 0 || !chart) {
         vline.style.display = 'none';
         hline.style.display = 'none';
         return;
       }
 
+      let rightScaleW = 0;
+      let timeScaleH = 0;
+      try {
+        rightScaleW = chart.priceScale('right')?.width() || 0;
+        timeScaleH = chart.timeScale()?.height() || 0;
+      } catch {}
+      const plotW = Math.max(0, containerW - rightScaleW);
+      const plotH = Math.max(0, containerH - timeScaleH);
+
       // 1. Resolve X Coordinate (Vertical Line)
       let syncXCoord: number | null = null;
       let syncTime: Time | number | null = null;
 
-      if (sync.time !== null && chartApiRef.current && containerW > 0) {
-        const exactX = chartApiRef.current.timeScale().timeToCoordinate(sync.time as Time);
-        if (exactX !== null && exactX >= 0 && exactX <= containerW) {
+      if (sync.time !== null && plotW > 0) {
+        const exactX = chart.timeScale().timeToCoordinate(sync.time as Time);
+        if (exactX !== null && exactX >= 0 && exactX <= plotW) {
           syncXCoord = exactX;
         }
 
@@ -1098,8 +1032,8 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
                 }
               }
               if (minDiff <= Math.max(dur * 2, 3600)) {
-                const nearestX = chartApiRef.current.timeScale().timeToCoordinate(best.time as Time);
-                if (nearestX !== null && nearestX >= 0 && nearestX <= containerW) {
+                const nearestX = chart.timeScale().timeToCoordinate(best.time as Time);
+                if (nearestX !== null && nearestX >= 0 && nearestX <= plotW) {
                   syncXCoord = nearestX;
                 }
               }
@@ -1108,7 +1042,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
         }
 
         if (syncXCoord !== null) {
-          syncTime = chartApiRef.current.timeScale().coordinateToTime(syncXCoord) || sync.time;
+          syncTime = chart.timeScale().coordinateToTime(syncXCoord) || sync.time;
         }
       }
 
@@ -1143,7 +1077,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
             if (found) {
               const change = found.close - found.open;
               const changePercent = (change / found.open) * 100;
-              setSyncHoveredOHLC({
+              hudController.setSyncHoveredOHLC({
                 open: found.open,
                 high: found.high,
                 low: found.low,
@@ -1153,17 +1087,18 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
                 changePercent,
               });
             } else {
-              setSyncHoveredOHLC(null);
+              hudController.setSyncHoveredOHLC(null);
             }
           }
         }
       } else if (lastSyncBarTime !== null) {
         lastSyncBarTime = null;
-        setSyncHoveredOHLC(null);
+        hudController.setSyncHoveredOHLC(null);
       }
 
-      if (syncXCoord !== null && syncXCoord >= 0 && syncXCoord <= containerW) {
+      if (syncXCoord !== null && syncXCoord >= 0 && syncXCoord <= plotW) {
         vline.style.display = 'block';
+        vline.style.bottom = `${timeScaleH}px`;
         vline.style.transform = `translate3d(${Math.round(syncXCoord)}px, 0, 0)`;
         if (timePill && syncTime !== null) {
           const timeStr = formatCrosshairTimeInTimezone(syncTime as Time, timezoneRef.current, isSecondsTfRef.current);
@@ -1178,7 +1113,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
         vline.style.display = 'none';
       }
 
-      // 2. Resolve Y Coordinate (Horizontal Line)
+      // 2. Resolve Y Coordinate (Horizontal Line) clipped to main plot bounds
       let syncYCoord: number | null = null;
       let syncPrice: number | null = null;
 
@@ -1191,7 +1126,22 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
         baselineSeriesRef.current
       );
 
-      if (sync.price != null && activeSeries && containerH > 0) {
+      const mainVIdx = paneOrderRef.current.indexOf('main') !== -1 ? paneOrderRef.current.indexOf('main') : 0;
+      let mainPaneTop = 0;
+      let mainPaneH = plotH;
+      try {
+        const mainPane = chart.panes()[mainVIdx];
+        if (mainPane) {
+          const h = mainPane.getHeight();
+          if (h > 0) mainPaneH = h;
+          const pEl = mainPane.getHTMLElement();
+          if (pEl && chartContainerRef.current) {
+            mainPaneTop = Math.max(0, Math.round(pEl.getBoundingClientRect().top - chartContainerRef.current.getBoundingClientRect().top));
+          }
+        }
+      } catch {}
+
+      if (sync.price != null && activeSeries && mainPaneH > 0) {
         const thisTickSize = tickSizeRef.current;
         const targetPrice = snapSyncedPrice(
           sync.price,
@@ -1200,14 +1150,15 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
           symbolRef.current
         );
         const priceCoord = activeSeries.priceToCoordinate(targetPrice);
-        if (priceCoord !== null && priceCoord >= 0 && priceCoord <= containerH) {
-          syncYCoord = priceCoord;
+        if (priceCoord !== null && priceCoord >= 0 && priceCoord <= mainPaneH) {
+          syncYCoord = mainPaneTop + priceCoord;
           syncPrice = targetPrice;
         }
       }
 
-      if (syncYCoord !== null && syncYCoord >= 0 && syncYCoord <= containerH) {
+      if (syncYCoord !== null && syncYCoord >= 0 && syncYCoord <= plotH) {
         hline.style.display = 'block';
+        hline.style.right = `${rightScaleW}px`;
         hline.style.transform = `translate3d(0, ${Math.round(syncYCoord)}px, 0)`;
         if (pricePill && syncPrice !== null) {
           pricePill.textContent = formatSyncedCrosshairPrice(syncPrice, pricePrecisionRef.current);
@@ -1218,12 +1169,15 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
       }
     };
 
-    const unsub = useSyncStore.subscribe((state) => {
-      pendingSync = state.syncCrosshair;
-      if (syncRafId === null) {
-        syncRafId = requestAnimationFrame(updateCrosshairDOM);
+    const unsub = useSyncStore.subscribe(
+      (state) => state.syncCrosshair,
+      (syncCrosshair) => {
+        pendingSync = syncCrosshair;
+        if (syncRafId === null) {
+          syncRafId = requestAnimationFrame(updateCrosshairDOM);
+        }
       }
-    });
+    );
 
     return () => {
       unsub();
@@ -1272,9 +1226,166 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
   timeframeRef.current = timeframe;
   chartTypeRef.current = chartType;
 
+  // Lazily create only the price series required for the requested chartType
+  const ensureSeriesForChartType = useCallback((ct: ChartType): ActivePriceSeries | null => {
+    const chart = chartApiRef.current;
+    if (!chart) return null;
+
+    const priceFormat = getPriceFormatConfig(pricePrecisionRef.current, tickSizeRef.current);
+
+    if (ct === 'bars' || ct === 'hlc_bars') {
+      if (!barSeriesRef.current) {
+        barSeriesRef.current = chart.addSeries(BarSeries, {
+          upColor: '#089981',
+          downColor: '#f23645',
+          openVisible: ct === 'bars',
+          thinBars: false,
+          priceFormat,
+          lastValueVisible: false,
+          visible: true,
+        });
+      }
+      return barSeriesRef.current;
+    }
+
+    if (ct === 'line' || ct === 'line_with_markers' || ct === 'step_line') {
+      if (!lineSeriesRef.current) {
+        lineSeriesRef.current = chart.addSeries(LineSeries, {
+          color: '#2962ff',
+          lineWidth: 2,
+          lineType: ct === 'step_line' ? LineType.WithSteps : LineType.Simple,
+          pointMarkersVisible: ct === 'line_with_markers',
+          pointMarkersRadius: 3,
+          visible: true,
+          priceFormat,
+          lastValueVisible: false,
+        });
+      }
+      return lineSeriesRef.current;
+    }
+
+    if (ct === 'area') {
+      if (!areaSeriesRef.current) {
+        areaSeriesRef.current = chart.addSeries(AreaSeries, {
+          topColor: 'rgba(41, 98, 255, 0.4)',
+          bottomColor: 'rgba(41, 98, 255, 0.0)',
+          lineColor: '#2962ff',
+          lineWidth: 2,
+          visible: true,
+          priceFormat,
+          lastValueVisible: false,
+        });
+      }
+      return areaSeriesRef.current;
+    }
+
+    if (ct === 'baseline') {
+      if (!baselineSeriesRef.current) {
+        baselineSeriesRef.current = chart.addSeries(BaselineSeries, {
+          baseValue: { type: 'price', price: 0 },
+          topLineColor: '#089981',
+          topFillColor1: 'rgba(8, 153, 129, 0.28)',
+          topFillColor2: 'rgba(8, 153, 129, 0.02)',
+          bottomLineColor: '#f23645',
+          bottomFillColor1: 'rgba(242, 54, 69, 0.02)',
+          bottomFillColor2: 'rgba(242, 54, 69, 0.28)',
+          lineWidth: 2,
+          priceFormat,
+          lastValueVisible: false,
+          visible: true,
+        });
+      }
+      return baselineSeriesRef.current;
+    }
+
+    if (!candleSeriesRef.current) {
+      candleSeriesRef.current = chart.addSeries(CandlestickSeries, {
+        upColor: '#089981',
+        downColor: '#f23645',
+        borderUpColor: '#089981',
+        borderDownColor: '#f23645',
+        wickUpColor: '#089981',
+        wickDownColor: '#f23645',
+        priceFormat,
+        lastValueVisible: false,
+        visible: true,
+      });
+    }
+    return candleSeriesRef.current;
+  }, []);
+
+  // Lazily create and attach FootprintPrimitive only when footprint or volume profile is active
+  const ensureFootprintPrimitive = useCallback((): FootprintPrimitive | null => {
+    if (footprintPrimitiveRef.current) return footprintPrimitiveRef.current;
+    const hostSeries = ensureSeriesForChartType('candles') as ISeriesApi<'Candlestick'> | null;
+    if (!hostSeries) return null;
+
+    const cs = chartSettingsRef.current;
+    const ofs = orderflowSettingsRef.current;
+    const fp = new FootprintPrimitive({
+      visible: chartTypeRef.current === 'footprint',
+      candleUpColor: cs?.candleBodyUpColor,
+      candleDownColor: cs?.candleBodyDownColor,
+      candleBorderUpColor: cs?.candleBorderUpColor,
+      candleBorderDownColor: cs?.candleBorderDownColor,
+      candleWickUpColor: cs?.candleWickUpColor,
+      candleWickDownColor: cs?.candleWickDownColor,
+      showCandleBody: cs?.showCandleBody,
+      showCandleBorders: cs?.showCandleBorders,
+      showCandleWick: cs?.showCandleWick,
+      showPOC: ofs?.showPOC,
+      pocColor: ofs?.pocColor,
+      imbalanceRules: ofs?.imbalanceRules,
+      imbalanceGlobalSettings: ofs?.imbalanceGlobalSettings,
+      imbalanceRepresentation: ofs?.imbalanceRepresentation,
+      imbalanceBuyColor: ofs?.imbalanceBuyColor,
+      imbalanceSellColor: ofs?.imbalanceSellColor,
+      textColor: ofs?.textColor,
+      zeroColor: ofs?.zeroColor,
+      bidColor: ofs?.bidColor,
+      askColor: ofs?.askColor,
+      deltaPositiveColor: ofs?.deltaPositiveColor,
+      deltaNegativeColor: ofs?.deltaNegativeColor,
+      showStats: ofs?.showStats,
+      statsPosition: ofs?.statsPosition,
+      showDelta: ofs?.showDelta,
+      showTotalVolume: ofs?.showTotalVolume,
+      totalVolumeColor: ofs?.totalVolumeColor,
+      showDeltaPercent: ofs?.showDeltaPercent,
+      deltaPercentColor: ofs?.deltaPercentColor,
+      showMinMaxDelta: ofs?.showMinMaxDelta,
+      minDeltaColor: ofs?.minDeltaColor,
+      maxDeltaColor: ofs?.maxDeltaColor,
+      aggregateProfiles: ofs?.aggregateProfiles,
+      convertClusterToCandlesOnZoom: ofs?.convertClusterToCandlesOnZoom,
+      includeEmptyLevels: ofs?.includeEmptyLevels,
+      barVisualization: ofs?.barVisualization,
+      candleZone: ofs?.candleZone,
+      candleZonePosition: ofs?.candleZonePosition,
+      barMarginPx: ofs?.barMarginPx,
+      calculateFontSizeAuto: ofs?.calculateFontSizeAuto,
+      maxValueCalculation: ofs?.maxValueCalculation,
+      tickSize: tickSizeRef.current,
+      volProfileEnabled: ofs?.volProfileEnabled,
+      volProfileMode: ofs?.volProfileMode,
+      volProfileTickInterval: ofs?.volProfileTickInterval,
+      volProfileBarColor: ofs?.volProfileBarColor,
+      volProfilePocBarColor: ofs?.volProfilePocBarColor,
+      volProfilePocBarEnabled: ofs?.volProfilePocBarEnabled,
+      volProfileShowValueArea: ofs?.volProfileShowValueArea,
+      volProfileValueAreaPercent: ofs?.volProfileValueAreaPercent,
+      volProfileValueAreaBarColor: ofs?.volProfileValueAreaBarColor,
+      volProfileValueAreaBarEnabled: ofs?.volProfileValueAreaBarEnabled,
+    });
+    hostSeries.attachPrimitive(fp);
+    footprintPrimitiveRef.current = fp;
+    return fp;
+  }, [ensureSeriesForChartType]);
+
   // Dynamically populate future whitespace bars so lightweight-charts creates
   // future tick marks, timescale timestamps, vertical grid lines, and crosshair snapping.
-  const updateFutureWhitespace = useCallback((candles: Candle[], tf: string, minBars = 300) => {
+  // Skips full regeneration on candle close unless approaching the whitespace boundary or context changed.
+  const updateFutureWhitespace = useCallback((candles: Candle[], tf: string, minBars = 300, force = false) => {
     if (!futureWhitespaceSeriesRef.current || candles.length === 0) return;
     const lastCandle = candles[candles.length - 1];
     const lastTime = lastCandle.time;
@@ -1282,23 +1393,51 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
       getTimeframeDurationSeconds(tf) ||
       (candles.length >= 2 ? Math.max(1, lastTime - candles[candles.length - 2].time) : 60);
 
-    const count = Math.max(futureBarCountRef.current, minBars);
-    futureBarCountRef.current = count;
+    const prev = whitespaceStateRef.current;
+    if (
+      !force &&
+      prev &&
+      prev.symbol === symbolRef.current &&
+      prev.tf === tf &&
+      prev.step === step
+    ) {
+      const barsAdvanced = Math.round((lastTime - prev.anchorTime) / step);
+      const remaining = prev.count - barsAdvanced;
+      if (barsAdvanced >= 0 && remaining >= 60 && minBars <= remaining) {
+        futureBarCountRef.current = remaining;
+        return;
+      }
+    }
 
-    const whitespaceData: WhitespaceData<Time>[] = [];
+    const count = Math.max(300, minBars);
+    futureBarCountRef.current = count;
+    whitespaceStateRef.current = {
+      symbol: symbolRef.current,
+      tf,
+      anchorTime: lastTime,
+      step,
+      count,
+    };
+
+    const whitespaceData: WhitespaceData<Time>[] = new Array(count);
     for (let i = 1; i <= count; i++) {
-      whitespaceData.push({
+      whitespaceData[i - 1] = {
         time: (lastTime + i * step) as Time,
-      });
+      };
     }
     futureWhitespaceSeriesRef.current.setData(whitespaceData);
   }, []);
 
-  const updateFutureWhitespaceRef = useRef<(candles: Candle[], tf: string, minBars?: number) => void>(() => {});
+  const updateFutureWhitespaceRef = useRef<(candles: Candle[], tf: string, minBars?: number, force?: boolean) => void>(() => {});
   updateFutureWhitespaceRef.current = updateFutureWhitespace;
 
   const applyChartTypeData = useCallback((ct: ChartType, candles: Candle[]) => {
     if (!candles || candles.length === 0) return;
+
+    const targetSeries = ensureSeriesForChartType(ct);
+    if (targetSeries) {
+      syncActiveSeriesState(targetSeries);
+    }
 
     const isCandleType =
       ct === 'candles' ||
@@ -1306,50 +1445,174 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
       ct === 'volume_candles' ||
       ct === 'heikin_ashi' ||
       ct === 'renko' ||
-      ct === 'high_low';
+      ct === 'high_low' ||
+      ct === 'footprint';
     const isBarType = ct === 'bars' || ct === 'hlc_bars';
     const isLineType = ct === 'line' || ct === 'line_with_markers' || ct === 'step_line';
 
-    candleSeriesRef.current?.applyOptions({
-      visible: isCandleType,
+    const mode = chartSettingsRef.current?.symbolPriceScaleMode || 'Value, line';
+    const isPriceLineVisible = mode === 'Value, line' || mode === 'Line only';
+
+    let lineStyleEnum = LineStyle.Dashed;
+    if (chartSettingsRef.current?.symbolPriceLineStyle === 'solid') {
+      lineStyleEnum = LineStyle.Solid;
+    } else if (chartSettingsRef.current?.symbolPriceLineStyle === 'dotted') {
+      lineStyleEnum = LineStyle.Dotted;
+    }
+
+    const priceLineOpts = {
+      priceLineVisible: isPriceLineVisible,
       lastValueVisible: false,
-    });
+      priceLineColor: chartSettingsRef.current?.symbolPriceLineColor || undefined,
+      priceLineStyle: lineStyleEnum,
+      priceLineWidth: (chartSettingsRef.current?.symbolPriceLineWidth || 1) as 1 | 2 | 3 | 4,
+    };
+
+    if (candleSeriesRef.current) {
+      if (ct === 'footprint') {
+        candleSeriesRef.current.applyOptions({
+          visible: true,
+          upColor: 'transparent',
+          downColor: 'transparent',
+          borderUpColor: 'transparent',
+          borderDownColor: 'transparent',
+          wickUpColor: 'transparent',
+          wickDownColor: 'transparent',
+          ...priceLineOpts,
+        });
+      } else {
+        candleSeriesRef.current.applyOptions({
+          visible: isCandleType,
+          upColor: chartSettingsRef.current?.candleBodyUpColor || '#089981',
+          downColor: chartSettingsRef.current?.candleBodyDownColor || '#f23645',
+          borderUpColor: chartSettingsRef.current?.candleBorderUpColor || '#089981',
+          borderDownColor: chartSettingsRef.current?.candleBorderDownColor || '#f23645',
+          wickUpColor: chartSettingsRef.current?.candleWickUpColor || '#089981',
+          wickDownColor: chartSettingsRef.current?.candleWickDownColor || '#f23645',
+          ...(isCandleType ? priceLineOpts : { priceLineVisible: false, lastValueVisible: false }),
+        });
+      }
+    }
+
+    const ofs = orderflowSettingsRef.current;
+    const needsFootprint =
+      ct === 'footprint' ||
+      Boolean(ofs?.volProfileEnabled) ||
+      ofs?.volProfileMode === 'profile' ||
+      ofs?.volProfileMode === 'both' ||
+      ofs?.volProfileMode === 'noCandle';
+    const fpPrim = needsFootprint ? ensureFootprintPrimitive() : footprintPrimitiveRef.current;
+    if (fpPrim) {
+      fpPrim.setOptions({
+        visible: ct === 'footprint',
+        candleUpColor: chartSettingsRef.current?.candleBodyUpColor,
+        candleDownColor: chartSettingsRef.current?.candleBodyDownColor,
+        candleBorderUpColor: chartSettingsRef.current?.candleBorderUpColor,
+        candleBorderDownColor: chartSettingsRef.current?.candleBorderDownColor,
+        candleWickUpColor: chartSettingsRef.current?.candleWickUpColor,
+        candleWickDownColor: chartSettingsRef.current?.candleWickDownColor,
+        showCandleBody: chartSettingsRef.current?.showCandleBody,
+        showCandleBorders: chartSettingsRef.current?.showCandleBorders,
+        showCandleWick: chartSettingsRef.current?.showCandleWick,
+      });
+    }
 
     barSeriesRef.current?.applyOptions({
       visible: isBarType,
       openVisible: ct === 'bars',
-      lastValueVisible: false,
+      ...(isBarType ? priceLineOpts : { priceLineVisible: false, lastValueVisible: false }),
     });
 
     lineSeriesRef.current?.applyOptions({
       visible: isLineType,
       lineType: ct === 'step_line' ? LineType.WithSteps : LineType.Simple,
       pointMarkersVisible: ct === 'line_with_markers',
-      lastValueVisible: false,
+      ...(isLineType ? priceLineOpts : { priceLineVisible: false, lastValueVisible: false }),
     });
 
     areaSeriesRef.current?.applyOptions({
       visible: ct === 'area',
-      lastValueVisible: false,
+      ...(ct === 'area' ? priceLineOpts : { priceLineVisible: false, lastValueVisible: false }),
     });
 
     baselineSeriesRef.current?.applyOptions({
       visible: ct === 'baseline',
-      lastValueVisible: false,
+      ...(ct === 'baseline' ? priceLineOpts : { priceLineVisible: false, lastValueVisible: false }),
     });
 
     if (isCandleType && candleSeriesRef.current) {
       if (ct === 'heikin_ashi') {
-        candleSeriesRef.current.setData(transformHeikinAshi(candles));
+        const transformed = transformHeikinAshi(candles);
+        derivedBarsRef.current = {
+          ct,
+          bars: transformed,
+          renkoBrickSize: 0,
+          renkoPrevBase: 0,
+          renkoPrevLastClose: 0,
+          renkoCurBase: 0,
+          renkoCurLastClose: 0,
+        };
+        candleSeriesRef.current.setData(transformed);
       } else if (ct === 'hollow_candles') {
-        candleSeriesRef.current.setData(transformHollowCandles(candles));
+        const transformed = transformHollowCandles(candles);
+        derivedBarsRef.current = {
+          ct,
+          bars: transformed,
+          renkoBrickSize: 0,
+          renkoPrevBase: 0,
+          renkoPrevLastClose: 0,
+          renkoCurBase: 0,
+          renkoCurLastClose: 0,
+        };
+        candleSeriesRef.current.setData(transformed);
       } else if (ct === 'volume_candles') {
-        candleSeriesRef.current.setData(transformVolumeCandles(candles));
+        const transformed = transformVolumeCandles(candles);
+        derivedBarsRef.current = {
+          ct,
+          bars: transformed,
+          renkoBrickSize: 0,
+          renkoPrevBase: 0,
+          renkoPrevLastClose: 0,
+          renkoCurBase: 0,
+          renkoCurLastClose: 0,
+        };
+        candleSeriesRef.current.setData(transformed);
       } else if (ct === 'high_low') {
-        candleSeriesRef.current.setData(transformHighLow(candles));
+        const transformed = transformHighLow(candles);
+        derivedBarsRef.current = {
+          ct,
+          bars: transformed,
+          renkoBrickSize: 0,
+          renkoPrevBase: 0,
+          renkoPrevLastClose: 0,
+          renkoCurBase: 0,
+          renkoCurLastClose: 0,
+        };
+        candleSeriesRef.current.setData(transformed);
       } else if (ct === 'renko') {
-        candleSeriesRef.current.setData(transformRenko(candles));
+        const transformed = transformRenko(candles);
+        const avgPrice = candles.reduce((acc, c) => acc + c.close, 0) / candles.length;
+        const brickSize = Math.max(
+          avgPrice * 0.001,
+          Math.abs(candles[candles.length - 1].close - candles[0].close) / 50 || 1
+        );
+        const initialBase = Math.floor(candles[0].close / brickSize) * brickSize;
+        const prevClose =
+          transformed.length >= 2 ? Number(transformed[transformed.length - 2].close) : initialBase;
+        const curClose =
+          transformed.length >= 1 ? Number(transformed[transformed.length - 1].close) : initialBase;
+        derivedBarsRef.current = {
+          ct,
+          bars: transformed,
+          renkoBrickSize: brickSize,
+          renkoPrevBase: prevClose,
+          renkoPrevLastClose: prevClose,
+          renkoCurBase: curClose,
+          renkoCurLastClose: curClose,
+        };
+        candleSeriesRef.current.setData(transformed);
       } else {
+        derivedBarsRef.current = null;
         candleSeriesRef.current.setData(
           candles.map((c) => ({
             time: c.time as Time,
@@ -1361,6 +1624,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
         );
       }
     } else if (isBarType && barSeriesRef.current) {
+      derivedBarsRef.current = null;
       barSeriesRef.current.setData(
         candles.map((c) => ({
           time: c.time as Time,
@@ -1371,6 +1635,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
         }))
       );
     } else if (isLineType && lineSeriesRef.current) {
+      derivedBarsRef.current = null;
       lineSeriesRef.current.setData(
         candles.map((c) => ({
           time: c.time as Time,
@@ -1378,6 +1643,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
         }))
       );
     } else if (ct === 'area' && areaSeriesRef.current) {
+      derivedBarsRef.current = null;
       areaSeriesRef.current.setData(
         candles.map((c) => ({
           time: c.time as Time,
@@ -1385,6 +1651,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
         }))
       );
     } else if (ct === 'baseline' && baselineSeriesRef.current) {
+      derivedBarsRef.current = null;
       const basePrice = candles[0].close;
       baselineSeriesRef.current.applyOptions({
         baseValue: { type: 'price', price: basePrice },
@@ -1396,7 +1663,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
         }))
       );
     }
-  }, []);
+  }, [ensureSeriesForChartType, ensureFootprintPrimitive, syncActiveSeriesState]);
 
   const applyChartTypeDataRef = useRef<(ct: ChartType, candles: Candle[]) => void>(() => {});
   applyChartTypeDataRef.current = applyChartTypeData;
@@ -1446,9 +1713,6 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
         hasMoreHistoryRef.current = false;
         return;
       }
-      if (dedupedOlder.length < 10) {
-        hasMoreHistoryRef.current = false;
-      }
 
       // Preserve viewport position without visual jump
       const currentLogicalRange = chartApiRef.current.timeScale().getVisibleLogicalRange();
@@ -1459,6 +1723,22 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
       applyChartTypeDataRef.current(chartTypeRef.current, merged);
       updateFutureWhitespaceRef.current(merged, timeframeRef.current);
       syncIndicators(merged);
+
+      // Backfill footprint orderflow clusters if footprint mode is active
+      const isFootprintActive = chartTypeRef.current === 'footprint';
+      if (isFootprintActive && footprintPrimitiveRef.current) {
+        transport
+          .fetchFootprint(symbolRef.current, timeframeRef.current, undefined, earliest.time, 200)
+          .then((rawOlderFp) => {
+            if (rawOlderFp && rawOlderFp.length > 0) {
+              const adaptedOlder = rawOlderFp.map((b) => adaptBackendFootprintBar(b, lookupCandleByTime));
+              footprintPrimitiveRef.current?.prependBars(adaptedOlder);
+            }
+          })
+          .catch((fpErr) => {
+            console.warn('[Backfill Footprint Error]', fpErr);
+          });
+      }
 
       // Shift visible logical range by number of prepended bars so visible bars stay stationary
       if (currentLogicalRange) {
@@ -1607,21 +1887,22 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
   // Live ticking clock & countdown calculation
   useEffect(() => {
     const updateTick = () => {
-      // 1. Clock in selected timezone
-      const now = new Date();
+      // 1. Clock in selected timezone synchronized to exchange/server time
+      const now = new Date(getServerTimeMs());
       const offset = getTimezoneOffsetSeconds(timezone);
       const targetDate = new Date(now.getTime() + offset * 1000 + now.getTimezoneOffset() * 60000);
       const h = String(targetDate.getHours()).padStart(2, '0');
       const m = String(targetDate.getMinutes()).padStart(2, '0');
       const s = String(targetDate.getSeconds()).padStart(2, '0');
-      setCurrentTimeStr(`${h}:${m}:${s}`);
+      const nextTimeStr = `${h}:${m}:${s}`;
+      setCurrentTimeStr((prev) => (prev === nextTimeStr ? prev : nextTimeStr));
 
       // 2. Bar close countdown
       const arr = candlesRef.current;
       if (arr.length > 0) {
         const lastCandle = arr[arr.length - 1];
         const dur = getTimeframeDurationSeconds(timeframe);
-        const nowSec = Math.floor(Date.now() / 1000);
+        const nowSec = getServerTimeSec();
 
         // Calculate countdown to period close.
         // If the last candle is currently open, count down to its closeTs.
@@ -1639,6 +1920,9 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
           } else if (dur > 0) {
             const currentBucketEnd = (Math.floor(nowSec / dur) + 1) * dur;
             rem = currentBucketEnd - nowSec;
+          }
+          if (dur > 0) {
+            rem = Math.min(dur, Math.max(0, rem));
           }
 
           if (rem < 3600) {
@@ -1666,7 +1950,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
     };
 
     updateTick();
-    const interval = setInterval(updateTick, 1000);
+    const interval = setInterval(updateTick, 250);
     return () => clearInterval(interval);
   }, [timezone, timeframe, symbol, chartSettings.showCountdownToBarClose]);
 
@@ -1740,6 +2024,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
           bottom: (chartSettings.marginScaleBottom ?? 8) / 100,
         },
         autoScale: true,
+        minimumWidth: 75,
       },
       timeScale: {
         borderColor: chartSettings.scalesLineColor || '#2a2e39',
@@ -1765,8 +2050,13 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
     });
 
     chartApiRef.current = chart;
+    setChartInstance(chart);
+    paneSyncRegistry.set(paneId, {
+      getCandles: () => candlesRef.current,
+      getTimeframe: () => timeframeRef.current,
+    });
     if (wrapperRef.current) {
-      (wrapperRef.current as any).__chart = chart;
+      (wrapperRef.current as unknown as { __chart?: IChartApi }).__chart = chart;
     }
 
     indicatorConnectorRef.current = new UniversalIndicatorConnector(
@@ -1776,7 +2066,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
       timeframe,
       {
         onLatestValuesChange: (vals) => {
-          setIndicatorLatestValues(vals);
+          hudController.setIndicatorLatestValues(vals);
         },
         onPanesAdjusted: () => {
           requestAnimationFrame(updatePaneOffsets);
@@ -1801,84 +2091,9 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
       }
     }
 
-    const initialPriceFormat = getPriceFormatConfig(pricePrecision, tickSize);
-
-    // 1. Candlestick Series
-    const isCandleType =
-      chartType === 'candles' ||
-      chartType === 'hollow_candles' ||
-      chartType === 'volume_candles' ||
-      chartType === 'heikin_ashi' ||
-      chartType === 'renko' ||
-      chartType === 'high_low';
-
-    const candleSeries = chart.addSeries(CandlestickSeries, {
-      upColor: '#089981',
-      downColor: '#f23645',
-      borderUpColor: '#089981',
-      borderDownColor: '#f23645',
-      wickUpColor: '#089981',
-      wickDownColor: '#f23645',
-      priceFormat: initialPriceFormat,
-      lastValueVisible: false,
-      visible: isCandleType,
-    });
-    candleSeriesRef.current = candleSeries;
-
-    // 2. Bar Series (OHLC Bars and HLC Bars)
-    const isBarType = chartType === 'bars' || chartType === 'hlc_bars';
-    const barSeries = chart.addSeries(BarSeries, {
-      upColor: '#089981',
-      downColor: '#f23645',
-      openVisible: chartType === 'bars',
-      thinBars: false,
-      priceFormat: initialPriceFormat,
-      lastValueVisible: false,
-      visible: isBarType,
-    });
-    barSeriesRef.current = barSeries;
-
-    // 3. Line Series (Simple, Markers, Step)
-    const isLineType = chartType === 'line' || chartType === 'line_with_markers' || chartType === 'step_line';
-    const lineSeries = chart.addSeries(LineSeries, {
-      color: '#2962ff',
-      lineWidth: 2,
-      lineType: chartType === 'step_line' ? LineType.WithSteps : LineType.Simple,
-      pointMarkersVisible: chartType === 'line_with_markers',
-      pointMarkersRadius: 3,
-      visible: isLineType,
-      priceFormat: initialPriceFormat,
-      lastValueVisible: false,
-    });
-    lineSeriesRef.current = lineSeries;
-
-    // 4. Area Series
-    const areaSeries = chart.addSeries(AreaSeries, {
-      topColor: 'rgba(41, 98, 255, 0.4)',
-      bottomColor: 'rgba(41, 98, 255, 0.0)',
-      lineColor: '#2962ff',
-      lineWidth: 2,
-      visible: chartType === 'area',
-      priceFormat: initialPriceFormat,
-      lastValueVisible: false,
-    });
-    areaSeriesRef.current = areaSeries;
-
-    // 5. Baseline Series
-    const baselineSeries = chart.addSeries(BaselineSeries, {
-      baseValue: { type: 'price', price: 0 },
-      topLineColor: '#089981',
-      topFillColor1: 'rgba(8, 153, 129, 0.28)',
-      topFillColor2: 'rgba(8, 153, 129, 0.02)',
-      bottomLineColor: '#f23645',
-      bottomFillColor1: 'rgba(242, 54, 69, 0.02)',
-      bottomFillColor2: 'rgba(242, 54, 69, 0.28)',
-      lineWidth: 2,
-      priceFormat: initialPriceFormat,
-      lastValueVisible: false,
-      visible: chartType === 'baseline',
-    });
-    baselineSeriesRef.current = baselineSeries;
+    // Lazily create only the series required for the initial active chartType
+    const initialActiveSeries = ensureSeriesForChartType(chartTypeRef.current);
+    syncActiveSeriesState(initialActiveSeries);
 
     // Single unified Price & Countdown badge on price scale canvas
     const mode = chartSettings.symbolPriceScaleMode || 'Value, line';
@@ -1891,11 +2106,22 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
       visible: isLastValVisible,
       pricePrecision,
     });
-    const initialActiveSeries =
-      getActiveSeries(chartType, candleSeries, barSeries, lineSeries, areaSeries, baselineSeries) || candleSeries;
-    initialActiveSeries.attachPrimitive(priceCountdown);
+    if (initialActiveSeries) {
+      initialActiveSeries.attachPrimitive(priceCountdown);
+      activeSeriesForCountdownRef.current = initialActiveSeries;
+    }
     priceCountdownPrimitiveRef.current = priceCountdown;
-    activeSeriesForCountdownRef.current = initialActiveSeries;
+
+    // Lazily attach FootprintPrimitive only if footprint or volume profile is active initially
+    if (
+      chartTypeRef.current === 'footprint' ||
+      orderflowSettings.volProfileEnabled ||
+      orderflowSettings.volProfileMode === 'profile' ||
+      orderflowSettings.volProfileMode === 'both' ||
+      orderflowSettings.volProfileMode === 'noCandle'
+    ) {
+      ensureFootprintPrimitive();
+    }
 
     // 4. Future Whitespace Series (LineSeries with transparent styling and autoscale disabled to extend timescale into future)
     const futureWhitespaceSeries = chart.addSeries(LineSeries, {
@@ -1916,6 +2142,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
 
     const checkAutoScale = () => {
       try {
+        if (useSyncStore.getState().activePaneId !== paneId) return;
         const mainVIdx = paneOrderRef.current.indexOf('main') !== -1 ? paneOrderRef.current.indexOf('main') : 0;
         const curAuto = chart.priceScale('right', mainVIdx).options().autoScale ?? false;
         setIsAutoScale((prev) => (prev !== curAuto ? curAuto : prev));
@@ -1925,21 +2152,17 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
     };
 
     window.addEventListener('pointerup', checkAutoScale);
-    window.addEventListener('mouseup', checkAutoScale);
     window.addEventListener('touchend', checkAutoScale);
 
-    // Crosshair move HUD update & dynamic price Y tracker
+    // Crosshair move HUD update & dynamic price Y tracker (zero ChartPane re-renders)
     chart.subscribeCrosshairMove((param) => {
-      const mainVIdx = paneOrderRef.current.indexOf('main') !== -1 ? paneOrderRef.current.indexOf('main') : 0;
-      const curAuto = chart.priceScale('right', mainVIdx).options().autoScale ?? false;
-      setIsAutoScale((prev) => (prev !== curAuto ? curAuto : prev));
       const isCrosshairLocked = useSyncStore.getState().crosshairLock;
 
       if (!param || !param.point) {
         if (lastHoveredBarTime !== null) {
           lastHoveredBarTime = null;
-          setHoveredOHLC(null);
-          setHoveredIndicatorValues(null);
+          hudController.setHoveredOHLC(null);
+          hudController.setHoveredIndicatorValues(null);
         }
         if (crosshairRafId !== null) {
           cancelAnimationFrame(crosshairRafId);
@@ -1990,40 +2213,57 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
       if (!param.time || !param.seriesData) {
         if (lastHoveredBarTime !== null) {
           lastHoveredBarTime = null;
-          setHoveredOHLC(null);
-          setHoveredIndicatorValues(null);
+          hudController.setHoveredOHLC(null);
+          hudController.setHoveredIndicatorValues(null);
         }
         return;
       }
 
       const barTime = param.time as number;
       if (barTime !== lastHoveredBarTime) {
-        const candleData = param.seriesData.get(candleSeries) as CandlestickData<Time> | undefined;
+        const targetSeries = activeSeriesInstanceRef.current || candleSeriesRef.current;
+        const seriesPoint = targetSeries ? param.seriesData.get(targetSeries) : undefined;
+        const matchedCandle = findCandleByTime(candlesRef.current, barTime);
 
-        if (candleData) {
+        if (seriesPoint && 'open' in seriesPoint && 'close' in seriesPoint) {
+          const ohlc = seriesPoint as CandlestickData<Time>;
           lastHoveredBarTime = barTime;
-          const change = candleData.close - candleData.open;
-          const changePercent = (change / candleData.open) * 100;
-          const matchedCandle = candlesRef.current.find((c) => c.time === barTime);
-          setHoveredOHLC({
-            open: candleData.open,
-            high: candleData.high,
-            low: candleData.low,
-            close: candleData.close,
+          const change = ohlc.close - ohlc.open;
+          const changePercent = ohlc.open !== 0 ? (change / ohlc.open) * 100 : 0;
+          hudController.setHoveredOHLC({
+            open: ohlc.open,
+            high: ohlc.high,
+            low: ohlc.low,
+            close: ohlc.close,
             volume: matchedCandle ? matchedCandle.volume : 0,
             change,
             changePercent,
           });
-
-          // Extract hovered indicator values for this candle
           if (indicatorConnectorRef.current) {
-            const hoveredVals = indicatorConnectorRef.current.getValuesAtTime(candleData.time);
-            setHoveredIndicatorValues(hoveredVals);
+            const hoveredVals = indicatorConnectorRef.current.getValuesAtTime(ohlc.time);
+            hudController.setHoveredIndicatorValues(hoveredVals);
+          }
+        } else if (matchedCandle) {
+          lastHoveredBarTime = barTime;
+          const change = matchedCandle.close - matchedCandle.open;
+          const changePercent = matchedCandle.open !== 0 ? (change / matchedCandle.open) * 100 : 0;
+          hudController.setHoveredOHLC({
+            open: matchedCandle.open,
+            high: matchedCandle.high,
+            low: matchedCandle.low,
+            close: matchedCandle.close,
+            volume: matchedCandle.volume,
+            change,
+            changePercent,
+          });
+          if (indicatorConnectorRef.current) {
+            const hoveredVals = indicatorConnectorRef.current.getValuesAtTime(barTime as Time);
+            hudController.setHoveredIndicatorValues(hoveredVals);
           }
         } else {
           lastHoveredBarTime = null;
-          setHoveredOHLC(null);
-          setHoveredIndicatorValues(null);
+          hudController.setHoveredOHLC(null);
+          hudController.setHoveredIndicatorValues(null);
         }
       }
     });
@@ -2051,15 +2291,19 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
       // Dynamically extend future timescale buffer as the user scrolls right into the future
       const arr = candlesRef.current;
       if (logicalRange && arr.length > 0) {
-        // Toggle "Scroll to the most recent bar" button when scrolled back in history
-        const scrollPos = chart.timeScale().scrollPosition();
-        setShowScrollToLatest(scrollPos < 2);
+        // Toggle "Scroll to the most recent bar" button only when visibility actually flips
+        const nextShow = chart.timeScale().scrollPosition() < 2;
+        if (nextShow !== showScrollToLatestRef.current) {
+          showScrollToLatestRef.current = nextShow;
+          setShowScrollToLatest(nextShow);
+        }
 
         const totalBars = arr.length + futureBarCountRef.current;
         if (logicalRange.to > totalBars - 60) {
           updateFutureWhitespaceRef.current(arr, timeframeRef.current, futureBarCountRef.current + 200);
         }
-      } else {
+      } else if (showScrollToLatestRef.current) {
+        showScrollToLatestRef.current = false;
         setShowScrollToLatest(false);
       }
     });
@@ -2106,8 +2350,10 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
 
     return () => {
       window.removeEventListener('pointerup', checkAutoScale);
-      window.removeEventListener('mouseup', checkAutoScale);
       window.removeEventListener('touchend', checkAutoScale);
+      paneSyncRegistry.delete(paneId);
+      setChartInstance(null);
+      syncActiveSeriesState(null);
       if (crosshairRafId !== null) {
         cancelAnimationFrame(crosshairRafId);
         crosshairRafId = null;
@@ -2119,7 +2365,13 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
           activeSeriesForCountdownRef.current.detachPrimitive(priceCountdownPrimitiveRef.current);
         } catch {}
       }
+      if (candleSeriesRef.current && footprintPrimitiveRef.current) {
+        try {
+          candleSeriesRef.current.detachPrimitive(footprintPrimitiveRef.current);
+        } catch {}
+      }
       priceCountdownPrimitiveRef.current = null;
+      footprintPrimitiveRef.current = null;
       activeSeriesForCountdownRef.current = null;
       candleSeriesRef.current = null;
       barSeriesRef.current = null;
@@ -2205,6 +2457,28 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
   }, [timeframe, timezone]);
 
 
+  const lookupCandleByTime = useCallback((time: number) => {
+    const candles = candlesRef.current;
+    for (let i = candles.length - 1; i >= 0; i--) {
+      const cTime = typeof candles[i].time === 'number'
+        ? (candles[i].time as number)
+        : Math.floor(new Date(candles[i].time).getTime() / 1000);
+      if (cTime === time) return candles[i];
+      if (cTime < time - 86400) break;
+    }
+    return undefined;
+  }, []);
+
+  // Auto-fallback from footprint to candles if active symbol does not support L2 orderflow
+  useEffect(() => {
+    if (chartType === 'footprint') {
+      const support = isChartTypeSupported(symbol, 'footprint');
+      if (!support.supported) {
+        useSyncStore.getState().updatePaneConfig(paneId, { chartType: 'candles' });
+      }
+    }
+  }, [symbol, chartType, paneId]);
+
   // Update visible series depending on chartType
   useEffect(() => {
     if (candlesRef.current.length > 0) {
@@ -2232,7 +2506,137 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
         activeSeriesForCountdownRef.current = targetSeries;
       } catch {}
     }
-  }, [chartType, applyChartTypeData]);
+
+    const isFootprintActive = chartType === 'footprint';
+    if (isFootprintActive) {
+      const ofs = orderflowSettingsRef.current;
+      footprintPrimitiveRef.current?.setOptions({
+        visible: true,
+        aggregateProfiles: ofs?.aggregateProfiles,
+        convertClusterToCandlesOnZoom: ofs?.convertClusterToCandlesOnZoom,
+        includeEmptyLevels: ofs?.includeEmptyLevels,
+        barVisualization: ofs?.barVisualization,
+        candleZone: ofs?.candleZone,
+        candleZonePosition: ofs?.candleZonePosition,
+        barMarginPx: ofs?.barMarginPx,
+        calculateFontSizeAuto: ofs?.calculateFontSizeAuto,
+        maxValueCalculation: ofs?.maxValueCalculation,
+        showPOC: ofs?.showPOC,
+        pocColor: ofs?.pocColor,
+        imbalanceRepresentation: ofs?.imbalanceRepresentation,
+        imbalanceBuyColor: ofs?.imbalanceBuyColor,
+        imbalanceSellColor: ofs?.imbalanceSellColor,
+        textColor: ofs?.textColor,
+        zeroColor: ofs?.zeroColor,
+        bidColor: ofs?.bidColor,
+        askColor: ofs?.askColor,
+        deltaPositiveColor: ofs?.deltaPositiveColor,
+        deltaNegativeColor: ofs?.deltaNegativeColor,
+        showStats: ofs?.showStats,
+        statsPosition: ofs?.statsPosition,
+        showDelta: ofs?.showDelta,
+        showTotalVolume: ofs?.showTotalVolume,
+        totalVolumeColor: ofs?.totalVolumeColor,
+        showDeltaPercent: ofs?.showDeltaPercent,
+        deltaPercentColor: ofs?.deltaPercentColor,
+        showMinMaxDelta: ofs?.showMinMaxDelta,
+        minDeltaColor: ofs?.minDeltaColor,
+        maxDeltaColor: ofs?.maxDeltaColor,
+        tickSize: tickSizeRef.current,
+        candleUpColor: chartSettingsRef.current?.candleBodyUpColor,
+        candleDownColor: chartSettingsRef.current?.candleBodyDownColor,
+        candleBorderUpColor: chartSettingsRef.current?.candleBorderUpColor,
+        candleBorderDownColor: chartSettingsRef.current?.candleBorderDownColor,
+        candleWickUpColor: chartSettingsRef.current?.candleWickUpColor,
+        candleWickDownColor: chartSettingsRef.current?.candleWickDownColor,
+        showCandleBody: chartSettingsRef.current?.showCandleBody,
+        showCandleBorders: chartSettingsRef.current?.showCandleBorders,
+        showCandleWick: chartSettingsRef.current?.showCandleWick,
+        volProfileEnabled: ofs?.volProfileEnabled,
+        volProfileMode: ofs?.volProfileMode,
+        volProfileTickInterval: ofs?.volProfileTickInterval,
+        volProfileBarColor: ofs?.volProfileBarColor,
+        volProfilePocBarColor: ofs?.volProfilePocBarColor,
+        volProfilePocBarEnabled: ofs?.volProfilePocBarEnabled,
+        volProfileShowValueArea: ofs?.volProfileShowValueArea,
+        volProfileValueAreaPercent: ofs?.volProfileValueAreaPercent,
+        volProfileValueAreaBarColor: ofs?.volProfileValueAreaBarColor,
+        volProfileValueAreaBarEnabled: ofs?.volProfileValueAreaBarEnabled,
+      });
+      if ((chartType === 'footprint' || ofs?.volProfileEnabled || ofs?.volProfileMode === 'profile' || ofs?.volProfileMode === 'both' || ofs?.volProfileMode === 'noCandle') && isChartTypeSupported(symbolRef.current, 'footprint').supported) {
+        transport.fetchFootprint(symbolRef.current, timeframeRef.current, undefined, undefined, Math.max(200, candlesRef.current.length))
+          .then((rawBars) => {
+            if (rawBars && rawBars.length > 0) {
+              const adapted = rawBars.map((b) => adaptBackendFootprintBar(b, lookupCandleByTime));
+              footprintPrimitiveRef.current?.updateData(adapted);
+            }
+          })
+          .catch((err) => console.warn('[ChartPane] Footprint history fetch error:', err));
+      }
+    } else {
+      footprintPrimitiveRef.current?.setOptions({ visible: false });
+    }
+  }, [chartType, applyChartTypeData, lookupCandleByTime]);
+
+  // Synchronize Orderflow / Footprint options dynamically without triggering re-fetch
+  useEffect(() => {
+    const isFootprintActive = chartType === 'footprint';
+    footprintPrimitiveRef.current?.setOptions({
+      visible: isFootprintActive,
+      aggregateProfiles: orderflowSettings.aggregateProfiles,
+      convertClusterToCandlesOnZoom: orderflowSettings.convertClusterToCandlesOnZoom,
+      includeEmptyLevels: orderflowSettings.includeEmptyLevels,
+      barVisualization: orderflowSettings.barVisualization,
+      candleZone: orderflowSettings.candleZone,
+      candleZonePosition: orderflowSettings.candleZonePosition,
+      barMarginPx: orderflowSettings.barMarginPx,
+      calculateFontSizeAuto: orderflowSettings.calculateFontSizeAuto,
+      maxValueCalculation: orderflowSettings.maxValueCalculation,
+      showPOC: orderflowSettings.showPOC,
+      pocColor: orderflowSettings.pocColor,
+      imbalanceRules: orderflowSettings.imbalanceRules,
+      imbalanceGlobalSettings: orderflowSettings.imbalanceGlobalSettings,
+      imbalanceRepresentation: orderflowSettings.imbalanceRepresentation,
+      imbalanceBuyColor: orderflowSettings.imbalanceBuyColor,
+      imbalanceSellColor: orderflowSettings.imbalanceSellColor,
+      textColor: orderflowSettings.textColor,
+      zeroColor: orderflowSettings.zeroColor,
+      bidColor: orderflowSettings.bidColor,
+      askColor: orderflowSettings.askColor,
+      deltaPositiveColor: orderflowSettings.deltaPositiveColor,
+      deltaNegativeColor: orderflowSettings.deltaNegativeColor,
+      showStats: orderflowSettings.showStats,
+      statsPosition: orderflowSettings.statsPosition,
+      showDelta: orderflowSettings.showDelta,
+      showTotalVolume: orderflowSettings.showTotalVolume,
+      totalVolumeColor: orderflowSettings.totalVolumeColor,
+      showDeltaPercent: orderflowSettings.showDeltaPercent,
+      deltaPercentColor: orderflowSettings.deltaPercentColor,
+      showMinMaxDelta: orderflowSettings.showMinMaxDelta,
+      minDeltaColor: orderflowSettings.minDeltaColor,
+      maxDeltaColor: orderflowSettings.maxDeltaColor,
+      tickSize: tickSizeRef.current,
+      candleUpColor: chartSettingsRef.current?.candleBodyUpColor,
+      candleDownColor: chartSettingsRef.current?.candleBodyDownColor,
+      candleBorderUpColor: chartSettingsRef.current?.candleBorderUpColor,
+      candleBorderDownColor: chartSettingsRef.current?.candleBorderDownColor,
+      candleWickUpColor: chartSettingsRef.current?.candleWickUpColor,
+      candleWickDownColor: chartSettingsRef.current?.candleWickDownColor,
+      showCandleBody: chartSettingsRef.current?.showCandleBody,
+      showCandleBorders: chartSettingsRef.current?.showCandleBorders,
+      showCandleWick: chartSettingsRef.current?.showCandleWick,
+      volProfileEnabled: orderflowSettings.volProfileEnabled,
+      volProfileMode: orderflowSettings.volProfileMode,
+      volProfileTickInterval: orderflowSettings.volProfileTickInterval,
+      volProfileBarColor: orderflowSettings.volProfileBarColor,
+      volProfilePocBarColor: orderflowSettings.volProfilePocBarColor,
+      volProfilePocBarEnabled: orderflowSettings.volProfilePocBarEnabled,
+      volProfileShowValueArea: orderflowSettings.volProfileShowValueArea,
+      volProfileValueAreaPercent: orderflowSettings.volProfileValueAreaPercent,
+      volProfileValueAreaBarColor: orderflowSettings.volProfileValueAreaBarColor,
+      volProfileValueAreaBarEnabled: orderflowSettings.volProfileValueAreaBarEnabled,
+    });
+  }, [orderflowSettings, chartType]);
 
   // Dynamically apply visual settings changes from Chart Settings Modal
   useEffect(() => {
@@ -2261,41 +2665,70 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
       visible: isLastValueVisible,
     });
 
-    if (candleSeriesRef.current) {
-      candleSeriesRef.current.applyOptions({
-        upColor: chartSettings.showCandleBody ? chartSettings.candleBodyUpColor : 'transparent',
-        downColor: chartSettings.showCandleBody ? chartSettings.candleBodyDownColor : 'transparent',
-        borderUpColor: chartSettings.showCandleBorders ? chartSettings.candleBorderUpColor : 'transparent',
-        borderDownColor: chartSettings.showCandleBorders ? chartSettings.candleBorderDownColor : 'transparent',
-        wickUpColor: chartSettings.showCandleWick ? chartSettings.candleWickUpColor : 'transparent',
-        wickDownColor: chartSettings.showCandleWick ? chartSettings.candleWickDownColor : 'transparent',
-        ...priceLineOpts,
-      });
-    }
+    footprintPrimitiveRef.current?.setOptions({
+      candleUpColor: chartSettings.candleBodyUpColor,
+      candleDownColor: chartSettings.candleBodyDownColor,
+      candleBorderUpColor: chartSettings.candleBorderUpColor,
+      candleBorderDownColor: chartSettings.candleBorderDownColor,
+      candleWickUpColor: chartSettings.candleWickUpColor,
+      candleWickDownColor: chartSettings.candleWickDownColor,
+      showCandleBody: chartSettings.showCandleBody,
+      showCandleBorders: chartSettings.showCandleBorders,
+      showCandleWick: chartSettings.showCandleWick,
+    });
 
-    if (barSeriesRef.current) {
-      barSeriesRef.current.applyOptions({
-        ...priceLineOpts,
-      });
-    }
+    const activeSeries = getActiveSeries(
+      chartType,
+      candleSeriesRef.current,
+      barSeriesRef.current,
+      lineSeriesRef.current,
+      areaSeriesRef.current,
+      baselineSeriesRef.current
+    ) || candleSeriesRef.current;
 
-    if (lineSeriesRef.current) {
-      lineSeriesRef.current.applyOptions({
-        ...priceLineOpts,
-      });
-    }
+    const allSeriesList = [
+      { ref: candleSeriesRef.current, isCandle: true },
+      { ref: barSeriesRef.current, isCandle: false },
+      { ref: lineSeriesRef.current, isCandle: false },
+      { ref: areaSeriesRef.current, isCandle: false },
+      { ref: baselineSeriesRef.current, isCandle: false },
+    ];
 
-    if (areaSeriesRef.current) {
-      areaSeriesRef.current.applyOptions({
-        ...priceLineOpts,
-      });
-    }
-
-    if (baselineSeriesRef.current) {
-      baselineSeriesRef.current.applyOptions({
-        ...priceLineOpts,
-      });
-    }
+    allSeriesList.forEach(({ ref, isCandle }) => {
+      if (!ref) return;
+      if (ref === activeSeries) {
+        if (isCandle && chartType === 'footprint') {
+          ref.applyOptions({
+            upColor: 'transparent',
+            downColor: 'transparent',
+            borderUpColor: 'transparent',
+            borderDownColor: 'transparent',
+            wickUpColor: 'transparent',
+            wickDownColor: 'transparent',
+            ...priceLineOpts,
+          });
+        } else if (isCandle) {
+          ref.applyOptions({
+            upColor: chartSettings.showCandleBody ? chartSettings.candleBodyUpColor : 'transparent',
+            downColor: chartSettings.showCandleBody ? chartSettings.candleBodyDownColor : 'transparent',
+            borderUpColor: chartSettings.showCandleBorders ? chartSettings.candleBorderUpColor : 'transparent',
+            borderDownColor: chartSettings.showCandleBorders ? chartSettings.candleBorderDownColor : 'transparent',
+            wickUpColor: chartSettings.showCandleWick ? chartSettings.candleWickUpColor : 'transparent',
+            wickDownColor: chartSettings.showCandleWick ? chartSettings.candleWickDownColor : 'transparent',
+            ...priceLineOpts,
+          });
+        } else {
+          ref.applyOptions({
+            ...priceLineOpts,
+          });
+        }
+      } else {
+        ref.applyOptions({
+          priceLineVisible: false,
+          lastValueVisible: false,
+        });
+      }
+    });
 
     if (chartApiRef.current) {
       const prev = prevSettingsRef.current;
@@ -2413,7 +2846,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
 
       prevSettingsRef.current = chartSettings;
     }
-  }, [chartSettings]);
+  }, [chartSettings, chartType]);
 
   // Dynamically update crosshair lines when cursorType changes (Cross vs Dot vs Arrow)
   useEffect(() => {
@@ -2571,9 +3004,14 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
   useEffect(() => {
     let isCancelled = false;
     let wsCleanup: (() => void) | null = null;
+    let fpWsCleanup: (() => void) | null = null;
     let hudRafId: number | null = null;
     let candlesRafId: number | null = null;
     let candlesTimeoutId: ReturnType<typeof setTimeout> | null = null;
+    let tickRafId: number | null = null;
+    let pendingHistoricalSync = false;
+    const pendingTickCandles = new Map<number, Candle>();
+    const pendingFpBars = new Map<number, FootprintBar>();
     setIsLoading(true);
     setError(null);
     setIsWsActive(false);
@@ -2599,6 +3037,18 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
         indicatorConnectorRef.current?.updateContext(symbol, timeframe);
         syncIndicators(candles);
 
+        const isFootprintActive = chartTypeRef.current === 'footprint';
+        if (isFootprintActive && isChartTypeSupported(symbol, 'footprint').supported) {
+          transport.fetchFootprint(symbol, timeframe, undefined, undefined, Math.max(200, candles.length))
+            .then((rawBars) => {
+              if (rawBars && rawBars.length > 0) {
+                const adapted = rawBars.map((b) => adaptBackendFootprintBar(b, lookupCandleByTime));
+                footprintPrimitiveRef.current?.updateData(adapted);
+              }
+            })
+            .catch((err) => console.warn('[ChartPane] Footprint fetch error:', err));
+        }
+
         const detectedDecimals = detectPrecisionFromCandles(candles, symbol);
         const detectedTick = detectTickSizeFromCandles(candles, symbol);
         setPricePrecision(detectedDecimals);
@@ -2617,8 +3067,8 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
         prevLoadedTimeframeRef.current = timeframe;
         isInitialCandlesLoadedRef.current = true;
 
-        // Position viewport to keep last price visible and ensure autoScale is cleanly active
-        if (isFirstLoad || isSymbolChange || isTimeframeChange) {
+        // Position viewport to keep last price visible
+        if (isFirstLoad || isSymbolChange) {
           if (candles.length > 0 && chartApiRef.current) {
             const count = candles.length;
             const visibleCount = Math.min(count, 80);
@@ -2637,13 +3087,50 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
             });
             setIsAutoScale(true);
           }
+        } else if (isTimeframeChange) {
+          if (candles.length > 0 && chartApiRef.current) {
+            const count = candles.length;
+            const visibleCount = Math.min(count, 80);
+            chartApiRef.current.timeScale().setVisibleLogicalRange({
+              from: count - visibleCount,
+              to: count + 5,
+            });
+
+            const mainVIdx = paneOrderRef.current.indexOf('main') !== -1 ? paneOrderRef.current.indexOf('main') : 0;
+            const mainScale = chartApiRef.current.priceScale('right', mainVIdx);
+
+            // Timeframe change must NOT enter Auto scaling mode
+            mainScale.applyOptions({
+              autoScale: false,
+            });
+            setIsAutoScale(false);
+
+            // Keep the last price cleanly in view vertically
+            const lastCandle = candles[candles.length - 1];
+            const curRange = mainScale.getVisibleRange();
+            if (curRange) {
+              const span = Math.max(1, curRange.to - curRange.from);
+              if (lastCandle.close < curRange.from || lastCandle.close > curRange.to) {
+                mainScale.setVisibleRange({
+                  from: lastCandle.close - span * 0.45,
+                  to: lastCandle.close + span * 0.55,
+                });
+              }
+            } else {
+              const priceSpan = Math.max(1, (lastCandle.high - lastCandle.low) * 8);
+              mainScale.setVisibleRange({
+                from: lastCandle.close - priceSpan * 0.45,
+                to: lastCandle.close + priceSpan * 0.55,
+              });
+            }
+          }
         }
 
         // Default HUD
         const last = candles[candles.length - 1];
         const change = last.close - last.open;
-        const changePercent = (change / last.open) * 100;
-        setLiveOHLC({
+        const changePercent = last.open !== 0 ? (change / last.open) * 100 : 0;
+        hudController.setLiveOHLC({
           open: last.open,
           high: last.high,
           low: last.low,
@@ -2652,8 +3139,8 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
           change,
           changePercent,
         });
-        setHoveredOHLC(null);
-        setHoveredIndicatorValues(null);
+        hudController.setHoveredOHLC(null);
+        hudController.setHoveredIndicatorValues(null);
 
         // Initialize Price & Countdown badge on price scale canvas
         priceCountdownPrimitiveRef.current?.updateData({
@@ -2693,7 +3180,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
             hudRafId = requestAnimationFrame(() => {
               hudRafId = null;
               if (pendingHudUpdate) {
-                setLiveOHLC(pendingHudUpdate);
+                hudController.setLiveOHLC(pendingHudUpdate);
               }
             });
           }
@@ -2737,6 +3224,310 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
           }
         };
 
+        const applySeriesUpdate = (candle: Candle) => {
+          const timeVal = candle.time as Time;
+          const ct = chartTypeRef.current;
+
+          if (ct === 'line' || ct === 'line_with_markers' || ct === 'step_line') {
+            lineSeriesRef.current?.update({ time: timeVal, value: candle.close });
+          } else if (ct === 'area') {
+            areaSeriesRef.current?.update({ time: timeVal, value: candle.close });
+          } else if (ct === 'baseline') {
+            baselineSeriesRef.current?.update({ time: timeVal, value: candle.close });
+          } else if (ct === 'bars' || ct === 'hlc_bars') {
+            barSeriesRef.current?.update({
+              time: timeVal,
+              open: candle.open,
+              high: candle.high,
+              low: candle.low,
+              close: candle.close,
+            });
+          } else if (
+            ct === 'heikin_ashi' ||
+            ct === 'hollow_candles' ||
+            ct === 'volume_candles' ||
+            ct === 'high_low' ||
+            ct === 'renko'
+          ) {
+            const derived = derivedBarsRef.current;
+            const src = candlesRef.current;
+            const candleSeriesInst = candleSeriesRef.current;
+            if (!derived || derived.ct !== ct || derived.bars.length === 0 || src.length === 0 || !candleSeriesInst) {
+              applyChartTypeDataRef.current(ct, src);
+            } else {
+              const dBars = derived.bars;
+              const lastDerived = dBars[dBars.length - 1];
+              const lastDerivedTime = Number(lastDerived.time);
+              const incomingTime = Number(candle.time);
+              const isTipUpdate = incomingTime === lastDerivedTime;
+              const isNextAppend = incomingTime > lastDerivedTime;
+
+              if (!isTipUpdate && !isNextAppend) {
+                applyChartTypeDataRef.current(ct, src);
+              } else {
+                const targetIdx = isTipUpdate ? dBars.length - 1 : dBars.length;
+                let nextBar: CandlestickData<Time> | null = null;
+
+                if (ct === 'heikin_ashi') {
+                  const haClose = (candle.open + candle.high + candle.low + candle.close) / 4;
+                  const prevBar = targetIdx > 0 ? dBars[targetIdx - 1] : null;
+                  const haOpen = prevBar
+                    ? (Number(prevBar.open) + Number(prevBar.close)) / 2
+                    : (candle.open + candle.close) / 2;
+                  nextBar = {
+                    time: timeVal,
+                    open: haOpen,
+                    high: Math.max(candle.high, haOpen, haClose),
+                    low: Math.min(candle.low, haOpen, haClose),
+                    close: haClose,
+                  };
+                } else if (ct === 'hollow_candles') {
+                  const srcIdx = isTipUpdate ? src.length - 1 : src.length - 1;
+                  const prevSrc = srcIdx > 0 ? src[srcIdx - 1] : null;
+                  const isBullish = candle.close >= candle.open;
+                  const isHigher = prevSrc ? candle.close >= prevSrc.close : isBullish;
+                  const col = isBullish ? '#089981' : '#f23645';
+                  nextBar = {
+                    time: timeVal,
+                    open: candle.open,
+                    high: candle.high,
+                    low: candle.low,
+                    close: candle.close,
+                    color: isHigher ? 'transparent' : col,
+                    borderColor: col,
+                    wickColor: col,
+                  };
+                } else if (ct === 'volume_candles') {
+                  const winStart = Math.max(0, src.length - 20);
+                  let volSum = 0;
+                  const winCount = src.length - winStart;
+                  for (let vi = winStart; vi < src.length; vi++) {
+                    volSum += src[vi].volume;
+                  }
+                  const avgVol = winCount > 0 ? volSum / winCount : 0;
+                  const volRatio = avgVol > 0 ? candle.volume / avgVol : 1;
+                  const isBull = candle.close >= candle.open;
+                  let col = isBull ? '#089981' : '#f23645';
+                  let borderCol = col;
+                  if (isBull) {
+                    if (volRatio >= 1.5) { col = '#00c853'; borderCol = '#00e676'; }
+                    else if (volRatio <= 0.6) { col = 'rgba(8, 153, 129, 0.45)'; borderCol = 'rgba(8, 153, 129, 0.65)'; }
+                  } else {
+                    if (volRatio >= 1.5) { col = '#d50000'; borderCol = '#ff1744'; }
+                    else if (volRatio <= 0.6) { col = 'rgba(242, 54, 69, 0.45)'; borderCol = 'rgba(242, 54, 69, 0.65)'; }
+                  }
+                  nextBar = {
+                    time: timeVal,
+                    open: candle.open,
+                    high: candle.high,
+                    low: candle.low,
+                    close: candle.close,
+                    color: col,
+                    borderColor: borderCol,
+                    wickColor: borderCol,
+                  };
+                } else if (ct === 'high_low') {
+                  const prevSrc = src.length >= 2 ? src[src.length - 2] : null;
+                  const isUp = prevSrc ? candle.close >= prevSrc.close : candle.close >= candle.open;
+                  const col = isUp ? '#089981' : '#f23645';
+                  nextBar = {
+                    time: timeVal,
+                    open: candle.low,
+                    high: candle.high,
+                    low: candle.low,
+                    close: candle.high,
+                    color: col,
+                    borderColor: col,
+                    wickColor: col,
+                  };
+                } else if (ct === 'renko' && derived.renkoBrickSize > 0) {
+                  const brickSize = derived.renkoBrickSize;
+                  const baseBefore = isTipUpdate ? derived.renkoPrevBase : derived.renkoCurBase;
+                  const lastBefore = isTipUpdate ? derived.renkoPrevLastClose : derived.renkoCurLastClose;
+                  const diff = candle.close - baseBefore;
+                  if (diff >= brickSize) {
+                    const nextClose = baseBefore + brickSize;
+                    nextBar = {
+                      time: timeVal,
+                      open: baseBefore,
+                      high: nextClose,
+                      low: baseBefore,
+                      close: nextClose,
+                      color: '#089981',
+                      borderColor: '#089981',
+                      wickColor: '#089981',
+                    };
+                    if (!isTipUpdate) {
+                      derived.renkoPrevBase = baseBefore;
+                      derived.renkoPrevLastClose = lastBefore;
+                    }
+                    derived.renkoCurBase = nextClose;
+                    derived.renkoCurLastClose = nextClose;
+                  } else if (diff <= -brickSize) {
+                    const nextClose = baseBefore - brickSize;
+                    nextBar = {
+                      time: timeVal,
+                      open: baseBefore,
+                      high: baseBefore,
+                      low: nextClose,
+                      close: nextClose,
+                      color: '#f23645',
+                      borderColor: '#f23645',
+                      wickColor: '#f23645',
+                    };
+                    if (!isTipUpdate) {
+                      derived.renkoPrevBase = baseBefore;
+                      derived.renkoPrevLastClose = lastBefore;
+                    }
+                    derived.renkoCurBase = nextClose;
+                    derived.renkoCurLastClose = nextClose;
+                  } else {
+                    const isUp = lastBefore >= baseBefore;
+                    const col = isUp ? '#089981' : '#f23645';
+                    nextBar = {
+                      time: timeVal,
+                      open: baseBefore,
+                      high: isUp ? lastBefore : baseBefore,
+                      low: isUp ? baseBefore : lastBefore,
+                      close: lastBefore,
+                      color: col,
+                      borderColor: col,
+                      wickColor: col,
+                    };
+                    if (!isTipUpdate) {
+                      derived.renkoPrevBase = baseBefore;
+                      derived.renkoPrevLastClose = lastBefore;
+                    }
+                    derived.renkoCurBase = baseBefore;
+                    derived.renkoCurLastClose = lastBefore;
+                  }
+                }
+
+                if (nextBar) {
+                  if (isTipUpdate) {
+                    dBars[targetIdx] = nextBar;
+                  } else {
+                    dBars.push(nextBar);
+                  }
+                  candleSeriesInst.update(nextBar);
+                } else {
+                  applyChartTypeDataRef.current(ct, src);
+                }
+              }
+            }
+          } else {
+            candleSeriesRef.current?.update({
+              time: timeVal,
+              open: candle.open,
+              high: candle.high,
+              low: candle.low,
+              close: candle.close,
+            });
+          }
+
+          priceCountdownPrimitiveRef.current?.updateData({
+            price: candle.close,
+          });
+        };
+
+        const flushBatchedTickUpdates = () => {
+          tickRafId = null;
+          if (isCancelled) return;
+
+          if (pendingFpBars.size > 0 && footprintPrimitiveRef.current) {
+            try {
+              const sortedFpBars = Array.from(pendingFpBars.values()).sort((a, b) => a.time - b.time);
+              for (const fpBar of sortedFpBars) {
+                footprintPrimitiveRef.current.upsertBar(fpBar);
+              }
+            } catch (e) {
+              console.error('[ChartPane] Error updating batched footprint bar:', e);
+            }
+            pendingFpBars.clear();
+          }
+
+          if (pendingHistoricalSync || pendingTickCandles.size > 0) {
+            const hadHistoricalSync = pendingHistoricalSync;
+            pendingHistoricalSync = false;
+            const sortedCandles = Array.from(pendingTickCandles.values()).sort(
+              (a, b) => (a.time as number) - (b.time as number)
+            );
+            pendingTickCandles.clear();
+
+            if (!isVisibleRef.current) {
+              pendingSeriesFlushRef.current = true;
+              return;
+            }
+
+            if (hadHistoricalSync && candlesRef.current.length > 0) {
+              // An earlier closed/finalized bar was updated (or inserted) — LWC's update() rejects
+              // timestamps older than the active tip, so apply an atomic setData preserving scroll.
+              const prevRange = chartApiRef.current?.timeScale().getVisibleLogicalRange() ?? null;
+              applyChartTypeDataRef.current(chartTypeRef.current, candlesRef.current);
+              if (prevRange) {
+                chartApiRef.current?.timeScale().setVisibleLogicalRange(prevRange);
+              }
+              const latestBar = candlesRef.current[candlesRef.current.length - 1];
+              if (latestBar) {
+                priceCountdownPrimitiveRef.current?.updateData({
+                  price: latestBar.close,
+                });
+                const chg = latestBar.close - latestBar.open;
+                const chgPct = latestBar.open > 0 ? (chg / latestBar.open) * 100 : 0;
+                scheduleHudUpdate({
+                  open: latestBar.open,
+                  high: latestBar.high,
+                  low: latestBar.low,
+                  close: latestBar.close,
+                  volume: latestBar.volume,
+                  change: chg,
+                  changePercent: chgPct,
+                });
+              }
+              if (indicatorsRef.current.length > 0) {
+                syncIndicators(candlesRef.current);
+              }
+            }
+
+            let lastCandle: Candle | null = null;
+            for (const candle of sortedCandles) {
+              if (hadHistoricalSync && candle.time < (candlesRef.current[candlesRef.current.length - 1]?.time ?? 0)) {
+                continue;
+              }
+              try {
+                applySeriesUpdate(candle);
+              } catch (seriesErr) {
+                applyChartTypeDataRef.current(chartTypeRef.current, candlesRef.current);
+              }
+
+              if (indicatorsRef.current.length > 0) {
+                indicatorConnectorRef.current?.updateRealtimeCandle(candle);
+              }
+              lastCandle = candle;
+            }
+
+            if (lastCandle) {
+              const chg = lastCandle.close - lastCandle.open;
+              const chgPct = lastCandle.open > 0 ? (chg / lastCandle.open) * 100 : 0;
+              scheduleHudUpdate({
+                open: lastCandle.open,
+                high: lastCandle.high,
+                low: lastCandle.low,
+                close: lastCandle.close,
+                volume: lastCandle.volume,
+                change: chg,
+                changePercent: chgPct,
+              });
+            }
+          }
+        };
+
+        const scheduleTickDispatch = () => {
+          if (tickRafId === null) {
+            tickRafId = requestAnimationFrame(flushBatchedTickUpdates);
+          }
+        };
+
         // Subscribe to live kline stream (WebSocket for Binance, Poll for OANDA)
         wsCleanup = transport.subscribeLiveKline(symbol, timeframe, (liveCandle) => {
           if (isCancelled) return;
@@ -2744,149 +3535,175 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
 
         try {
           const dur = getTimeframeDurationSeconds(timeframe);
-          const bucketTime = dur > 1 ? Math.floor(liveCandle.time / dur) * dur : liveCandle.time;
+          const rawTime = typeof liveCandle.time === 'number' ? liveCandle.time : Math.floor(new Date(liveCandle.time).getTime() / 1000);
+          recordServerTimestamp(rawTime);
 
           const arr = candlesRef.current;
-          let aggregatedCandle: Candle;
+          const prevLastTime = arr.length > 0 ? arr[arr.length - 1].time : -1;
+          const mergeRes = mergeLiveCandleTick(arr, liveCandle, dur);
+          const aggregatedCandle = mergeRes.candle;
 
-          if (arr.length > 0) {
-            const lastBar = arr[arr.length - 1];
-            if (bucketTime < lastBar.time) {
-              const idx = arr.findIndex((b) => b.time === bucketTime);
-              if (idx !== -1) {
-                arr[idx] = {
-                  ...arr[idx],
-                  high: Math.max(arr[idx].high, liveCandle.high),
-                  low: Math.min(arr[idx].low, liveCandle.low),
-                  close: liveCandle.close,
-                  volume: Math.max(arr[idx].volume || 0, liveCandle.volume ?? 0),
-                };
-                scheduleCandlesUpdate();
-                // NOTE: Do NOT call candleSeries.update() for bars older than the series tip!
-                // Lightweight Charts explicitly forbids updating older data:
-                // "Error: Cannot update oldest data, last time=..., new time=..."
-              }
-              return;
-            }
-
-            if (lastBar.time === bucketTime) {
-              const liveVol = liveCandle.volume ?? 0;
-              // Candle volume from provider is the bar's cumulative volume.
-              // It must be at least the existing bar's volume and never decrease.
-              const newVolume = Math.max(lastBar.volume || 0, liveVol);
-
-              aggregatedCandle = {
-                time: bucketTime,
-                open: lastBar.open,
-                high: Math.max(lastBar.high, liveCandle.high),
-                low: Math.min(lastBar.low, liveCandle.low),
-                close: liveCandle.close,
-                volume: newVolume,
-              };
-              arr[arr.length - 1] = aggregatedCandle;
-              scheduleCandlesUpdate();
-            } else {
-              const isGap = bucketTime - lastBar.time > dur * 1.5;
-              aggregatedCandle = {
-                time: bucketTime,
-                open: liveCandle.open,
-                high: liveCandle.high,
-                low: liveCandle.low,
-                close: liveCandle.close,
-                volume: liveCandle.volume ?? 0,
-              };
-              arr.push(aggregatedCandle);
-              scheduleCandlesUpdate(true);
-              updateFutureWhitespaceRef.current(arr, timeframeRef.current);
-
-              if (isGap) {
-                // Gap between last known bar and incoming bar! Trigger immediate catch-up backfill
-                reconcileCatchUpRef.current('live_gap');
-              }
-            }
-          } else {
-            aggregatedCandle = {
-              ...liveCandle,
-              time: bucketTime,
-            };
-            arr.push(aggregatedCandle);
-            scheduleCandlesUpdate(true);
-            updateFutureWhitespaceRef.current(arr, timeframeRef.current);
-          }
-
-          // If pane is off-screen or occluded, mark pending flush and skip GPU series draws
-          if (!isVisibleRef.current) {
-            pendingSeriesFlushRef.current = true;
+          if (mergeRes.action === 'noop') {
+            scheduleCandlesUpdate();
             return;
           }
 
-          const applySeriesUpdate = (candle: Candle) => {
-            const timeVal = candle.time as Time;
-            const ct = chartTypeRef.current;
-
-            if (ct === 'line' || ct === 'line_with_markers' || ct === 'step_line') {
-              lineSeriesRef.current?.update({ time: timeVal, value: candle.close });
-            } else if (ct === 'area') {
-              areaSeriesRef.current?.update({ time: timeVal, value: candle.close });
-            } else if (ct === 'baseline') {
-              baselineSeriesRef.current?.update({ time: timeVal, value: candle.close });
-            } else if (ct === 'bars' || ct === 'hlc_bars') {
-              barSeriesRef.current?.update({
-                time: timeVal,
-                open: candle.open,
-                high: candle.high,
-                low: candle.low,
-                close: candle.close,
-              });
-            } else if (
-              ct === 'heikin_ashi' ||
-              ct === 'hollow_candles' ||
-              ct === 'volume_candles' ||
-              ct === 'high_low' ||
-              ct === 'renko'
-            ) {
-              applyChartTypeDataRef.current(ct, candlesRef.current);
-            } else {
-              candleSeriesRef.current?.update({
-                time: timeVal,
-                open: candle.open,
-                high: candle.high,
-                low: candle.low,
-                close: candle.close,
-              });
-            }
-
-            priceCountdownPrimitiveRef.current?.updateData({
-              price: candle.close,
-            });
-
-            if (indicatorsRef.current.length > 0) {
-              indicatorConnectorRef.current?.updateRealtimeCandle(aggregatedCandle);
-            }
-          };
-
-          // Raw, unthrottled real-time canvas dispatch: every single WebSocket update
-          // is rendered directly to the Lightweight Charts canvas with zero delay, cap, or skipping.
-          try {
-            applySeriesUpdate(aggregatedCandle);
-          } catch (seriesErr) {
-            applyChartTypeDataRef.current(chartTypeRef.current, candlesRef.current);
+          if (mergeRes.action === 'resync') {
+            pendingHistoricalSync = true;
+            scheduleCandlesUpdate(true);
+            updateFutureWhitespaceRef.current(arr, timeframeRef.current);
+            pendingTickCandles.set(aggregatedCandle.time as number, aggregatedCandle);
+            scheduleTickDispatch();
+            return;
           }
 
-          const chg = aggregatedCandle.close - aggregatedCandle.open;
-          const chgPct = (chg / aggregatedCandle.open) * 100;
-          scheduleHudUpdate({
-            open: aggregatedCandle.open,
-            high: aggregatedCandle.high,
-            low: aggregatedCandle.low,
-            close: aggregatedCandle.close,
-            volume: aggregatedCandle.volume,
-            change: chg,
-            changePercent: chgPct,
-          });
+          const openedNewBar = (aggregatedCandle.time as number) > prevLastTime;
+          scheduleCandlesUpdate(openedNewBar);
+          if (openedNewBar) {
+            updateFutureWhitespaceRef.current(arr, timeframeRef.current);
+            if (mergeRes.needsCatchUp) {
+              // Gap between last known bar and incoming bar! Trigger immediate catch-up backfill
+              reconcileCatchUpRef.current('live_gap');
+            }
+          }
+
+          // Ensure the active forming candle immediately has its footprint bar rendered & updated
+          const isFpActive = chartTypeRef.current === 'footprint';
+          const isRealL2Symbol = symbol.startsWith('DATABRIDGE:');
+          if (isFpActive && footprintPrimitiveRef.current) {
+            const candleTimeSec = typeof aggregatedCandle.time === 'number' ? aggregatedCandle.time : Math.floor(new Date(aggregatedCandle.time).getTime() / 1000);
+            const existingFp = pendingFpBars.get(candleTimeSec) || footprintPrimitiveRef.current.getBar(candleTimeSec);
+            if (isRealL2Symbol) {
+              // For real L2 symbols (e.g. DATABRIDGE), synchronously update forming candle OHLC
+              if (existingFp) {
+                existingFp.close = aggregatedCandle.close;
+                existingFp.high = Math.max(existingFp.high, aggregatedCandle.high);
+                existingFp.low = Math.min(existingFp.low, aggregatedCandle.low);
+                pendingFpBars.set(candleTimeSec, existingFp);
+              }
+            } else if (!existingFp) {
+              const liveFp = synthesizeFormingFootprintBar(aggregatedCandle, tickSizeRef.current);
+              pendingFpBars.set(candleTimeSec, liveFp);
+            } else {
+              // Real-time update for forming footprint bar on every tick
+              const prevFpLow = existingFp.low;
+              const prevFpHigh = existingFp.high;
+              existingFp.high = Math.max(existingFp.high, aggregatedCandle.high);
+              existingFp.low = Math.min(existingFp.low, aggregatedCandle.low);
+              existingFp.close = aggregatedCandle.close;
+              const prevVol = existingFp.totalVolume;
+              existingFp.totalVolume = Math.max(existingFp.totalVolume, aggregatedCandle.volume || (prevVol + 1));
+              const deltaVol = Math.max(1, existingFp.totalVolume - prevVol);
+
+              const ts = tickSizeRef.current > 0 ? tickSizeRef.current : 0.25;
+              const rangeExpanded = existingFp.low !== prevFpLow || existingFp.high !== prevFpHigh || existingFp.levels.length === 0;
+              if (orderflowSettingsRef.current?.includeEmptyLevels && rangeExpanded) {
+                const lowTick = Math.round(existingFp.low / ts) * ts;
+                const highTick = Math.round(existingFp.high / ts) * ts;
+                let insertedEmpty = false;
+                for (let p = lowTick; p <= highTick + ts * 0.5; p += ts) {
+                  const roundedEmpty = Number((Math.round(p / ts) * ts).toFixed(4));
+                  const exists = existingFp.levels.some((l) => Math.abs(l.price - roundedEmpty) < ts * 0.5);
+                  if (!exists) {
+                    existingFp.levels.push({
+                      price: roundedEmpty,
+                      bidVolume: 0,
+                      askVolume: 0,
+                      delta: 0,
+                      isPOC: false,
+                    });
+                    insertedEmpty = true;
+                  }
+                }
+                if (insertedEmpty) {
+                  existingFp.levels.sort((a, b) => a.price - b.price);
+                }
+              }
+
+              const roundedP = Number((Math.round(aggregatedCandle.close / ts) * ts).toFixed(6));
+              let lvl = existingFp.levels.find((l) => Math.abs(l.price - roundedP) < ts * 0.5);
+              if (!lvl) {
+                lvl = {
+                  price: roundedP,
+                  bidVolume: 0,
+                  askVolume: 0,
+                  delta: 0,
+                  isPOC: false,
+                };
+                existingFp.levels.push(lvl);
+                existingFp.levels.sort((a, b) => a.price - b.price);
+              }
+
+              if (aggregatedCandle.close >= aggregatedCandle.open) {
+                lvl.askVolume += deltaVol;
+              } else {
+                lvl.bidVolume += deltaVol;
+              }
+              lvl.delta = lvl.askVolume - lvl.bidVolume;
+
+              // Re-calculate POC and total delta across forming candle
+              let maxLvlVol = -1;
+              let pocP = existingFp.pocPrice ?? aggregatedCandle.close;
+              let totDelta = 0;
+              for (const l of existingFp.levels) {
+                const t = l.bidVolume + l.askVolume;
+                if (t > maxLvlVol) {
+                  maxLvlVol = t;
+                  pocP = l.price;
+                }
+                totDelta += (l.askVolume - l.bidVolume);
+              }
+              existingFp.pocPrice = pocP;
+              existingFp.delta = totDelta;
+              for (const l of existingFp.levels) {
+                l.isPOC = Math.abs(l.price - pocP) < ts * 0.5;
+              }
+
+              pendingFpBars.set(candleTimeSec, existingFp);
+            }
+          }
+
+          // Throttle incoming real-time WebSocket tick series dispatches and footprint updates
+          // using requestAnimationFrame, batching rapid ticks per frame (60Hz / 144Hz)
+          pendingTickCandles.set(aggregatedCandle.time as number, aggregatedCandle);
+          scheduleTickDispatch();
         } catch (seriesErr) {
           console.warn('[Live Candle Update Warning]', seriesErr);
         }
+        });
+
+        // Subscribe to live institutional Footprint stream if active
+        fpWsCleanup = transport.subscribeFootprint(symbol, timeframe, (fp) => {
+          if (isCancelled) return;
+          setIsWsActive(true);
+          try {
+            const adapted = adaptBackendFootprintBar(fp, lookupCandleByTime);
+
+            const liveCandle: Candle = {
+              time: adapted.time,
+              open: adapted.open,
+              high: adapted.high,
+              low: adapted.low,
+              close: adapted.close,
+              volume: adapted.totalVolume,
+            };
+
+            // Keep candlesRef in sync so other components and timers have the live price
+            if (candlesRef.current.length > 0) {
+              const lastIdx = candlesRef.current.length - 1;
+              if (candlesRef.current[lastIdx].time === adapted.time) {
+                candlesRef.current[lastIdx] = liveCandle;
+              } else if (adapted.time > (candlesRef.current[lastIdx].time as number)) {
+                candlesRef.current.push(liveCandle);
+              }
+            }
+
+            pendingFpBars.set(adapted.time, adapted);
+            pendingTickCandles.set(liveCandle.time as number, liveCandle);
+            scheduleTickDispatch();
+          } catch (e) {
+            console.error('[ChartPane] Error updating footprint bar:', e);
+          }
         });
       } catch (err) {
         if (!isCancelled) {
@@ -2912,41 +3729,68 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
         clearTimeout(candlesTimeoutId);
         candlesTimeoutId = null;
       }
+      if (tickRafId !== null) {
+        cancelAnimationFrame(tickRafId);
+        tickRafId = null;
+      }
+      pendingTickCandles.clear();
+      pendingFpBars.clear();
       if (wsCleanup) {
         wsCleanup();
+      }
+      if (fpWsCleanup) {
+        fpWsCleanup();
       }
     };
   }, [symbol, timeframe]);
 
-  // Visible logical range synchronization listener (0 React re-renders during panning!)
+  // Visible logical range synchronization listener (timestamp-aligned across panes, 0 React re-renders)
   useEffect(() => {
     if (!dateRangeLock) return;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const unsub = useSyncStore.subscribe((state) => {
-      const syncRange = state.syncLogicalRange;
-      if (!syncRange || syncRange.sourceId === paneId) return;
-      if (!chartApiRef.current) return;
-      const curRange = chartApiRef.current.timeScale().getVisibleLogicalRange();
-      if (
-        curRange &&
-        Math.abs(curRange.from - syncRange.from) < 0.05 &&
-        Math.abs(curRange.to - syncRange.to) < 0.05
-      ) {
-        return;
+    const unsub = useSyncStore.subscribe(
+      (state) => state.syncLogicalRange,
+      (syncRange) => {
+        if (!syncRange || syncRange.sourceId === paneId) return;
+        const chart = chartApiRef.current;
+        if (!chart) return;
+
+        let targetFrom = syncRange.from;
+        let targetTo = syncRange.to;
+        const srcEntry = paneSyncRegistry.get(syncRange.sourceId);
+        const dstCandles = candlesRef.current;
+        if (srcEntry && dstCandles.length > 0) {
+          const srcCandles = srcEntry.getCandles();
+          const srcTf = srcEntry.getTimeframe();
+          if (srcCandles.length > 0) {
+            const fromTs = logicalIndexToTimestamp(srcCandles, srcTf, syncRange.from);
+            const toTs = logicalIndexToTimestamp(srcCandles, srcTf, syncRange.to);
+            if (fromTs !== null && toTs !== null) {
+              targetFrom = timestampToLogicalIndex(dstCandles, timeframeRef.current, fromTs);
+              targetTo = timestampToLogicalIndex(dstCandles, timeframeRef.current, toTs);
+            }
+          }
+        }
+
+        const curRange = chart.timeScale().getVisibleLogicalRange();
+        if (
+          curRange &&
+          Math.abs(curRange.from - targetFrom) < 0.05 &&
+          Math.abs(curRange.to - targetTo) < 0.05
+        ) {
+          return;
+        }
+        isApplyingSyncRangeRef.current = true;
+        chart.timeScale().setVisibleLogicalRange({
+          from: targetFrom,
+          to: targetTo,
+        });
+        queueMicrotask(() => {
+          isApplyingSyncRangeRef.current = false;
+        });
       }
-      isApplyingSyncRangeRef.current = true;
-      chartApiRef.current.timeScale().setVisibleLogicalRange({
-        from: syncRange.from,
-        to: syncRange.to,
-      });
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(() => {
-        isApplyingSyncRangeRef.current = false;
-      }, 50);
-    });
+    );
     return () => {
       unsub();
-      if (timer) clearTimeout(timer);
     };
   }, [dateRangeLock, paneId]);
 
@@ -2994,8 +3838,8 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
 
         {/* Interactive Drawing Overlay Canvas */}
         <DrawingCanvas
-          chart={chartApiRef.current}
-          series={candleSeriesRef.current}
+          chart={chartInstance}
+          series={activeSeriesInstance}
           candles={candlesData}
           containerRef={wrapperRef}
           paneSymbol={symbol}
@@ -3062,10 +3906,10 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
               e.stopPropagation();
               toggleMaximizePane(paneId);
             }}
-            className={`absolute top-2 right-12 z-25 p-1 rounded backdrop-blur transition-colors cursor-pointer shadow select-none ${
+            className={`absolute top-2 right-12 z-25 p-1 rounded transition-colors cursor-pointer shadow select-none ${
               isLightCanvas
-                ? 'bg-white/90 hover:bg-white border border-black/10 text-[#434651] hover:text-[#131722]'
-                : 'bg-[#1e222d]/85 hover:bg-[#2a2e39] border border-[#2a2e39] text-[#787b86] hover:text-[#d1d4dc]'
+                ? 'bg-white/95 hover:bg-white border border-black/10 text-[#434651] hover:text-[#131722]'
+                : 'bg-[#1e222d]/95 hover:bg-[#2a2e39] border border-[#2a2e39] text-[#787b86] hover:text-[#d1d4dc]'
             } ${
               isMaximized ? 'text-[#2962ff] border-[#2962ff]/50' : ''
             }`}
@@ -3087,10 +3931,10 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
               {/* Main Chart Pane Action Controls (When sub-panes exist) */}
               {subpaneIndicators.length > 0 && isMainVisible && (
                 <div
-                  className={`absolute ${isGrid ? 'right-20' : 'right-14'} z-30 flex items-center gap-0.5 rounded px-1 py-0.5 shadow backdrop-blur-xs select-none ${
+                  className={`absolute ${isGrid ? 'right-20' : 'right-14'} z-30 flex items-center gap-0.5 rounded px-1 py-0.5 shadow select-none ${
                     isLightCanvas
-                      ? 'bg-white/90 hover:bg-white border border-black/10 text-[#434651]'
-                      : 'bg-[#1e222d]/85 hover:bg-[#1e222d] border border-[#2a2e39] text-[#787b86]'
+                      ? 'bg-white/95 hover:bg-white border border-black/10 text-[#434651]'
+                      : 'bg-[#1e222d]/95 hover:bg-[#1e222d] border border-[#2a2e39] text-[#787b86]'
                   }`}
                   style={{
                     top: `${mainTopOffset + 6}px`,
@@ -3201,50 +4045,16 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
                       </div>
                     )}
 
-                    {displayOHLC && (
-                      <div
-                        className="flex items-center space-x-2 tabular-nums text-[11px]"
-                        style={{ fontSize: `${statusTextSize}px` }}
-                      >
-                        {chartSettings.statusShowChartValues && (
-                          <>
-                            <span style={{ color: statusTextColor }}>
-                              <span className="opacity-75 font-normal">O</span>{' '}
-                              <span className="font-medium">{displayOHLC.open.toFixed(pricePrecision)}</span>
-                            </span>
-                            <span style={{ color: statusTextColor }}>
-                              <span className="opacity-75 font-normal">H</span>{' '}
-                              <span className="font-medium">{displayOHLC.high.toFixed(pricePrecision)}</span>
-                            </span>
-                            <span style={{ color: statusTextColor }}>
-                              <span className="opacity-75 font-normal">L</span>{' '}
-                              <span className="font-medium">{displayOHLC.low.toFixed(pricePrecision)}</span>
-                            </span>
-                            <span style={{ color: statusTextColor }}>
-                              <span className="opacity-75 font-normal">C</span>{' '}
-                              <span className="font-medium">{displayOHLC.close.toFixed(pricePrecision)}</span>
-                            </span>
-                          </>
-                        )}
-                        {chartSettings.statusShowBarChange && (
-                          <span
-                            className={`font-medium ${
-                              displayOHLC.change >= 0 ? 'text-[#089981]' : 'text-[#f23645]'
-                            }`}
-                          >
-                            {displayOHLC.change >= 0 ? '+' : ''}
-                            {displayOHLC.change.toFixed(pricePrecision)} ({displayOHLC.change >= 0 ? '+' : ''}
-                            {displayOHLC.changePercent.toFixed(2)}%)
-                          </span>
-                        )}
-                        {chartSettings.statusShowVolume && (
-                          <span style={{ color: statusTextColor }}>
-                            <span className="opacity-75 font-normal">Vol</span>{' '}
-                            <span className="font-medium">{displayOHLC.volume.toLocaleString()}</span>
-                          </span>
-                        )}
-                      </div>
-                    )}
+                    <ChartOhlcReadout
+                      controller={hudController}
+                      crosshairLock={crosshairLock}
+                      pricePrecision={pricePrecision}
+                      statusTextColor={statusTextColor}
+                      statusTextSize={statusTextSize}
+                      showChartValues={Boolean(chartSettings.statusShowChartValues)}
+                      showBarChange={Boolean(chartSettings.statusShowBarChange)}
+                      showVolume={Boolean(chartSettings.statusShowVolume)}
+                    />
 
                     {isBackfilling && (
                       <div className="flex items-center space-x-1.5 px-2 py-0.5 rounded bg-[#1e222d] border border-[#2962ff]/50 text-[#2962ff] text-[10px] font-mono select-none">
@@ -3255,10 +4065,9 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
                   </div>
 
                   {/* Active Overlay Indicators Legend (Overlays stay on Main Chart) */}
-                  <IndicatorLegend
+                  <ChartOverlayLegend
+                    controller={hudController}
                     paneId={paneId}
-                    category="overlay"
-                    values={displayIndicatorValues}
                     precision={pricePrecision}
                   />
                 </div>
@@ -3285,22 +4094,22 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
                         left: '12px',
                       }}
                     >
-                      <IndicatorLegendItem
+                      <ChartSubpaneLegendItem
+                        controller={hudController}
                         paneId={paneId}
                         indicator={ind}
-                        values={displayIndicatorValues[ind.id] || {}}
                         precision={pricePrecision}
                       />
                     </div>
 
                     {/* Sub-pane Action Controls Toolbar */}
                     <div
-                      className={`absolute ${isGrid ? 'right-20' : 'right-14'} z-30 flex items-center gap-0.5 rounded px-1 py-0.5 shadow backdrop-blur-xs select-none transition-opacity ${
+                      className={`absolute ${isGrid ? 'right-20' : 'right-14'} z-30 flex items-center gap-0.5 rounded px-1 py-0.5 shadow select-none transition-opacity ${
                         isThisPaneCollapsing ? 'opacity-30' : 'opacity-100'
                       } ${
                         isLightCanvas
-                          ? 'bg-white/90 hover:bg-white border border-black/10 text-[#434651]'
-                          : 'bg-[#1e222d]/85 hover:bg-[#1e222d] border border-[#2a2e39] text-[#787b86]'
+                          ? 'bg-white/95 hover:bg-white border border-black/10 text-[#434651]'
+                          : 'bg-[#1e222d]/95 hover:bg-[#1e222d] border border-[#2a2e39] text-[#787b86]'
                       }`}
                       style={{
                         top: `${topOffset + 6}px`,
@@ -3408,7 +4217,6 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
             {subpaneIndicators
               .filter((ind) => collapsedPanes.has(ind.id))
               .map((ind) => {
-                const values = displayIndicatorValues?.[ind.id] || {};
                 const inputsStr =
                   isVolumeIndicatorType(ind.type)
                     ? ind.inputs?.showMa
@@ -3427,7 +4235,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
                       e.stopPropagation();
                       toggleCollapsePane(ind.id);
                     }}
-                    className={`w-full h-[22px] px-3 border-t flex items-center justify-between text-[11px] font-sans select-none cursor-pointer transition-colors group backdrop-blur-xs ${
+                    className={`w-full h-[22px] px-3 border-t flex items-center justify-between text-[11px] font-sans select-none cursor-pointer transition-colors group ${
                       isLightCanvas
                         ? 'bg-white/95 hover:bg-white border-black/10 text-[#131722]'
                         : 'bg-[#131722]/95 hover:bg-[#1e222d] border-[#2a2e39] text-[#d1d4dc]'
@@ -3454,27 +4262,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
                           {inputsStr}
                         </span>
                       )}
-                      <div className="flex items-center space-x-2 font-mono tabular-nums text-[11px] truncate">
-                        {Object.entries(values).map(([plotKey, val]) => {
-                          const style = ind.styles[plotKey];
-                          const color = style?.color || '#2962ff';
-                          const formatted =
-                            val !== null && val !== undefined && !isNaN(val)
-                              ? isVolumeIndicatorType(ind.type) && plotKey === 'vol'
-                                ? Math.abs(val) >= 1_000_000
-                                  ? (val / 1_000_000).toFixed(2) + 'M'
-                                  : Math.abs(val) >= 1_000
-                                  ? (val / 1_000).toFixed(2) + 'K'
-                                  : Math.round(val).toLocaleString()
-                                : val.toFixed(2)
-                              : '—';
-                          return (
-                            <span key={plotKey} style={{ color }}>
-                              {formatted}
-                            </span>
-                          );
-                        })}
-                      </div>
+                      <ChartCollapsedIndicatorValues controller={hudController} indicator={ind} />
                     </div>
 
                     {/* Right: Restore, Maximize, and Delete controls */}
@@ -3535,7 +4323,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
 
         {/* Separator Drag Auto-Collapse Snap Badge */}
         {pendingCollapseIndicatorId && (
-          <div className="absolute bottom-12 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 bg-[#1e222d] border border-[#2962ff] shadow-xl shadow-[#2962ff]/30 px-3.5 py-1.5 rounded-full text-xs text-white pointer-events-none select-none backdrop-blur-md animate-pulse">
+          <div className="absolute bottom-12 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 bg-[#1e222d] border border-[#2962ff] shadow-xl shadow-[#2962ff]/30 px-3.5 py-1.5 rounded-full text-xs text-white pointer-events-none select-none animate-pulse">
             <Minus className="w-3.5 h-3.5 text-[#2962ff]" />
             <span>
               Release to collapse{' '}
@@ -3552,8 +4340,8 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
             collapsedPanes.size > 0 && maximizedPaneIndex === null
               ? 'bottom-[52px]'
               : 'bottom-[34px]'
-          } left-3 z-30 flex items-center space-x-1.5 px-2 py-1 rounded bg-[#131722]/85 backdrop-blur-md border border-[#2a2e39] hover:border-[#2962ff] transition-all select-none pointer-events-auto cursor-pointer group shadow-lg`}
-          title="OrderCraft — Powered by TradingView Lightweight Charts™"
+          } left-3 z-30 flex items-center space-x-1.5 px-2 py-1 rounded bg-[#131722]/95 border border-[#2a2e39] hover:border-[#2962ff] transition-all select-none pointer-events-auto cursor-pointer group shadow-lg`}
+          title="OrderCraft"
         >
           <img
             src="/logo.png"
@@ -3567,7 +4355,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
 
         {/* Loading overlay */}
         {isLoading && (
-          <div className="absolute inset-0 bg-[#131722]/60 backdrop-blur-[1px] flex items-center justify-center z-20">
+          <div className="absolute inset-0 bg-[#131722]/75 flex items-center justify-center z-20">
             <div className="flex items-center space-x-2 text-xs text-[#d1d4dc]">
               <div className="w-3.5 h-3.5 border-2 border-[#2962ff] border-t-transparent rounded-full animate-spin" />
               <span>Streaming {symbol} ({timeframe})...</span>
@@ -3717,7 +4505,7 @@ export const ChartPane: React.FC<ChartPaneProps> = ({
                     setTzSearchQuery('');
                   }}
                 />
-                <div className="absolute bottom-8 right-0 w-80 bg-[#1e222d] border border-[#2a2e39] rounded-lg shadow-2xl py-1 z-50 text-xs backdrop-blur-md overflow-hidden animate-in fade-in zoom-in-95 duration-100">
+                <div className="absolute bottom-8 right-0 w-80 bg-[#1e222d] border border-[#2a2e39] rounded-lg shadow-2xl py-1 z-50 text-xs overflow-hidden animate-in fade-in zoom-in-95 duration-100">
                   <div className="px-3 py-1.5 text-[10px] font-semibold text-[#787b86] border-b border-[#2a2e39] uppercase tracking-wider flex items-center justify-between">
                     <span>Select Timezone (Syncs X-Axis)</span>
                     <span className="font-mono text-[9px] text-[#2962ff]">{ALL_TIMEZONES.length} zones</span>

@@ -21,7 +21,8 @@ import {
   Link2,
   Star,
 } from 'lucide-react';
-import { useSyncStore } from '../../store/syncStore';
+import { useShallow } from 'zustand/react/shallow';
+import { useSyncStore, createDefaultVolumeIndicator } from '../../store/syncStore';
 import type { DrawingToolType, CursorType } from '../../store/syncStore';
 import {
   CrossCursorIcon,
@@ -67,14 +68,38 @@ export const LeftDrawingBar: React.FC = () => {
     isObjectTreeOpen,
     toggleObjectTree,
     activePaneId,
-    panes,
     syncDrawingsAcrossCharts,
     toggleSyncDrawingsAcrossCharts,
     favoriteDrawingTools,
     toggleFavoriteDrawingTool,
     showFavoriteDrawingsBar,
     toggleShowFavoriteDrawingsBar,
-  } = useSyncStore();
+  } = useSyncStore(
+    useShallow((s) => ({
+      activeTool: s.activeTool,
+      setActiveTool: s.setActiveTool,
+      cursorType: s.cursorType,
+      setCursorType: s.setCursorType,
+      magnetMode: s.magnetMode,
+      setMagnetMode: s.setMagnetMode,
+      drawingsLocked: s.drawingsLocked,
+      toggleDrawingsLocked: s.toggleDrawingsLocked,
+      drawingsHidden: s.drawingsHidden,
+      toggleDrawingsHidden: s.toggleDrawingsHidden,
+      clearDrawings: s.clearDrawings,
+      drawings: s.drawings,
+      symbol: s.symbol,
+      isObjectTreeOpen: s.isObjectTreeOpen,
+      toggleObjectTree: s.toggleObjectTree,
+      activePaneId: s.activePaneId,
+      syncDrawingsAcrossCharts: s.syncDrawingsAcrossCharts,
+      toggleSyncDrawingsAcrossCharts: s.toggleSyncDrawingsAcrossCharts,
+      favoriteDrawingTools: s.favoriteDrawingTools,
+      toggleFavoriteDrawingTool: s.toggleFavoriteDrawingTool,
+      showFavoriteDrawingsBar: s.showFavoriteDrawingsBar,
+      toggleShowFavoriteDrawingsBar: s.toggleShowFavoriteDrawingsBar,
+    }))
+  );
 
   const [openGroup, setOpenGroup] = useState<string | null>(null);
   const [lastActiveMagnetMode, setLastActiveMagnetMode] = useState<'weak' | 'strong'>('weak');
@@ -97,8 +122,8 @@ export const LeftDrawingBar: React.FC = () => {
   const containerRef = useRef<HTMLElement>(null);
 
   const currentPaneId = activePaneId || 'pane-1';
-  const activePane = panes[currentPaneId];
-  const activeSymbol = activePane?.symbol || symbol;
+  const activePaneSymbol = useSyncStore((s) => s.panes[currentPaneId]?.symbol);
+  const activeSymbol = activePaneSymbol || symbol;
   // Count drawings that belong to the active/selected chart
   const activeChartDrawings = drawings.filter((d) => {
     if (d.symbol && d.symbol !== activeSymbol) return false;
@@ -108,8 +133,10 @@ export const LeftDrawingBar: React.FC = () => {
   });
 
   const drawingsCount = activeChartDrawings.length;
-  const indicatorsMap = useSyncStore((s) => s.indicators);
-  const paneIndicators = indicatorsMap[currentPaneId] || [];
+  const rawPaneIndicators = useSyncStore((s) => s.indicators[currentPaneId]);
+  const paneIndicators = rawPaneIndicators !== undefined
+    ? rawPaneIndicators
+    : [createDefaultVolumeIndicator(currentPaneId)];
   const indicatorsCount = paneIndicators.length;
 
   const toggleMagnet = () => {

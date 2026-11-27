@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { X, ChevronDown, ChevronUp, Trash2, Check } from 'lucide-react';
+import { X, ChevronDown, ChevronUp, Check } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import { useSyncStore } from '../../store/syncStore';
 import type { ChartVisualSettings } from '../../store/syncStore';
-import { ALL_TIMEZONES } from '../ChartPane/ChartPane';
+import { ALL_TIMEZONES } from '../../utils/timezones';
 import { chartTemplateManager, type ChartTemplate } from '../../templates/ChartTemplateManager';
 import { SaveChartTemplateModal } from './SaveChartTemplateModal';
 import { DeleteChartTemplateModal } from './DeleteChartTemplateModal';
@@ -221,21 +222,31 @@ export const ChartSettingsModal: React.FC<ChartSettingsModalProps> = ({ isOpen, 
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [isTemplateMenuOpen]);
 
+  const resolvedPaneId = useSyncStore(
+    (s) => s.targetSettingsPaneId || s.activePaneId || 'pane-1'
+  );
+  const targetPane = useSyncStore((s) => s.panes[resolvedPaneId]);
   const {
     timezone,
     setTimezone,
     chartSettings,
-    panes,
-    activePaneId,
-    targetSettingsPaneId,
     updatePaneSettings,
     updatePaneConfig,
     applySettingsToAllPanes,
-  } = useSyncStore();
+    commitSnapshot,
+  } = useSyncStore(
+    useShallow((s) => ({
+      timezone: s.timezone,
+      setTimezone: s.setTimezone,
+      chartSettings: s.chartSettings,
+      updatePaneSettings: s.updatePaneSettings,
+      updatePaneConfig: s.updatePaneConfig,
+      applySettingsToAllPanes: s.applySettingsToAllPanes,
+      commitSnapshot: s.commitSnapshot,
+    }))
+  );
 
-  // Identify target pane: opened from context menu (targetSettingsPaneId) or active chart (activePaneId)
-  const resolvedPaneId = targetSettingsPaneId || activePaneId || 'pane-1';
-  const targetPane = panes[resolvedPaneId];
+  // Identify target pane settings & timezone
   const targetSettings = targetPane?.settings || chartSettings;
   const targetTimezone = targetPane?.timezone || timezone;
 
@@ -395,11 +406,11 @@ export const ChartSettingsModal: React.FC<ChartSettingsModalProps> = ({ isOpen, 
     };
   }, [isDragging]);
 
-  // Live update target chart immediately on change (live direct apply!)
+  // Live update target chart immediately on change without flooding undo history
   const handleUpdate = (partial: Partial<ChartVisualSettings>) => {
     setLocalSettings((prev) => {
       const next = { ...prev, ...partial };
-      updatePaneSettings(resolvedPaneId, next);
+      updatePaneSettings(resolvedPaneId, next, true);
       return next;
     });
   };
@@ -410,9 +421,9 @@ export const ChartSettingsModal: React.FC<ChartSettingsModalProps> = ({ isOpen, 
     updatePaneConfig(resolvedPaneId, { timezone: val });
   };
 
-  // Revert to snapshot on Cancel
+  // Revert to snapshot on Cancel (skipHistory so cancel never adds an undo step)
   const handleCancel = () => {
-    updatePaneSettings(resolvedPaneId, initialSettingsRef.current);
+    updatePaneSettings(resolvedPaneId, initialSettingsRef.current, true);
     if (initialTimezoneRef.current) {
       updatePaneConfig(resolvedPaneId, { timezone: initialTimezoneRef.current });
     }
@@ -434,14 +445,21 @@ export const ChartSettingsModal: React.FC<ChartSettingsModalProps> = ({ isOpen, 
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isOpen]);
 
-  // Confirm current settings and close
+  // Confirm current settings with a single clean undo snapshot
   const handleOk = () => {
-    updatePaneSettings(resolvedPaneId, localSettings);
+    const changed =
+      JSON.stringify(localSettings) !== JSON.stringify(initialSettingsRef.current);
+    if (changed) {
+      updatePaneSettings(resolvedPaneId, initialSettingsRef.current, true);
+      commitSnapshot('change chart settings');
+      updatePaneSettings(resolvedPaneId, localSettings, true);
+    }
     onClose();
   };
 
   // Apply to all charts in the layout
   const handleApplyToAll = () => {
+    updatePaneSettings(resolvedPaneId, initialSettingsRef.current, true);
     applySettingsToAllPanes(localSettings);
     if (localTimezone !== timezone) {
       setTimezone(localTimezone);
@@ -449,11 +467,11 @@ export const ChartSettingsModal: React.FC<ChartSettingsModalProps> = ({ isOpen, 
     onClose();
   };
 
-  // Apply defaults live
+  // Apply defaults live (skipHistory during modal edit; committed on Ok)
   const handleApplyDefaults = () => {
     const def = chartTemplateManager.resetToDefaults();
     setLocalSettings(def);
-    updatePaneSettings(resolvedPaneId, def);
+    updatePaneSettings(resolvedPaneId, def, true);
     setActiveTemplateId('ctmpl_dark_pro');
     setIsTemplateMenuOpen(false);
   };
@@ -461,7 +479,7 @@ export const ChartSettingsModal: React.FC<ChartSettingsModalProps> = ({ isOpen, 
   const handleApplyTemplate = (tmpl: ChartTemplate) => {
     const applied = chartTemplateManager.applyTemplate(localSettings, tmpl);
     setLocalSettings(applied);
-    updatePaneSettings(resolvedPaneId, applied);
+    updatePaneSettings(resolvedPaneId, applied, true);
     setActiveTemplateId(tmpl.id);
     setIsTemplateMenuOpen(false);
   };
@@ -1044,24 +1062,16 @@ export const ChartSettingsModal: React.FC<ChartSettingsModalProps> = ({ isOpen, 
                     {/* Previous Day Close */}
                     <div className="flex items-center justify-between">
                       <span className="text-[#d1d4dc]">Previous day close</span>
-                      <div className="flex items-center space-x-2">
-                        <ProSelect
-                          value={localSettings.previousDayCloseMode}
-                          onChange={(val) => handleUpdate({ previousDayCloseMode: val })}
-                          options={[
-                            { value: 'Hidden', label: 'Hidden' },
-                            { value: 'Value, line', label: 'Value, line' },
-                            { value: 'Line only', label: 'Line only' },
-                          ]}
-                          width="w-44"
-                        />
-                        <ProColorSwatch
-                          color="#787b86"
-                          onChange={() => {}}
-                          showLine
-                          title="Previous day close color"
-                        />
-                      </div>
+                      <ProSelect
+                        value={localSettings.previousDayCloseMode}
+                        onChange={(val) => handleUpdate({ previousDayCloseMode: val })}
+                        options={[
+                          { value: 'Hidden', label: 'Hidden' },
+                          { value: 'Value, line', label: 'Value, line' },
+                          { value: 'Line only', label: 'Line only' },
+                        ]}
+                        width="w-44"
+                      />
                     </div>
 
                     {/* Indicators and Financials */}
@@ -1082,52 +1092,31 @@ export const ChartSettingsModal: React.FC<ChartSettingsModalProps> = ({ isOpen, 
                     {/* High and Low */}
                     <div className="flex items-center justify-between">
                       <span className="text-[#d1d4dc]">High and low</span>
-                      <div className="flex items-center space-x-2">
-                        <ProSelect
-                          value={localSettings.highLowPriceScaleMode}
-                          onChange={(val) => handleUpdate({ highLowPriceScaleMode: val })}
-                          options={[
-                            { value: 'Hidden', label: 'Hidden' },
-                            { value: 'Value, line', label: 'Value, line' },
-                            { value: 'Line only', label: 'Line only' },
-                          ]}
-                          width="w-44"
-                        />
-                        <ProColorSwatch
-                          color="#089981"
-                          splitColor="#f23645"
-                          onChange={() => {}}
-                          showLine
-                          title="High/Low lines"
-                        />
-                      </div>
+                      <ProSelect
+                        value={localSettings.highLowPriceScaleMode}
+                        onChange={(val) => handleUpdate({ highLowPriceScaleMode: val })}
+                        options={[
+                          { value: 'Hidden', label: 'Hidden' },
+                          { value: 'Value, line', label: 'Value, line' },
+                          { value: 'Line only', label: 'Line only' },
+                        ]}
+                        width="w-44"
+                      />
                     </div>
 
                     {/* Bid and Ask */}
                     <div className="flex items-center justify-between">
                       <span className="text-[#d1d4dc]">Bid and ask</span>
-                      <div className="flex items-center space-x-2">
-                        <ProSelect
-                          value={localSettings.bidAskPriceScaleMode}
-                          onChange={(val) => handleUpdate({ bidAskPriceScaleMode: val })}
-                          options={[
-                            { value: 'Hidden', label: 'Hidden' },
-                            { value: 'Value, line', label: 'Value, line' },
-                            { value: 'Line only', label: 'Line only' },
-                          ]}
-                          width="w-44"
-                        />
-                        <ProColorSwatch
-                          color="#2962ff"
-                          onChange={() => {}}
-                          title="Bid price color"
-                        />
-                        <ProColorSwatch
-                          color="#f23645"
-                          onChange={() => {}}
-                          title="Ask price color"
-                        />
-                      </div>
+                      <ProSelect
+                        value={localSettings.bidAskPriceScaleMode}
+                        onChange={(val) => handleUpdate({ bidAskPriceScaleMode: val })}
+                        options={[
+                          { value: 'Hidden', label: 'Hidden' },
+                          { value: 'Value, line', label: 'Value, line' },
+                          { value: 'Line only', label: 'Line only' },
+                        ]}
+                        width="w-44"
+                      />
                     </div>
                   </div>
                 </div>
@@ -1597,18 +1586,6 @@ export const ChartSettingsModal: React.FC<ChartSettingsModalProps> = ({ isOpen, 
                             {activeTemplateId === tmpl.id && (
                               <Check size={12} className="text-[#2962ff]" />
                             )}
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setIsTemplateMenuOpen(false);
-                                setTemplateToDelete(tmpl);
-                              }}
-                              className="p-1 rounded text-[#787b86] hover:text-[#f23645] hover:bg-[#363a45] transition-colors cursor-pointer"
-                              title={`Delete ${tmpl.name}`}
-                            >
-                              <Trash2 size={13} />
-                            </button>
                           </div>
                         </div>
                       ))}
@@ -1635,18 +1612,6 @@ export const ChartSettingsModal: React.FC<ChartSettingsModalProps> = ({ isOpen, 
                             {activeTemplateId === tmpl.id && (
                               <Check size={12} className="text-[#2962ff]" />
                             )}
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setIsTemplateMenuOpen(false);
-                                setTemplateToDelete(tmpl);
-                              }}
-                              className="p-1 rounded text-[#787b86] hover:text-[#f23645] hover:bg-[#363a45] transition-colors cursor-pointer"
-                              title={`Delete ${tmpl.name}`}
-                            >
-                              <Trash2 size={13} />
-                            </button>
                           </div>
                         </div>
                       ))}

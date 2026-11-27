@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
   Newspaper,
   ExternalLink,
@@ -8,15 +8,8 @@ import {
   Globe,
 } from 'lucide-react';
 import { useSyncStore } from '../../../store/syncStore';
-
-interface NewsArticle {
-  title: string;
-  link: string;
-  pubDate: string;
-  source: string;
-  description: string;
-  publishedAt?: number;
-}
+import { transport, type NewsArticle } from '../../../transport/client';
+import { safeExternalHref } from '../../../utils/url';
 
 export const NewsFlowPanel: React.FC = () => {
   const [articles, setArticles] = useState<NewsArticle[]>([]);
@@ -28,50 +21,66 @@ export const NewsFlowPanel: React.FC = () => {
   const watchlists = useSyncStore((s) => s.watchlists);
   const activeWatchlistId = useSyncStore((s) => s.activeWatchlistId);
 
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const spinTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current?.abort();
+      if (spinTimerRef.current !== null) {
+        window.clearTimeout(spinTimerRef.current);
+      }
+    };
+  }, []);
+
   // Extract symbols from the active watchlist for the Watchlist news feed
   const activeWatchlistSymbols = useMemo(() => {
     const activeList = watchlists.find((w) => w.id === activeWatchlistId) || watchlists[0];
     if (!activeList || !Array.isArray(activeList.items)) return [];
     return activeList.items
-      .map((it) => it.symbol.replace(/^[^:]+:/, '').replace(/[-_]?(USD|USDT)$/i, ''))
+      .map((it) => it.symbol)
+      .filter((sym) => Boolean(sym) && !sym.endsWith('_SECTION'))
+      .map((sym) => sym.replace(/^[^:]+:/, '').replace(/[-_]?(USD|USDT)$/i, ''))
       .filter(Boolean)
       .slice(0, 5);
   }, [watchlists, activeWatchlistId]);
 
-  const fetchNews = async (force = false) => {
-    if (force) {
-      setIsRefreshing(true);
-    } else {
-      setLoading(true);
-    }
+  const fetchNews = useCallback(
+    async (force = false, searchOverride?: string) => {
+      abortControllerRef.current?.abort();
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
 
-    const startTime = Date.now();
-    try {
-      let endpoint = '/api/news';
-      const params: string[] = [];
-
-      if (customSearch.trim()) {
-        params.push(`q=${encodeURIComponent(customSearch.trim())}`);
-      } else if (feedMode === 'watchlist') {
-        const query = activeWatchlistSymbols.length > 0
-          ? activeWatchlistSymbols.join(' OR ')
-          : 'stocks crypto markets';
-        params.push(`q=${encodeURIComponent(query)}`);
+      if (spinTimerRef.current !== null) {
+        window.clearTimeout(spinTimerRef.current);
+        spinTimerRef.current = null;
       }
 
       if (force) {
-        params.push('refresh=true');
-        params.push(`_t=${Date.now()}`);
+        setIsRefreshing(true);
+      } else {
+        setLoading(true);
       }
 
-      if (params.length > 0) {
-        endpoint += `?${params.join('&')}`;
-      }
+      const startTime = Date.now();
+      try {
+        const activeQueryText = searchOverride !== undefined ? searchOverride : customSearch;
+        let query: string | undefined;
+        if (activeQueryText.trim()) {
+          query = activeQueryText.trim();
+        } else if (feedMode === 'watchlist') {
+          query =
+            activeWatchlistSymbols.length > 0
+              ? activeWatchlistSymbols.join(' OR ')
+              : 'stocks crypto markets';
+        }
 
-      const resp = await fetch(endpoint);
-      if (resp.ok) {
-        const data = await resp.json();
-        const rawArticles: NewsArticle[] = data.articles || [];
+        const rawArticles = await transport.getNews({
+          query,
+          refresh: force,
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) return;
 
         // Filter out news older than 5 days and sort strictly by newest first
         const nowMs = Date.now();
@@ -89,22 +98,27 @@ export const NewsFlowPanel: React.FC = () => {
           });
 
         setArticles(sorted.length > 0 ? sorted : rawArticles);
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') return;
+        console.warn('Failed to fetch news from backend:', err);
+      } finally {
+        if (!controller.signal.aborted) {
+          const elapsed = Date.now() - startTime;
+          const minSpinDelay = force ? Math.max(0, 450 - elapsed) : 0;
+          spinTimerRef.current = window.setTimeout(() => {
+            setLoading(false);
+            setIsRefreshing(false);
+            spinTimerRef.current = null;
+          }, minSpinDelay);
+        }
       }
-    } catch (err) {
-      console.warn('Failed to fetch news from backend:', err);
-    } finally {
-      const elapsed = Date.now() - startTime;
-      const minSpinDelay = force ? Math.max(0, 450 - elapsed) : 0;
-      setTimeout(() => {
-        setLoading(false);
-        setIsRefreshing(false);
-      }, minSpinDelay);
-    }
-  };
+    },
+    [customSearch, feedMode, activeWatchlistSymbols]
+  );
 
   useEffect(() => {
     fetchNews(false);
-  }, [feedMode]);
+  }, [feedMode, fetchNews]);
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -199,7 +213,7 @@ export const NewsFlowPanel: React.FC = () => {
             type="button"
             onClick={() => {
               setCustomSearch('');
-              fetchNews(true);
+              fetchNews(true, '');
             }}
             className="text-[#787b86] hover:text-white cursor-pointer"
           >
@@ -223,7 +237,7 @@ export const NewsFlowPanel: React.FC = () => {
           articles.map((article, idx) => (
             <a
               key={article.link || idx}
-              href={article.link}
+              href={safeExternalHref(article.link)}
               target="_blank"
               rel="noopener noreferrer"
               className="block p-3 bg-[#181b27]/60 hover:bg-[#1e222d] border border-[#2a2e39]/50 rounded-lg transition-colors group cursor-pointer"

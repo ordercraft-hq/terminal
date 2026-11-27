@@ -34,8 +34,36 @@ import {
   transport,
   type Candle,
   type IndicatorEvalResponsePayload,
+  type IndicatorStreamUpdate,
 } from '../transport/client';
 import type { ChartVisualSettings } from '../store/syncStore';
+
+const MAX_CACHED_CANDLES = 5000;
+
+function isIndicatorVisibleOnTimeframe(ind: IndicatorInstance, timeframe: string): boolean {
+  const vis = ind.visibility;
+  if (!vis) return true;
+  const rawTf = (timeframe || '').trim();
+  const tf = rawTf.toLowerCase();
+  if (tf.endsWith('t')) return vis.ticks !== false;
+  if (tf.endsWith('s')) return vis.seconds !== false;
+  if (tf.endsWith('h')) return vis.hours !== false;
+  if (tf.endsWith('d')) return vis.days !== false;
+  if (tf.endsWith('w') || rawTf === '1M' || rawTf === 'M' || tf.includes('mo')) return vis.weeks !== false;
+  if (tf.endsWith('m') || (!isNaN(Number(tf)) && Number(tf) > 0)) return vis.minutes !== false;
+  return true;
+}
+
+function stableSerialize(value: unknown): string {
+  if (value === null || value === undefined) return String(value);
+  if (typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableSerialize(item)).join(',')}]`;
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableSerialize(obj[k])}`).join(',')}}`;
+}
 
 export function isVolumeIndicatorType(type: string): boolean {
   return type === 'volume' || type === 'wickra.volume';
@@ -84,6 +112,11 @@ export interface ManagedIndicatorEntry {
   latestValues: Record<string, number | null>;
   cachedPlots: Record<string, IndicatorPlotDataPoint[]>;
   markers: Map<string, SeriesMarker<Time>[]>;
+  autoscaleProviders: Map<string, AutoscaleInfoProvider>;
+  latestIndicator?: IndicatorInstance;
+  levelsSignature?: string;
+  priceLinesHost?: ISeriesApi<SeriesType, Time>;
+  appliedStyleSignatures?: Record<string, string>;
 }
 
 export interface EvalIndicatorInstancePayload {
@@ -120,11 +153,13 @@ export class UniversalIndicatorConnector {
   private lastCandles: Candle[] = [];
   private mainPaneIndex: number = 0;
 
-  // WebSocket real-time streaming state
-  private ws: WebSocket | null = null;
-  private isWsConnecting = false;
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private pendingWsResubscribe = false;
+  // Multiplexed WebSocket real-time streaming state & eval dirty tracking
+  private streamUnsubscribe: (() => void) | null = null;
+  private activeStreamSubKey = '';
+  private streamRafId: number | null = null;
+  private pendingStreamUpdates: Map<number, Record<string, Record<string, number>>> = new Map();
+  private lastEvalKeyMap: Map<string, string> = new Map();
+  private lastEvalCandlesSig = '';
   private isDestroyed = false;
   private evalEpoch = 0;
   private hudUpdateTimer: ReturnType<typeof setTimeout> | null = null;
@@ -147,24 +182,19 @@ export class UniversalIndicatorConnector {
   public updateContext(symbol: string, resolution: string): void {
     const symbolChanged = this.symbol !== symbol;
     const resChanged = this.resolution !== resolution;
-    const oldSymbol = this.symbol;
-    const oldResolution = this.resolution;
     this.symbol = symbol;
     this.resolution = resolution;
 
     if (symbolChanged || resChanged) {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.cancelPendingStreamBatch();
+      if (this.streamUnsubscribe) {
         try {
-          this.ws.send(
-            JSON.stringify({
-              action: 'unsubscribe',
-              symbol: oldSymbol,
-              resolution: oldResolution,
-            })
-          );
+          this.streamUnsubscribe();
         } catch {}
+        this.streamUnsubscribe = null;
       }
-      this.resubscribeWs();
+      this.activeStreamSubKey = '';
+      this.lastEvalCandlesSig = '';
     }
   }
 
@@ -268,7 +298,8 @@ export class UniversalIndicatorConnector {
   }
 
   /**
-   * Synchronizes indicator definitions, subpanes, series, and triggers off-thread calculation.
+   * Synchronizes indicator definitions, subpanes, series, and triggers off-thread calculation
+   * only when indicator type/inputs or underlying candles change.
    */
   public async syncIndicators(
     indicators: IndicatorInstance[],
@@ -281,35 +312,25 @@ export class UniversalIndicatorConnector {
     if (this.isDestroyed || !this.chart) return;
 
     this.currentIndicators = [...indicators];
-    this.lastCandles = [...candles];
+    this.lastCandles =
+      candles.length > MAX_CACHED_CANDLES ? candles.slice(-MAX_CACHED_CANDLES) : [...candles];
 
     // 1. Remove deleted indicators
     const currentIds = new Set(indicators.map((ind) => ind.id));
-    const deletedIds: string[] = [];
+    let anyDeleted = false;
     for (const [id, entry] of Array.from(this.managed.entries())) {
       if (!currentIds.has(id)) {
-        deletedIds.push(id);
+        anyDeleted = true;
         this.cleanupEntry(entry);
         this.managed.delete(id);
+        this.lastEvalKeyMap.delete(id);
       }
     }
-    if (deletedIds.length > 0) {
+    if (anyDeleted) {
       this.evalEpoch++;
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        try {
-          this.ws.send(
-            JSON.stringify({
-              action: 'unsubscribe',
-              symbol: this.symbol,
-              resolution: this.resolution,
-              instanceIds: deletedIds,
-            })
-          );
-        } catch {}
-      }
     }
 
-    // 2. Adjust chart subpanes layout
+    // 2. Adjust chart subpanes layout (remove empty panes, add missing panes)
     const currentSubpaneIds = new Set(
       indicators.filter((i) => i.category === 'subpane').map((i) => i.id)
     );
@@ -339,12 +360,78 @@ export class UniversalIndicatorConnector {
         this.chart.addPane();
         panesChanged = true;
       }
+    } catch (err) {
+      console.warn('[UniversalIndicatorConnector] Pane setup error:', err);
+    }
+
+    const mainVIdx = nextOrder.indexOf('main') !== -1 ? nextOrder.indexOf('main') : 0;
+    this.mainPaneIndex = mainVIdx;
+
+    const paneAssignment = new Map<string, number>();
+    for (const ind of indicators) {
+      if (ind.category === 'overlay') {
+        paneAssignment.set(ind.id, mainVIdx);
+      } else {
+        const vIdx = nextOrder.indexOf(ind.id);
+        paneAssignment.set(ind.id, vIdx !== -1 ? vIdx : 1);
+      }
+    }
+
+    // 3. Allocate/reconcile series structure for each active indicator (using moveToPane when pane changed)
+    for (const ind of indicators) {
+      const targetPane = paneAssignment.get(ind.id) ?? mainVIdx;
+      let entry = this.managed.get(ind.id);
+      let paneChanged = false;
+
+      if (entry && entry.indicatorId !== ind.type) {
+        this.cleanupEntry(entry);
+        entry = undefined;
+      }
+
+      if (!entry) {
+        entry = {
+          instanceId: ind.id,
+          indicatorId: ind.type,
+          paneIndex: targetPane,
+          series: new Map(),
+          bands: new Map(),
+          bandAttachedSeries: new Map(),
+          footprints: new Map(),
+          priceLines: [],
+          latestValues: {},
+          cachedPlots: {},
+          markers: new Map(),
+          autoscaleProviders: new Map(),
+          latestIndicator: ind,
+          appliedStyleSignatures: {},
+        };
+        this.managed.set(ind.id, entry);
+      } else {
+        entry.latestIndicator = ind;
+        if (entry.paneIndex !== targetPane) {
+          paneChanged = true;
+          for (const s of entry.series.values()) {
+            try {
+              if (typeof s.moveToPane === 'function') {
+                s.moveToPane(targetPane);
+              }
+            } catch {}
+          }
+          entry.paneIndex = targetPane;
+        }
+      }
+
+      this.ensureIndicatorSeries(ind, entry, targetPane, mainVIdx, chartSettings, paneChanged);
+      this.syncLevels(ind, entry, chartSettings);
+      this.syncBands(ind, entry);
+    }
+
+    // Remove any remaining excess panes after series have been moved to target panes
+    try {
       while (this.chart.panes().length > requiredPanes && this.chart.panes().length > 1) {
         this.chart.removePane(this.chart.panes().length - 1);
         panesChanged = true;
       }
-      const mainVIdx = nextOrder.indexOf('main') !== -1 ? nextOrder.indexOf('main') : 0;
-      this.mainPaneIndex = mainVIdx;
 
       this.chart.panes().forEach((_, pIdx) => {
         this.chart.priceScale('right', pIdx).applyOptions({
@@ -379,55 +466,70 @@ export class UniversalIndicatorConnector {
         this.options.onPanesAdjusted?.();
       }
     } catch (err) {
-      console.warn('[UniversalIndicatorConnector] Pane adjustment error:', err);
+      console.warn('[UniversalIndicatorConnector] Pane finalization error:', err);
     }
 
-    const mainVIdx = this.mainPaneIndex;
-    const paneAssignment = new Map<string, number>();
-    for (const ind of indicators) {
-      if (ind.category === 'overlay') {
-        paneAssignment.set(ind.id, mainVIdx);
-      } else {
-        const vIdx = nextOrder.indexOf(ind.id);
-        paneAssignment.set(ind.id, vIdx !== -1 ? vIdx : 1);
-      }
-    }
-
-    // 3. Allocate/reconcile series structure for each active indicator
-    for (const ind of indicators) {
-      const targetPane = paneAssignment.get(ind.id) ?? mainVIdx;
-      let entry = this.managed.get(ind.id);
-
-      if (!entry || entry.paneIndex !== targetPane) {
-        if (entry) {
-          this.cleanupEntry(entry);
-        }
-        entry = {
-          instanceId: ind.id,
-          indicatorId: ind.type,
-          paneIndex: targetPane,
-          series: new Map(),
-          bands: new Map(),
-          bandAttachedSeries: new Map(),
-          footprints: new Map(),
-          priceLines: [],
-          latestValues: {},
-          cachedPlots: {},
-          markers: new Map(),
-        };
-        this.managed.set(ind.id, entry);
-      }
-
-      this.ensureIndicatorSeries(ind, entry, targetPane, mainVIdx, chartSettings);
-      this.syncLevels(ind, entry, chartSettings);
-      this.syncBands(ind, entry);
-    }
-
-    // 4. Ingest and calculate off-thread
+    // 4. Evaluate off-thread only for indicators whose type/inputs or candles changed;
+    // style/visibility/band/level-only edits are applied strictly client-side.
     await this.evaluateOffThread(candles);
 
-    // 5. Connect/resubscribe WebSocket streaming stream
-    this.ensureWsConnection();
+    // 5. Connect/resubscribe shared multiplexed WebSocket streaming stream
+    this.resubscribeStream();
+  }
+
+  private getOrCreateAutoscaleProvider(
+    entry: ManagedIndicatorEntry,
+    plotId: string
+  ): AutoscaleInfoProvider {
+    const existing = entry.autoscaleProviders.get(plotId);
+    if (existing) return existing;
+
+    const provider: AutoscaleInfoProvider = (
+      original: () => AutoscaleInfo | null
+    ): AutoscaleInfo | null => {
+      const res = original();
+      let min = res?.priceRange ? res.priceRange.minValue : Infinity;
+      let max = res?.priceRange ? res.priceRange.maxValue : -Infinity;
+
+      // 1. Expand range to include indicator reference levels (e.g. RSI 70/30, Stoch 80/20)
+      const levels = entry.latestIndicator?.levels;
+      if (levels && levels.length > 0) {
+        for (const lvl of levels) {
+          if (lvl.visible !== false && typeof lvl.value === 'number' && Number.isFinite(lvl.value)) {
+            if (lvl.value < min) min = lvl.value;
+            if (lvl.value > max) max = lvl.value;
+          }
+        }
+      }
+
+      // 2. Expand range to guarantee indicator last value is always centered and in view
+      const latestVal = entry.latestValues[plotId];
+      if (typeof latestVal === 'number' && Number.isFinite(latestVal)) {
+        if (latestVal < min) min = latestVal;
+        if (latestVal > max) max = latestVal;
+      }
+
+      // 3. Fallback if no valid points, levels, or latest values exist yet
+      if (min === Infinity || max === -Infinity) {
+        if (res && res.priceRange) return res;
+        return null;
+      }
+
+      // 4. Handle flat/degenerate zero-height ranges (e.g. constant line or single point)
+      if (min === max) {
+        const pad = min !== 0 ? Math.abs(min) * 0.05 : 1;
+        min -= pad;
+        max += pad;
+      }
+
+      return {
+        priceRange: { minValue: min, maxValue: max },
+        margins: res?.margins,
+      };
+    };
+
+    entry.autoscaleProviders.set(plotId, provider);
+    return provider;
   }
 
   private ensureIndicatorSeries(
@@ -435,7 +537,8 @@ export class UniversalIndicatorConnector {
     entry: ManagedIndicatorEntry,
     targetPane: number,
     mainVIdx: number,
-    chartSettings: ChartVisualSettings
+    chartSettings: ChartVisualSettings,
+    paneChanged = false
   ): void {
     const isVolumeIndicator = isVolumeIndicatorType(ind.type);
     const priceScaleId =
@@ -447,8 +550,9 @@ export class UniversalIndicatorConnector {
       ...(ind.styles || {}),
     };
 
+    const tfVisible = isIndicatorVisibleOnTimeframe(ind, this.resolution);
     for (const [plotId, style] of Object.entries(effectiveStyles)) {
-      const isVisible = ind.visible && (style ? style.visible !== false : true);
+      const isVisible = ind.visible && tfVisible && (style ? style.visible !== false : true);
       const isHistogram = style?.plotType === 'histogram';
       const showPriceScale =
         (ind.showLabelsOnPriceScale !== false) &&
@@ -463,46 +567,8 @@ export class UniversalIndicatorConnector {
         plotPriceScaleId = `overlay_${ind.id}_${plotId}`;
       }
 
-      const autoscaleInfoProvider: AutoscaleInfoProvider | undefined = targetPane !== mainVIdx ? (original: () => AutoscaleInfo | null): AutoscaleInfo | null => {
-        const res = original();
-        let min = res?.priceRange ? res.priceRange.minValue : Infinity;
-        let max = res?.priceRange ? res.priceRange.maxValue : -Infinity;
-
-        // 1. Expand range to include indicator reference levels (e.g. RSI 70/30, Stoch 80/20)
-        if (ind.levels && ind.levels.length > 0) {
-          for (const lvl of ind.levels) {
-            if (lvl.visible !== false && typeof lvl.value === 'number' && Number.isFinite(lvl.value)) {
-              if (lvl.value < min) min = lvl.value;
-              if (lvl.value > max) max = lvl.value;
-            }
-          }
-        }
-
-        // 2. Expand range to guarantee indicator last value is always centered and in view
-        const latestVal = entry.latestValues[plotId];
-        if (typeof latestVal === 'number' && Number.isFinite(latestVal)) {
-          if (latestVal < min) min = latestVal;
-          if (latestVal > max) max = latestVal;
-        }
-
-        // 3. Fallback if no valid points, levels, or latest values exist yet
-        if (min === Infinity || max === -Infinity) {
-          if (res && res.priceRange) return res;
-          return null;
-        }
-
-        // 4. Handle flat/degenerate zero-height ranges (e.g. constant line or single point)
-        if (min === max) {
-          const pad = min !== 0 ? Math.abs(min) * 0.05 : 1;
-          min -= pad;
-          max += pad;
-        }
-
-        return {
-          priceRange: { minValue: min, maxValue: max },
-          margins: res?.margins,
-        };
-      } : undefined;
+      const autoscaleInfoProvider: AutoscaleInfoProvider | undefined =
+        targetPane !== mainVIdx ? this.getOrCreateAutoscaleProvider(entry, plotId) : undefined;
 
       let seriesApi = entry.series.get(plotId);
       if (!seriesApi) {
@@ -633,13 +699,14 @@ export class UniversalIndicatorConnector {
               scaleMargins: { top: 0.75, bottom: 0.02 },
             });
           }
+          const paneAutoscalePatch = paneChanged ? { autoscaleInfoProvider } : {};
           if (isHistogram) {
             seriesApi.applyOptions({
               color: style?.color || '#089981',
               visible: isVisible,
               lastValueVisible: showPriceScale,
               priceLineVisible: false,
-              autoscaleInfoProvider,
+              ...paneAutoscalePatch,
             });
           } else if (isDiscontinuousPlot(ind.type, plotId)) {
             const defaultRegimeColor = plotId === 'down' ? '#F23645' : '#089981';
@@ -652,7 +719,7 @@ export class UniversalIndicatorConnector {
               visible: isVisible,
               lastValueVisible: showPriceScale,
               priceLineVisible: Boolean(style?.priceLineVisible),
-              autoscaleInfoProvider,
+              ...paneAutoscalePatch,
             });
           } else {
             seriesApi.applyOptions({
@@ -665,7 +732,7 @@ export class UniversalIndicatorConnector {
               visible: isVisible,
               lastValueVisible: showPriceScale,
               priceLineVisible: Boolean(style?.priceLineVisible),
-              autoscaleInfoProvider,
+              ...paneAutoscalePatch,
             });
           }
         } catch {}
@@ -679,16 +746,26 @@ export class UniversalIndicatorConnector {
     _chartSettings: ChartVisualSettings
   ): void {
     const firstSeries = Array.from(entry.series.values())[0];
+    const nextLevelsSig = stableSerialize(ind.levels || []);
+
+    if (entry.levelsSignature === nextLevelsSig && entry.priceLinesHost === firstSeries) {
+      return;
+    }
+
     if (entry.priceLines.length > 0) {
-      if (firstSeries) {
+      const host = entry.priceLinesHost || firstSeries;
+      if (host) {
         for (const pl of entry.priceLines) {
           try {
-            firstSeries.removePriceLine(pl);
+            host.removePriceLine(pl);
           } catch {}
         }
       }
       entry.priceLines = [];
     }
+
+    entry.levelsSignature = nextLevelsSig;
+    entry.priceLinesHost = firstSeries;
 
     if (!ind.levels || ind.levels.length === 0 || !firstSeries) {
       return;
@@ -821,27 +898,145 @@ export class UniversalIndicatorConnector {
     }
   }
 
+  private applyPlotSeriesData(
+    ind: IndicatorInstance,
+    entry: ManagedIndicatorEntry,
+    plotId: string,
+    points: IndicatorPlotDataPoint[],
+    candleMap: Map<number, Candle>
+  ): void {
+    const seriesApi = entry.series.get(plotId);
+    if (!seriesApi) return;
+
+    const style = ind.styles[plotId];
+    const isHistogram = style?.plotType === 'histogram';
+    const isDiscontinuous = isDiscontinuousPlot(ind.type, plotId);
+    const defaultRegimeColor = plotId === 'down' ? '#F23645' : '#089981';
+
+    try {
+      if (isHistogram) {
+        const colorUp = style?.colorUp || style?.color || '#089981';
+        const colorDown = style?.colorDown || '#f23645';
+        const histData: HistogramData<Time>[] = points.map((pt) => {
+          const candle = candleMap.get(pt.time);
+          const isUp = candle ? candle.close >= candle.open : pt.value >= 0;
+          return {
+            time: pt.time as Time,
+            value: pt.value,
+            color: pt.color || (isUp ? colorUp : colorDown),
+          };
+        });
+        seriesApi.setData(histData);
+      } else if (isDiscontinuous) {
+        seriesApi.setData(
+          points.map((pt) => ({
+            time: pt.time as Time,
+            value: pt.value,
+            color: pt.color || style?.color || defaultRegimeColor,
+          }))
+        );
+      } else {
+        seriesApi.setData(
+          points.map((pt) => ({
+            time: pt.time as Time,
+            value: pt.value,
+            ...(pt.color ? { color: pt.color } : {}),
+          }))
+        );
+      }
+
+      if (entry.paneIndex !== this.mainPaneIndex) {
+        this.chart.priceScale('right', entry.paneIndex).applyOptions({
+          autoScale: true,
+          scaleMargins: { top: 0.1, bottom: 0.1 },
+        });
+      }
+    } catch (err) {
+      console.warn(`[UniversalIndicatorConnector] Failed to setData on ${ind.id}:${plotId}`, err);
+    }
+
+    if (!entry.appliedStyleSignatures) entry.appliedStyleSignatures = {};
+    entry.appliedStyleSignatures[plotId] = `${style?.color || ''}|${style?.colorUp || ''}|${style?.colorDown || ''}|${style?.plotType || ''}`;
+  }
+
+  private refreshBandsFromCache(ind: IndicatorInstance, entry: ManagedIndicatorEntry): void {
+    const def = INDICATOR_REGISTRY[ind.type] || INDICATOR_REGISTRY[normalizeIndicatorId(ind.type)];
+    const effectiveBands =
+      ind.bands && ind.bands.length > 0
+        ? ind.bands
+        : (def?.defaultBands || []);
+
+    if (effectiveBands.length === 0) return;
+
+    for (const band of effectiveBands) {
+      const bandPrim = entry.bands.get(band.id);
+      if (!bandPrim) continue;
+
+      const upperPts = entry.cachedPlots[band.upperPlotId] || [];
+      const lowerPts = entry.cachedPlots[band.lowerPlotId] || [];
+
+      const lowerMap = new Map<number, number>();
+      for (let i = 0; i < lowerPts.length; i++) {
+        lowerMap.set(lowerPts[i].time, lowerPts[i].value);
+      }
+
+      const bandPoints: BandPoint[] = [];
+      for (let i = 0; i < upperPts.length; i++) {
+        const t = upperPts[i].time;
+        const lowVal = lowerMap.get(t);
+        if (lowVal !== undefined) {
+          bandPoints.push({
+            time: t,
+            upper: upperPts[i].value,
+            lower: lowVal,
+          });
+        }
+      }
+
+      bandPrim.updateData(bandPoints, band.fillColor, band.visible !== false);
+    }
+  }
+
   /**
    * Evaluates indicators strictly off the main thread:
    * 1. Volume is mapped directly from candle volume (no math).
-   * 2. All technical indicators are evaluated via POST /api/indicators/eval in Go Wazero.
+   * 2. Technical indicators are evaluated via POST /api/indicators/eval in Go ONLY when
+   *    candles changed or an indicator's type/inputs changed.
    */
   private async evaluateOffThread(candles: Candle[]): Promise<void> {
     if (candles.length === 0 || this.currentIndicators.length === 0) return;
     const currentEpoch = ++this.evalEpoch;
 
-    // 1. Process volume indicator directly from OHLCV candles
-    const candleMap = new Map<number, Candle>();
-    for (let i = 0; i < candles.length; i++) {
-      candleMap.set(candles[i].time, candles[i]);
-    }
+    const firstTime = candles[0]?.time ?? 0;
+    const lastCandle = candles[candles.length - 1];
+    const candlesSig = `${this.symbol}|${this.resolution}|${candles.length}|${firstTime}|${lastCandle?.time ?? 0}|${lastCandle?.close ?? 0}|${lastCandle?.volume ?? 0}`;
+    const candlesChanged = this.lastEvalCandlesSig !== candlesSig;
+    this.lastEvalCandlesSig = candlesSig;
 
+    let candleMap: Map<number, Candle> | null = null;
+    const getCandleMap = (): Map<number, Candle> => {
+      if (!candleMap) {
+        candleMap = new Map<number, Candle>();
+        for (let i = 0; i < candles.length; i++) {
+          candleMap.set(candles[i].time, candles[i]);
+        }
+      }
+      return candleMap;
+    };
+
+    // 1. Process volume indicator directly from OHLCV candles (only when candles or volume colors changed)
     for (const ind of this.currentIndicators) {
       if (isVolumeIndicatorType(ind.type)) {
         const entry = this.managed.get(ind.id);
         if (!entry) continue;
 
         const volStyle = ind.styles['vol'];
+        const volStyleSig = `${volStyle?.colorUp || ''}|${volStyle?.colorDown || ''}|${volStyle?.color || ''}`;
+        const volStyleChanged = entry.appliedStyleSignatures?.['vol'] !== volStyleSig;
+        if (!candlesChanged && !volStyleChanged && entry.cachedPlots['vol']?.length) {
+          continue;
+        }
+
         const volSeries = entry.series.get('vol');
         if (volSeries) {
           const colorUp = volStyle?.colorUp || volStyle?.color || '#089981';
@@ -866,22 +1061,52 @@ export class UniversalIndicatorConnector {
             value: c.volume,
             color: c.close >= c.open ? colorUp : colorDown,
           }));
-          const lastCandle = candles[candles.length - 1];
           entry.latestValues['vol'] = lastCandle ? lastCandle.volume : null;
+          if (!entry.appliedStyleSignatures) entry.appliedStyleSignatures = {};
+          entry.appliedStyleSignatures['vol'] = volStyleSig;
         }
       }
     }
 
-    // 2. Query off-thread Go backend for all other indicators
-    const offThreadIndicators = this.currentIndicators
-      .filter((i) => !isVolumeIndicatorType(i.type))
-      .map((i) => ({
-        instanceId: i.id,
-        indicatorId: LEGACY_INDICATOR_MIGRATION_MAP[i.type] || i.type,
-        inputs: (i.inputs || {}) as Record<string, unknown>,
-      }));
+    // 2. Partition non-volume indicators into dirty (needs Go eval) vs style/visibility-only (client-side only)
+    const dirtyOffThreadIndicators: EvalIndicatorInstancePayload[] = [];
+    const dirtyEvalKeys = new Map<string, string>();
 
-    if (offThreadIndicators.length === 0) {
+    for (const ind of this.currentIndicators) {
+      if (isVolumeIndicatorType(ind.type)) continue;
+
+      const entry = this.managed.get(ind.id);
+      const evalKey = `${ind.type}|${stableSerialize(ind.inputs || {})}`;
+      const hasCachedPlots = entry ? Object.keys(entry.cachedPlots).length > 0 : false;
+      const needsEval = candlesChanged || this.lastEvalKeyMap.get(ind.id) !== evalKey || !hasCachedPlots;
+
+      if (needsEval) {
+        dirtyOffThreadIndicators.push({
+          instanceId: ind.id,
+          indicatorId: LEGACY_INDICATOR_MIGRATION_MAP[ind.type] || ind.type,
+          inputs: (ind.inputs || {}) as Record<string, unknown>,
+        });
+        dirtyEvalKeys.set(ind.id, evalKey);
+      } else if (entry) {
+        // Apply any style-driven data coloring updates (e.g. histogram colorUp/colorDown or discontinuous color)
+        for (const [plotId, pts] of Object.entries(entry.cachedPlots)) {
+          const style = ind.styles[plotId];
+          const nextSig = `${style?.color || ''}|${style?.colorUp || ''}|${style?.colorDown || ''}|${style?.plotType || ''}`;
+          const prevSig = entry.appliedStyleSignatures?.[plotId];
+          if (
+            prevSig !== nextSig &&
+            (style?.plotType === 'histogram' || isDiscontinuousPlot(ind.type, plotId))
+          ) {
+            this.applyPlotSeriesData(ind, entry, plotId, pts, getCandleMap());
+          } else if (entry.appliedStyleSignatures) {
+            entry.appliedStyleSignatures[plotId] = nextSig;
+          }
+        }
+        this.refreshBandsFromCache(ind, entry);
+      }
+    }
+
+    if (dirtyOffThreadIndicators.length === 0) {
       this.options.onLatestValuesChange?.(this.getLatestValues());
       return;
     }
@@ -898,15 +1123,19 @@ export class UniversalIndicatorConnector {
           close: c.close,
           volume: c.volume,
         })),
-        indicators: offThreadIndicators,
+        indicators: dirtyOffThreadIndicators,
       });
 
       if (this.evalEpoch !== currentEpoch || this.isDestroyed) {
         return;
       }
 
+      for (const [id, key] of dirtyEvalKeys.entries()) {
+        this.lastEvalKeyMap.set(id, key);
+      }
+
       if (evalData && Array.isArray(evalData.results)) {
-        this.ingestEvalResults(evalData.results, candleMap);
+        this.ingestEvalResults(evalData.results, getCandleMap());
       }
     } catch (err) {
       if (this.evalEpoch !== currentEpoch || this.isDestroyed) {
@@ -927,44 +1156,7 @@ export class UniversalIndicatorConnector {
 
       for (const [plotId, points] of Object.entries(res.plots)) {
         entry.cachedPlots[plotId] = points;
-        const seriesApi = entry.series.get(plotId);
-        const style = ind.styles[plotId];
-        const isHistogram = style?.plotType === 'histogram';
-
-        if (seriesApi) {
-          try {
-            if (isHistogram) {
-              const colorUp = style?.colorUp || style?.color || '#089981';
-              const colorDown = style?.colorDown || '#f23645';
-              const histData: HistogramData<Time>[] = points.map((pt) => {
-                const candle = candleMap.get(pt.time);
-                const isUp = candle ? candle.close >= candle.open : true;
-                return {
-                  time: pt.time as Time,
-                  value: pt.value,
-                  color: pt.color || (isUp ? colorUp : colorDown),
-                };
-              });
-              seriesApi.setData(histData);
-            } else {
-              seriesApi.setData(
-                points.map((pt) => ({
-                  time: pt.time as Time,
-                  value: pt.value,
-                  color: pt.color || style?.color,
-                }))
-              );
-            }
-            if (entry.paneIndex !== this.mainPaneIndex) {
-              this.chart.priceScale('right', entry.paneIndex).applyOptions({
-                autoScale: true,
-                scaleMargins: { top: 0.1, bottom: 0.1 },
-              });
-            }
-          } catch (err) {
-            console.warn(`[UniversalIndicatorConnector] Failed to setData on ${res.instanceId}:${plotId}`, err);
-          }
-        }
+        this.applyPlotSeriesData(ind, entry, plotId, points, candleMap);
 
         const lastPt = points[points.length - 1];
         const lastCandle = this.lastCandles[this.lastCandles.length - 1];
@@ -977,42 +1169,7 @@ export class UniversalIndicatorConnector {
           : null;
       }
 
-      // Recompute bands if attached
-      const def = INDICATOR_REGISTRY[ind.type] || INDICATOR_REGISTRY[normalizeIndicatorId(ind.type)];
-      const effectiveBands =
-        ind.bands && ind.bands.length > 0
-          ? ind.bands
-          : (def?.defaultBands || []);
-
-      if (effectiveBands.length > 0) {
-        for (const band of effectiveBands) {
-          const bandPrim = entry.bands.get(band.id);
-          if (!bandPrim) continue;
-
-          const upperPts = entry.cachedPlots[band.upperPlotId] || [];
-          const lowerPts = entry.cachedPlots[band.lowerPlotId] || [];
-
-          const lowerMap = new Map<number, number>();
-          for (let i = 0; i < lowerPts.length; i++) {
-            lowerMap.set(lowerPts[i].time, lowerPts[i].value);
-          }
-
-          const bandPoints: BandPoint[] = [];
-          for (let i = 0; i < upperPts.length; i++) {
-            const t = upperPts[i].time;
-            const lowVal = lowerMap.get(t);
-            if (lowVal !== undefined) {
-              bandPoints.push({
-                time: t,
-                upper: upperPts[i].value,
-                lower: lowVal,
-              });
-            }
-          }
-
-          bandPrim.updateData(bandPoints, band.fillColor, band.visible !== false);
-        }
-      }
+      this.refreshBandsFromCache(ind, entry);
     }
 
     this.options.onLatestValuesChange?.(this.getLatestValues());
@@ -1031,6 +1188,9 @@ export class UniversalIndicatorConnector {
         this.lastCandles[this.lastCandles.length - 1] = candle;
       } else if (candle.time > last.time) {
         this.lastCandles.push(candle);
+        if (this.lastCandles.length > MAX_CACHED_CANDLES) {
+          this.lastCandles.splice(0, this.lastCandles.length - MAX_CACHED_CANDLES);
+        }
       }
     }
 
@@ -1065,6 +1225,9 @@ export class UniversalIndicatorConnector {
               value: candle.volume,
               color: isUp ? colorUp : colorDown,
             });
+            if (cached.length > MAX_CACHED_CANDLES) {
+              cached.splice(0, cached.length - MAX_CACHED_CANDLES);
+            }
           }
           entry.cachedPlots['vol'] = cached;
         }
@@ -1113,84 +1276,19 @@ export class UniversalIndicatorConnector {
   }
 
   // ==========================================
-  // REAL-TIME WEBSOCKET STREAMING (/ws/indicators)
+  // REAL-TIME MULTIPLEXED WEBSOCKET STREAMING (/ws/indicators)
   // ==========================================
 
-  private getWsUrl(): string {
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${proto}//${window.location.host}/ws/indicators`;
+  private cancelPendingStreamBatch(): void {
+    if (this.streamRafId !== null && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(this.streamRafId);
+    }
+    this.streamRafId = null;
+    this.pendingStreamUpdates.clear();
   }
 
-  private ensureWsConnection(): void {
-    if (this.isDestroyed || this.currentIndicators.length === 0) return;
-    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
-      if (this.ws.readyState === WebSocket.OPEN) {
-        this.resubscribeWs();
-      } else {
-        this.pendingWsResubscribe = true;
-      }
-      return;
-    }
-    if (this.isWsConnecting) return;
-    this.isWsConnecting = true;
-
-    try {
-      this.ws = new WebSocket(this.getWsUrl());
-
-      this.ws.onopen = () => {
-        this.isWsConnecting = false;
-        const hadPending = this.pendingWsResubscribe;
-        this.pendingWsResubscribe = false;
-        if (hadPending || this.lastCandles.length > 0) {
-          this.resubscribeWs();
-        } else {
-          this.resubscribeWs();
-        }
-      };
-
-      this.ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data) as IndicatorBroadcastMessagePayload;
-          if (
-            msg &&
-            msg.type === 'indicator_update' &&
-            msg.plots &&
-            msg.symbol === this.symbol &&
-            msg.resolution === this.resolution
-          ) {
-            this.handleStreamingIndicatorUpdate(msg.time, msg.plots);
-          }
-        } catch (e) {
-          console.error('[UniversalIndicatorConnector WS Message Error]', e);
-        }
-      };
-
-      this.ws.onerror = (err) => {
-        console.warn('[UniversalIndicatorConnector WS Error]', err);
-      };
-
-      this.ws.onclose = () => {
-        this.isWsConnecting = false;
-        this.ws = null;
-        if (!this.isDestroyed && this.currentIndicators.length > 0 && !this.reconnectTimer) {
-          this.reconnectTimer = setTimeout(() => {
-            this.reconnectTimer = null;
-            this.ensureWsConnection();
-          }, 2500);
-          const timerObj = this.reconnectTimer as unknown;
-          if (timerObj && typeof (timerObj as { unref?: () => void }).unref === 'function') {
-            (timerObj as { unref: () => void }).unref();
-          }
-        }
-      };
-    } catch (err) {
-      this.isWsConnecting = false;
-      console.error('[UniversalIndicatorConnector WS Connect Error]', err);
-    }
-  }
-
-  private resubscribeWs(): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+  private resubscribeStream(): void {
+    if (this.isDestroyed) return;
 
     const indicatorsToSub = this.currentIndicators
       .filter((i) => !isVolumeIndicatorType(i.type))
@@ -1200,26 +1298,104 @@ export class UniversalIndicatorConnector {
         inputs: (i.inputs || {}) as Record<string, unknown>,
       }));
 
-    if (indicatorsToSub.length === 0) return;
+    if (indicatorsToSub.length === 0) {
+      if (this.streamUnsubscribe) {
+        try {
+          this.streamUnsubscribe();
+        } catch {}
+        this.streamUnsubscribe = null;
+      }
+      this.activeStreamSubKey = '';
+      return;
+    }
 
-    try {
-      this.ws.send(
-        JSON.stringify({
-          action: 'subscribe',
-          symbol: this.symbol,
-          resolution: this.resolution,
-          indicators: indicatorsToSub,
-          candles: this.lastCandles.slice(-2000).map((c) => ({
-            time: c.time,
-            open: c.open,
-            high: c.high,
-            low: c.low,
-            close: c.close,
-            volume: c.volume,
-          })),
-        })
-      );
-    } catch {}
+    const nextKey = `${this.symbol}|${this.resolution}|${stableSerialize(indicatorsToSub)}`;
+    if (nextKey === this.activeStreamSubKey && this.streamUnsubscribe) {
+      return;
+    }
+
+    const prevUnsub = this.streamUnsubscribe;
+    this.activeStreamSubKey = nextKey;
+    this.streamUnsubscribe = transport.subscribeIndicatorStream({
+      symbol: this.symbol,
+      resolution: this.resolution,
+      indicators: indicatorsToSub,
+      candles: this.lastCandles.slice(-2000).map((c) => ({
+        time: c.time,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.volume,
+      })),
+      onUpdate: (update: IndicatorStreamUpdate) => {
+        if (this.isDestroyed || update.symbol !== this.symbol || update.resolution !== this.resolution) {
+          return;
+        }
+        this.enqueueStreamingIndicatorUpdate(update.time, update.plots);
+      },
+    });
+
+    if (prevUnsub) {
+      try {
+        prevUnsub();
+      } catch {}
+    }
+  }
+
+  private enqueueStreamingIndicatorUpdate(
+    time: number,
+    plots: Record<string, Record<string, number>>
+  ): void {
+    if (this.isDestroyed) return;
+
+    let timeBucket = this.pendingStreamUpdates.get(time);
+    if (!timeBucket) {
+      timeBucket = {};
+      this.pendingStreamUpdates.set(time, timeBucket);
+    }
+    for (const [instanceId, plotMap] of Object.entries(plots)) {
+      const existing = timeBucket[instanceId];
+      if (!existing) {
+        timeBucket[instanceId] = { ...plotMap };
+      } else {
+        Object.assign(existing, plotMap);
+      }
+    }
+
+    if (typeof requestAnimationFrame === 'function') {
+      if (this.streamRafId === null) {
+        this.streamRafId = requestAnimationFrame(() => {
+          this.streamRafId = null;
+          this.flushStreamingIndicatorUpdates();
+        });
+      }
+    } else {
+      this.flushStreamingIndicatorUpdates();
+    }
+  }
+
+  private flushStreamingIndicatorUpdates(): void {
+    if (this.isDestroyed || this.pendingStreamUpdates.size === 0) return;
+
+    const times = Array.from(this.pendingStreamUpdates.keys()).sort((a, b) => a - b);
+    for (let i = 0; i < times.length; i++) {
+      const t = times[i];
+      const plots = this.pendingStreamUpdates.get(t);
+      if (plots) {
+        this.handleStreamingIndicatorUpdate(t, plots);
+      }
+    }
+    this.pendingStreamUpdates.clear();
+  }
+
+  private findCachedCandleAtTime(time: number): Candle | undefined {
+    const candles = this.lastCandles;
+    for (let i = candles.length - 1; i >= 0; i--) {
+      if (candles[i].time === time) return candles[i];
+      if (candles[i].time < time) break;
+    }
+    return undefined;
   }
 
   private handleStreamingIndicatorUpdate(
@@ -1228,24 +1404,70 @@ export class UniversalIndicatorConnector {
   ): void {
     if (this.isDestroyed) return;
 
+    const candle = this.findCachedCandleAtTime(time);
     let hasUpdates = false;
+
     for (const [instanceId, plotMap] of Object.entries(plots)) {
       const entry = this.managed.get(instanceId);
       if (!entry) continue;
 
+      const ind = this.currentIndicators.find((i) => i.id === instanceId);
+
       for (const [plotId, val] of Object.entries(plotMap)) {
         const s = entry.series.get(plotId);
+        const style = ind?.styles[plotId];
+        const isHistogram = style?.plotType === 'histogram';
+        const isDiscontinuous = ind ? isDiscontinuousPlot(ind.type, plotId) : false;
+
         if (s) {
+          if (val === null || val === undefined || !Number.isFinite(val)) {
+            if (isDiscontinuous) {
+              try {
+                (s as unknown as { update: (d: { time: Time }) => void }).update({ time: time as Time });
+              } catch {}
+              entry.latestValues[plotId] = null;
+              hasUpdates = true;
+            }
+            continue;
+          }
+
           try {
-            s.update({ time: time as Time, value: val });
+            let ptColor: string | undefined;
+            if (isHistogram) {
+              const colorUp = style?.colorUp || style?.color || '#089981';
+              const colorDown = style?.colorDown || '#f23645';
+              const isUp = candle ? candle.close >= candle.open : val >= 0;
+              ptColor = isUp ? colorUp : colorDown;
+              s.update({ time: time as Time, value: val, color: ptColor });
+            } else if (isDiscontinuous) {
+              const defaultRegimeColor = plotId === 'down' ? '#F23645' : '#089981';
+              ptColor = style?.color || defaultRegimeColor;
+              (s as unknown as DiscontinuousLineSeriesApi).update({
+                time: time as Time,
+                value: val,
+                color: ptColor,
+                customValues: { regime: plotId },
+              });
+            } else {
+              s.update({ time: time as Time, value: val });
+            }
+
             entry.latestValues[plotId] = val;
             hasUpdates = true;
 
             const cached = entry.cachedPlots[plotId] || [];
             if (cached.length > 0 && cached[cached.length - 1].time === time) {
               cached[cached.length - 1].value = val;
+              if (ptColor) cached[cached.length - 1].color = ptColor;
             } else {
-              cached.push({ time, value: val });
+              cached.push({
+                time,
+                value: val,
+                ...(ptColor ? { color: ptColor } : {}),
+              });
+              if (cached.length > MAX_CACHED_CANDLES) {
+                cached.splice(0, cached.length - MAX_CACHED_CANDLES);
+              }
             }
             entry.cachedPlots[plotId] = cached;
           } catch {}
@@ -1260,7 +1482,6 @@ export class UniversalIndicatorConnector {
       }
 
       // Update shaded bands (e.g. VWAP std dev bands, Bollinger Bands) in real time
-      const ind = this.currentIndicators.find((i) => i.id === instanceId);
       const def = ind
         ? INDICATOR_REGISTRY[ind.type] || INDICATOR_REGISTRY[normalizeIndicatorId(ind.type)]
         : undefined;
@@ -1345,26 +1566,26 @@ export class UniversalIndicatorConnector {
     entry.bandAttachedSeries?.clear();
     entry.footprints.clear();
     entry.priceLines = [];
+    entry.autoscaleProviders.clear();
   }
 
   public destroy(): void {
     this.isDestroyed = true;
     this.evalEpoch++;
+    this.cancelPendingStreamBatch();
     if (this.hudUpdateTimer) {
       clearTimeout(this.hudUpdateTimer);
       this.hudUpdateTimer = null;
     }
     this.pendingHudUpdate = false;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    if (this.ws) {
+    if (this.streamUnsubscribe) {
       try {
-        this.ws.close();
+        this.streamUnsubscribe();
       } catch {}
-      this.ws = null;
+      this.streamUnsubscribe = null;
     }
+    this.activeStreamSubKey = '';
+    this.lastEvalKeyMap.clear();
     for (const entry of this.managed.values()) {
       this.cleanupEntry(entry);
     }

@@ -9,6 +9,7 @@ import type {
   LogicalAnchor,
 } from '../types';
 import type { Candle } from '../../transport/client';
+import { computeVolumeProfileFromCandles } from '../helpers/volumeProfileCalc';
 
 export interface VolumeProfileBin {
   low: number;
@@ -58,6 +59,21 @@ function toAlpha(color: string, alpha: number): string {
   }
   return color;
 }
+
+interface FRVPCache {
+  anchorsKey: string;
+  candlesRef: Candle[];
+  candlesLen: number;
+  lastCandleTime: number;
+  lastCandleHigh: number;
+  lastCandleLow: number;
+  lastCandleClose: number;
+  lastCandleVolume: number;
+  optsKey: string;
+  data: VolumeProfileData | null;
+}
+
+const frvpCache = new WeakMap<UserDrawing, FRVPCache>();
 
 export class FixedRangeVolumeProfileTool extends BaseDrawingTool<FRVPOptions> {
   readonly id: DrawingToolType = 'fixed_range_volume_profile';
@@ -134,13 +150,69 @@ export class FixedRangeVolumeProfileTool extends BaseDrawingTool<FRVPOptions> {
   }
 
   /**
+   * Memoized profile computation on drawing entity.
+   */
+  public getOrComputeProfile(
+    drawing: UserDrawing,
+    candles: Candle[],
+    opts?: FRVPOptions
+  ): VolumeProfileData | null {
+    if (!drawing.anchors || drawing.anchors.length < 2 || !candles || candles.length === 0) {
+      return null;
+    }
+
+    const effectiveOpts = opts || (drawing.options as FRVPOptions) || this.getDefaultOptions();
+    const anchorsKey = drawing.anchors.map((a) => `${a.time}_${a.price}`).join(';');
+    const candlesLen = candles.length;
+    const lastCandle = candles[candlesLen - 1];
+    const lastCandleTime = lastCandle ? lastCandle.time : 0;
+    const lastCandleHigh = lastCandle ? lastCandle.high : 0;
+    const lastCandleLow = lastCandle ? lastCandle.low : 0;
+    const lastCandleClose = lastCandle ? lastCandle.close : 0;
+    const lastCandleVolume = lastCandle ? (lastCandle.volume ?? 0) : 0;
+    const optsKey = `${drawing.symbol || ''}_${effectiveOpts.rowsLayout}_${effectiveOpts.rowSize}_${effectiveOpts.extendRight}_${effectiveOpts.valueAreaVolume}_${effectiveOpts.volume}_${effectiveOpts.showDevelopingPOC}_${effectiveOpts.showDevelopingVA}`;
+
+    const cached = frvpCache.get(drawing);
+    if (
+      cached &&
+      cached.anchorsKey === anchorsKey &&
+      cached.candlesRef === candles &&
+      cached.candlesLen === candlesLen &&
+      cached.lastCandleTime === lastCandleTime &&
+      cached.lastCandleHigh === lastCandleHigh &&
+      cached.lastCandleLow === lastCandleLow &&
+      cached.lastCandleClose === lastCandleClose &&
+      cached.lastCandleVolume === lastCandleVolume &&
+      cached.optsKey === optsKey
+    ) {
+      return cached.data;
+    }
+
+    const data = this.computeProfile(drawing.anchors, candles, effectiveOpts, drawing.symbol);
+    frvpCache.set(drawing, {
+      anchorsKey,
+      candlesRef: candles,
+      candlesLen,
+      lastCandleTime,
+      lastCandleHigh,
+      lastCandleLow,
+      lastCandleClose,
+      lastCandleVolume,
+      optsKey,
+      data,
+    });
+    return data;
+  }
+
+  /**
    * Computes the volume profile histogram, POC, and Value Area (VAH & VAL)
    * from candle data between the two anchors (or extending to live candle).
    */
   public computeProfile(
     anchors: LogicalAnchor[],
     candles: Candle[],
-    opts: FRVPOptions
+    opts: FRVPOptions,
+    symbol?: string
   ): VolumeProfileData | null {
     if (!anchors || anchors.length < 2 || !candles || candles.length === 0) {
       return null;
@@ -174,229 +246,13 @@ export class FixedRangeVolumeProfileTool extends BaseDrawingTool<FRVPOptions> {
       rangeCandles = [closest];
     }
 
-    // Determine min and max price across range
-    let minPrice = rangeCandles[0].low;
-    let maxPrice = rangeCandles[0].high;
-    for (let i = 1; i < rangeCandles.length; i++) {
-      const c = rangeCandles[i];
-      if (c.low < minPrice) minPrice = c.low;
-      if (c.high > maxPrice) maxPrice = c.high;
-    }
-
-    if (maxPrice <= minPrice) {
-      const delta = minPrice > 0 ? minPrice * 0.001 : 0.01;
-      maxPrice += delta;
-      minPrice -= delta;
-    }
-
-    const rowCount = Math.max(4, Math.min(200, opts.rowSize || 24));
-    const priceStep = (maxPrice - minPrice) / rowCount;
-
-    // Initialize bins
-    const bins: VolumeProfileBin[] = [];
-    for (let k = 0; k < rowCount; k++) {
-      const low = minPrice + k * priceStep;
-      const high = minPrice + (k + 1) * priceStep;
-      bins.push({
-        low,
-        high,
-        mid: (low + high) / 2,
-        upVolume: 0,
-        downVolume: 0,
-        totalVolume: 0,
-        inValueArea: false,
-      });
-    }
-
-    // Distribute volume into bins
-    let totalVolume = 0;
-
-    for (const c of rangeCandles) {
-      const vol = typeof c.volume === 'number' && c.volume > 0 ? c.volume : 1;
-      const isUp = c.close >= c.open;
-      const cLow = c.low;
-      const cHigh = c.high;
-      const span = Math.max(1e-9, cHigh - cLow);
-
-      for (const bin of bins) {
-        const overlap = Math.max(0, Math.min(cHigh, bin.high) - Math.max(cLow, bin.low));
-        if (overlap > 0) {
-          const frac = overlap / span;
-          const v = vol * frac;
-          if (isUp) {
-            bin.upVolume += v;
-          } else {
-            bin.downVolume += v;
-          }
-          bin.totalVolume += v;
-          totalVolume += v;
-        }
-      }
-    }
-
-    // Find Point of Control (POC)
-    let maxBinVol = -1;
-    let kPOC = 0;
-    for (let k = 0; k < bins.length; k++) {
-      if (bins[k].totalVolume > maxBinVol) {
-        maxBinVol = bins[k].totalVolume;
-        kPOC = k;
-      }
-    }
-
-    const pocPrice = bins[kPOC].mid;
-    const pocVolume = bins[kPOC].totalVolume;
-
-    // Value Area Calculation (70% standard)
-    const vaPercentage = typeof opts.valueAreaVolume === 'number' ? opts.valueAreaVolume : 70;
-    const targetVAVolume = totalVolume * (vaPercentage / 100);
-
-    bins[kPOC].inValueArea = true;
-    let currentVAVolume = bins[kPOC].totalVolume;
-    let upIdx = kPOC + 1;
-    let downIdx = kPOC - 1;
-
-    while (
-      currentVAVolume < targetVAVolume &&
-      (upIdx < bins.length || downIdx >= 0)
-    ) {
-      const volUp = upIdx < bins.length ? bins[upIdx].totalVolume : -1;
-      const volDown = downIdx >= 0 ? bins[downIdx].totalVolume : -1;
-
-      if (volUp >= volDown && volUp >= 0) {
-        bins[upIdx].inValueArea = true;
-        currentVAVolume += volUp;
-        upIdx++;
-      } else if (volDown >= 0) {
-        bins[downIdx].inValueArea = true;
-        currentVAVolume += volDown;
-        downIdx--;
-      } else {
-        break;
-      }
-    }
-
-    let vahPrice = pocPrice;
-    for (let k = bins.length - 1; k >= 0; k--) {
-      if (bins[k].inValueArea) {
-        vahPrice = bins[k].high;
-        break;
-      }
-    }
-
-    let valPrice = pocPrice;
-    for (let k = 0; k < bins.length; k++) {
-      if (bins[k].inValueArea) {
-        valPrice = bins[k].low;
-        break;
-      }
-    }
-
-    // Compute Developing POC & Developing VA if requested
-    let devPOC: Array<{ time: number; price: number }> | undefined;
-    let devVAH: Array<{ time: number; price: number }> | undefined;
-    let devVAL: Array<{ time: number; price: number }> | undefined;
-
-    if (opts.showDevelopingPOC || opts.showDevelopingVA) {
-      devPOC = [];
-      devVAH = [];
-      devVAL = [];
-
-      const devBins: VolumeProfileBin[] = bins.map((b) => ({
-        ...b,
-        upVolume: 0,
-        downVolume: 0,
-        totalVolume: 0,
-        inValueArea: false,
-      }));
-
-      let cumDevVol = 0;
-
-      for (const c of rangeCandles) {
-        const vol = typeof c.volume === 'number' && c.volume > 0 ? c.volume : 1;
-        const isUp = c.close >= c.open;
-        const span = Math.max(1e-9, c.high - c.low);
-
-        for (const bin of devBins) {
-          const overlap = Math.max(0, Math.min(c.high, bin.high) - Math.max(c.low, bin.low));
-          if (overlap > 0) {
-            const v = vol * (overlap / span);
-            if (isUp) bin.upVolume += v;
-            else bin.downVolume += v;
-            bin.totalVolume += v;
-            cumDevVol += v;
-          }
-        }
-
-        // Find current step POC
-        let stepMaxVol = -1;
-        let stepPocK = 0;
-        for (let k = 0; k < devBins.length; k++) {
-          if (devBins[k].totalVolume > stepMaxVol) {
-            stepMaxVol = devBins[k].totalVolume;
-            stepPocK = k;
-          }
-        }
-        devPOC.push({ time: c.time, price: devBins[stepPocK].mid });
-
-        // Step VA
-        if (opts.showDevelopingVA) {
-          for (const b of devBins) b.inValueArea = false;
-          devBins[stepPocK].inValueArea = true;
-          let stepVaVol = devBins[stepPocK].totalVolume;
-          const targetStepVa = cumDevVol * (vaPercentage / 100);
-          let sUp = stepPocK + 1;
-          let sDown = stepPocK - 1;
-
-          while (stepVaVol < targetStepVa && (sUp < devBins.length || sDown >= 0)) {
-            const vUp = sUp < devBins.length ? devBins[sUp].totalVolume : -1;
-            const vDown = sDown >= 0 ? devBins[sDown].totalVolume : -1;
-            if (vUp >= vDown && vUp >= 0) {
-              devBins[sUp].inValueArea = true;
-              stepVaVol += vUp;
-              sUp++;
-            } else if (vDown >= 0) {
-              devBins[sDown].inValueArea = true;
-              stepVaVol += vDown;
-              sDown--;
-            } else break;
-          }
-
-          let sVah = devBins[stepPocK].mid;
-          for (let k = devBins.length - 1; k >= 0; k--) {
-            if (devBins[k].inValueArea) {
-              sVah = devBins[k].high;
-              break;
-            }
-          }
-          let sVal = devBins[stepPocK].mid;
-          for (let k = 0; k < devBins.length; k++) {
-            if (devBins[k].inValueArea) {
-              sVal = devBins[k].low;
-              break;
-            }
-          }
-          devVAH.push({ time: c.time, price: sVah });
-          devVAL.push({ time: c.time, price: sVal });
-        }
-      }
-    }
-
-    return {
-      bins,
-      pocPrice,
-      pocVolume,
-      vahPrice,
-      valPrice,
-      totalVolume,
-      minPrice,
-      maxPrice,
+    return computeVolumeProfileFromCandles(
+      rangeCandles,
       effectiveStartTime,
       effectiveEndTime,
-      devPOC,
-      devVAH,
-      devVAL,
-    };
+      opts,
+      symbol
+    );
   }
 
   getHandles(drawing: UserDrawing, ctx: DrawingRenderContext): DrawingHandle[] {
@@ -404,7 +260,7 @@ export class FixedRangeVolumeProfileTool extends BaseDrawingTool<FRVPOptions> {
     if (!drawing.anchors || drawing.anchors.length < 2) return handles;
 
     const opts: FRVPOptions = (drawing.options as FRVPOptions) || this.getDefaultOptions();
-    const profile = this.computeProfile(drawing.anchors, ctx.candles, opts);
+    const profile = this.getOrComputeProfile(drawing, ctx.candles, opts);
 
     const p1 = ctx.anchorToCoordinates(drawing.anchors[0]);
     let effectiveAnchor2 = drawing.anchors[1];
@@ -529,7 +385,7 @@ export class FixedRangeVolumeProfileTool extends BaseDrawingTool<FRVPOptions> {
       c2d.stroke();
     }
 
-    const profile = this.computeProfile(drawing.anchors, ctx.candles, opts);
+    const profile = this.getOrComputeProfile(drawing, ctx.candles, opts);
     if (!profile) {
       c2d.restore();
       return;
@@ -842,7 +698,7 @@ export class FixedRangeVolumeProfileTool extends BaseDrawingTool<FRVPOptions> {
     const xLeft = Math.min(p1.x, p2.x);
     const xRight = Math.max(p1.x, p2.x);
 
-    const profile = this.computeProfile(drawing.anchors, ctx.candles, opts);
+    const profile = this.getOrComputeProfile(drawing, ctx.candles, opts);
     let boxTop = Math.min(p1.y, p2.y);
     let boxBottom = Math.max(p1.y, p2.y);
 
@@ -865,9 +721,26 @@ export class FixedRangeVolumeProfileTool extends BaseDrawingTool<FRVPOptions> {
       return { hit: true, handleIndex: 1, cursor: 'grab' };
     }
 
-    // 2. Hit-test inside profile bounding box
-    if (px >= xLeft - 4 && px <= xRight + 4 && py >= boxTop - 4 && py <= boxBottom + 4) {
-      return { hit: true, handleIndex: -1, cursor: 'pointer' };
+    // 2. Hit-test strictly inside actual volume histogram profile area
+    if (opts.showVolumeProfile !== false && profile && profile.bins.length > 0) {
+      const boxWidth = Math.max(1, xRight - xLeft);
+      const widthPercent = typeof opts.widthPercent === 'number' ? opts.widthPercent : 30;
+      const maxBarWidth = boxWidth * (widthPercent / 100);
+      const isLeft = (opts.placement || 'left') === 'left';
+      const labelPadding = opts.showValues ? 36 : 8;
+
+      let profileLeft = xLeft - 4;
+      let profileRight = xLeft + maxBarWidth + labelPadding;
+
+      if (!isLeft) {
+        profileLeft = xRight - maxBarWidth - labelPadding;
+        profileRight = xRight + 4;
+      }
+
+      // Check if click is within the actual profile column
+      if (px >= profileLeft && px <= profileRight && py >= boxTop - 4 && py <= boxBottom + 4) {
+        return { hit: true, handleIndex: -1, cursor: 'pointer' };
+      }
     }
 
     return null;

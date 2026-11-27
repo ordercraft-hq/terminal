@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useRef } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import {
   Plus,
   MoreVertical,
@@ -13,54 +13,84 @@ import {
   FolderPlus,
   Edit2,
 } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import { useSyncStore } from '../../../store/syncStore';
-import type { WatchlistItem } from '../../../store/syncStore';
+import type { WatchlistItem, WatchlistTickUpdate } from '../../../store/syncStore';
+import { transport, type WatchlistSearchResult } from '../../../transport/client';
 
-interface SearchResultItem {
-  symbol: string;
-  name: string;
-  type: string;
-  exchange: string;
-}
+type WatchlistColumnToggleKey =
+  | 'showLast'
+  | 'showChange'
+  | 'showChangePct'
+  | 'showVolume'
+  | 'showExtendedHours';
 
 export const WatchlistPanel: React.FC = () => {
-  const watchlists = useSyncStore((s) => s.watchlists);
-  const activeWatchlistId = useSyncStore((s) => s.activeWatchlistId);
-  const setActiveWatchlistId = useSyncStore((s) => s.setActiveWatchlistId);
-  const addSymbolToWatchlist = useSyncStore((s) => s.addSymbolToWatchlist);
-  const removeSymbolFromWatchlist = useSyncStore((s) => s.removeSymbolFromWatchlist);
-  const createWatchlist = useSyncStore((s) => s.createWatchlist);
-  const deleteWatchlist = useSyncStore((s) => s.deleteWatchlist);
-  const renameWatchlist = useSyncStore((s) => s.renameWatchlist);
-  const clearWatchlist = useSyncStore((s) => s.clearWatchlist);
-  const sortWatchlist = useSyncStore((s) => s.sortWatchlist);
-  const updateWatchlistTick = useSyncStore((s) => s.updateWatchlistTick);
-
-  const tableSettings = useSyncStore((s) => s.watchlistTableSettings);
-  const setTableSettings = useSyncStore((s) => s.setWatchlistTableSettings);
+  const {
+    watchlists,
+    activeWatchlistId,
+    setActiveWatchlistId,
+    addSymbolToWatchlist,
+    removeSymbolFromWatchlist,
+    createWatchlist,
+    deleteWatchlist,
+    renameWatchlist,
+    clearWatchlist,
+    sortWatchlist,
+    updateWatchlistTicks,
+    tableSettings,
+    setTableSettings,
+    setSymbol,
+    activeSymbol,
+  } = useSyncStore(
+    useShallow((s) => ({
+      watchlists: s.watchlists,
+      activeWatchlistId: s.activeWatchlistId,
+      setActiveWatchlistId: s.setActiveWatchlistId,
+      addSymbolToWatchlist: s.addSymbolToWatchlist,
+      removeSymbolFromWatchlist: s.removeSymbolFromWatchlist,
+      createWatchlist: s.createWatchlist,
+      deleteWatchlist: s.deleteWatchlist,
+      renameWatchlist: s.renameWatchlist,
+      clearWatchlist: s.clearWatchlist,
+      sortWatchlist: s.sortWatchlist,
+      updateWatchlistTicks: s.updateWatchlistTicks,
+      tableSettings: s.watchlistTableSettings,
+      setTableSettings: s.setWatchlistTableSettings,
+      setSymbol: s.setSymbol,
+      activeSymbol: (s.activePaneId && s.panes[s.activePaneId]?.symbol) || s.symbol,
+    }))
+  );
 
   // Local UI state
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isTableViewMenuOpen, setIsTableViewMenuOpen] = useState(false);
   const [isOptionsMenuOpen, setIsOptionsMenuOpen] = useState(false);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  const [isCreateOpen, setIsCreateOpen] = useState(false);
+  const [createValue, setCreateValue] = useState('');
   const [isRenameOpen, setIsRenameOpen] = useState(false);
   const [renameValue, setRenameValue] = useState('');
   const [isAddSectionOpen, setIsAddSectionOpen] = useState(false);
   const [newSectionName, setNewSectionName] = useState('');
+  const [confirmAction, setConfirmAction] = useState<{
+    type: 'clear' | 'delete';
+    watchlistId: string;
+    name: string;
+  } | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
 
   // Search in current watchlist
   const [isSearchActive, setIsSearchActive] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
 
-  // Selected row in watchlist (purely local selection, does NOT load chart)
+  // Selected row in watchlist
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
 
   // New symbol search modal state
   const [searchModalQuery, setSearchModalQuery] = useState('');
   const [searchCategory, setSearchCategory] = useState<string>('ALL');
-  const [searchResults, setSearchResults] = useState<SearchResultItem[]>([]);
+  const [searchResults, setSearchResults] = useState<WatchlistSearchResult[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [targetGroupForAdd, setTargetGroupForAdd] = useState('STOCKS');
 
@@ -80,72 +110,105 @@ export const WatchlistPanel: React.FC = () => {
     return watchlists.find((w) => w.id === activeWatchlistId) || watchlists[0];
   }, [watchlists, activeWatchlistId]);
 
-  // Ref to hold all symbols for polling
-  const symbolsRef = useRef<string[]>([]);
-  symbolsRef.current = useMemo(() => {
+  const quotableSymbols = useMemo(() => {
     if (!currentWatchlist) return [];
-    return currentWatchlist.items.map((it) => it.symbol);
+    return currentWatchlist.items
+      .map((it) => it.symbol)
+      .filter((sym) => Boolean(sym) && !sym.endsWith('_SECTION'));
   }, [currentWatchlist]);
 
-  // Fetch live quotes from Go backend (/api/watchlist/quotes)
-  const fetchLiveQuotes = async () => {
-    const list = symbolsRef.current;
-    if (list.length === 0) return;
+  const symbolsKey = quotableSymbols.join(',');
 
-    try {
-      const endpoint = `/api/watchlist/quotes?symbols=${encodeURIComponent(
-        list.join(',')
-      )}`;
-      const res = await fetch(endpoint);
-      if (res.ok) {
-        const json = await res.json();
-        if (Array.isArray(json.quotes)) {
-          for (const q of json.quotes) {
-            const sym = q.originalKey || q.symbol;
-            updateWatchlistTick(sym, q.price, q.change, q.changePct, q.volume, q.name);
-          }
+  // Fetch live quotes via transport client (/api/watchlist/quotes)
+  const fetchLiveQuotes = useCallback(
+    async (signal?: AbortSignal) => {
+      if (quotableSymbols.length === 0) return;
+
+      try {
+        const quotes = await transport.getWatchlistQuotes(quotableSymbols, signal);
+        if (signal?.aborted || quotes.length === 0) return;
+
+        const updates: Record<string, WatchlistTickUpdate> = {};
+        for (const q of quotes) {
+          const sym = q.originalKey || q.symbol;
+          updates[sym] = {
+            lastPrice: q.price,
+            change: q.change,
+            changePct: q.changePct,
+            volume: q.volume,
+            name: q.name,
+          };
         }
+        updateWatchlistTicks(updates);
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') return;
+        // Backend may be warming up
       }
-    } catch {
-      // Backend may be warming up
-    }
-  };
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [symbolsKey, updateWatchlistTicks]
+  );
 
-  // Poll live quotes on mount and every 20s
+  // Poll live quotes on mount/symbol change and every 20s when tab is visible
   useEffect(() => {
-    fetchLiveQuotes();
-    const interval = setInterval(fetchLiveQuotes, 20000);
-    return () => clearInterval(interval);
-  }, [activeWatchlistId]);
+    const controller = new AbortController();
+    fetchLiveQuotes(controller.signal);
+
+    const interval = window.setInterval(() => {
+      if (document.visibilityState !== 'hidden') {
+        fetchLiveQuotes(controller.signal);
+      }
+    }, 20000);
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        fetchLiveQuotes(controller.signal);
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      controller.abort();
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [activeWatchlistId, symbolsKey, fetchLiveQuotes]);
 
   // Debounced search for the Add Symbol Modal
   useEffect(() => {
     if (!isAddModalOpen) return;
     if (!searchModalQuery.trim()) {
       setSearchResults([]);
+      setIsSearching(false);
       return;
     }
 
-    const timer = setTimeout(async () => {
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
       setIsSearching(true);
       try {
-        const res = await fetch(
-          `/api/watchlist/search?q=${encodeURIComponent(
-            searchModalQuery.trim()
-          )}`
+        const results = await transport.searchWatchlistSymbols(
+          searchModalQuery.trim(),
+          controller.signal
         );
-        if (res.ok) {
-          const json = await res.json();
-          setSearchResults(json.results || []);
+        if (!controller.signal.aborted) {
+          setSearchResults(results);
         }
-      } catch {
-        setSearchResults([]);
+      } catch (err) {
+        if (!(err instanceof Error && err.name === 'AbortError')) {
+          setSearchResults([]);
+        }
       } finally {
-        setIsSearching(false);
+        if (!controller.signal.aborted) {
+          setIsSearching(false);
+        }
       }
     }, 250);
 
-    return () => clearTimeout(timer);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
   }, [searchModalQuery, isAddModalOpen]);
 
   // Group items
@@ -174,6 +237,15 @@ export const WatchlistPanel: React.FC = () => {
     setCollapsedGroups((prev) => ({ ...prev, [grp]: !prev[grp] }));
   };
 
+  const handleCreateSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = createValue.trim();
+    if (!trimmed) return;
+    createWatchlist(trimmed);
+    setCreateValue('');
+    setIsCreateOpen(false);
+  };
+
   const handleRenameSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!renameValue.trim() || !currentWatchlist) return;
@@ -184,18 +256,17 @@ export const WatchlistPanel: React.FC = () => {
   const handleAddSectionSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newSectionName.trim() || !currentWatchlist) return;
-    // Insert a dummy item with the new section name so the group shows up
-    addSymbolToWatchlist(currentWatchlist.id, `${newSectionName.toUpperCase()}_SECTION`, newSectionName.trim().toUpperCase());
+    // Insert a section placeholder so the group shows up (excluded from quote polls)
+    addSymbolToWatchlist(currentWatchlist.id, `${newSectionName.trim().toUpperCase()}_SECTION`, newSectionName.trim().toUpperCase());
     setNewSectionName('');
     setIsAddSectionOpen(false);
   };
 
-  const handleAddSymbolFromModal = (res: SearchResultItem) => {
+  const handleAddSymbolFromModal = (res: WatchlistSearchResult) => {
     if (!currentWatchlist) return;
     addSymbolToWatchlist(currentWatchlist.id, res.symbol, targetGroupForAdd, res.name);
     setIsAddModalOpen(false);
     setSearchModalQuery('');
-    setTimeout(fetchLiveQuotes, 300);
   };
 
   const getBadgeInfo = (symbol: string) => {
@@ -316,10 +387,8 @@ export const WatchlistPanel: React.FC = () => {
                 <button
                   onClick={() => {
                     setIsDropdownOpen(false);
-                    const name = prompt('Enter new watchlist name:');
-                    if (name && name.trim()) {
-                      createWatchlist(name.trim());
-                    }
+                    setCreateValue('');
+                    setIsCreateOpen(true);
                   }}
                   className="w-full flex items-center space-x-1.5 px-3 py-1.5 hover:bg-[#2a2e39] text-[#2962ff] text-left transition-colors cursor-pointer font-medium"
                 >
@@ -383,14 +452,16 @@ export const WatchlistPanel: React.FC = () => {
                   <div className="text-[10px] uppercase font-bold text-[#787b86] tracking-wider mb-1">
                     Customize Columns
                   </div>
-                  {[
-                    { key: 'showLast', label: 'Last' },
-                    { key: 'showChange', label: 'Change' },
-                    { key: 'showChangePct', label: 'Change %' },
-                    { key: 'showVolume', label: 'Volume' },
-                    { key: 'showExtendedHours', label: 'Extended Hours' },
-                  ].map((col) => {
-                    const isChecked = !!(tableSettings as any)[col.key];
+                  {(
+                    [
+                      { key: 'showLast', label: 'Last' },
+                      { key: 'showChange', label: 'Change' },
+                      { key: 'showChangePct', label: 'Change %' },
+                      { key: 'showVolume', label: 'Volume' },
+                      { key: 'showExtendedHours', label: 'Extended Hours' },
+                    ] as const
+                  ).map((col: { key: WatchlistColumnToggleKey; label: string }) => {
+                    const isChecked = Boolean(tableSettings[col.key]);
                     return (
                       <label
                         key={col.key}
@@ -564,8 +635,12 @@ export const WatchlistPanel: React.FC = () => {
                 <div className="pt-1">
                   <button
                     onClick={() => {
-                      if (currentWatchlist && confirm(`Clear all items from "${currentWatchlist.name}"?`)) {
-                        clearWatchlist(currentWatchlist.id);
+                      if (currentWatchlist) {
+                        setConfirmAction({
+                          type: 'clear',
+                          watchlistId: currentWatchlist.id,
+                          name: currentWatchlist.name,
+                        });
                       }
                       setIsOptionsMenuOpen(false);
                     }}
@@ -577,8 +652,12 @@ export const WatchlistPanel: React.FC = () => {
                   {watchlists.length > 1 && (
                     <button
                       onClick={() => {
-                        if (currentWatchlist && confirm(`Delete "${currentWatchlist.name}"?`)) {
-                          deleteWatchlist(currentWatchlist.id);
+                        if (currentWatchlist) {
+                          setConfirmAction({
+                            type: 'delete',
+                            watchlistId: currentWatchlist.id,
+                            name: currentWatchlist.name,
+                          });
                         }
                         setIsOptionsMenuOpen(false);
                       }}
@@ -615,6 +694,68 @@ export const WatchlistPanel: React.FC = () => {
               <X size={12} />
             </button>
           )}
+        </div>
+      )}
+
+      {/* Inline Create Watchlist Form */}
+      {isCreateOpen && (
+        <form onSubmit={handleCreateSubmit} className="p-2 border-b border-[#2a2e39] bg-[#181b27] flex items-center space-x-1.5">
+          <input
+            type="text"
+            value={createValue}
+            onChange={(e) => setCreateValue(e.target.value)}
+            placeholder="New watchlist name..."
+            className="flex-1 bg-[#131722] border border-[#2a2e39] rounded px-2 py-1 text-xs text-white outline-none focus:border-[#2962ff]"
+            autoFocus
+          />
+          <button
+            type="submit"
+            disabled={!createValue.trim()}
+            className="px-2.5 py-1 bg-[#2962ff] disabled:opacity-50 text-white rounded text-xs font-semibold cursor-pointer"
+          >
+            Create
+          </button>
+          <button
+            type="button"
+            onClick={() => setIsCreateOpen(false)}
+            className="p-1 text-[#787b86] hover:text-white cursor-pointer"
+          >
+            <X size={14} />
+          </button>
+        </form>
+      )}
+
+      {/* Inline Clear / Delete Confirmation Banner */}
+      {confirmAction && (
+        <div className="p-2 border-b border-[#f23645]/30 bg-[#f23645]/10 flex items-center justify-between gap-2">
+          <span className="text-[11px] text-[#d1d4dc] truncate">
+            {confirmAction.type === 'clear'
+              ? `Clear all items from "${confirmAction.name}"?`
+              : `Delete "${confirmAction.name}"?`}
+          </span>
+          <div className="flex items-center space-x-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => setConfirmAction(null)}
+              className="px-2 py-0.5 rounded bg-[#2a2e39] hover:bg-[#363a45] text-[#d1d4dc] text-[11px] cursor-pointer"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (confirmAction.type === 'clear') {
+                  clearWatchlist(confirmAction.watchlistId);
+                } else {
+                  deleteWatchlist(confirmAction.watchlistId);
+                }
+                setConfirmAction(null);
+              }}
+              className="px-2 py-0.5 rounded bg-[#f23645] hover:bg-[#d92b3a] text-white text-[11px] font-semibold cursor-pointer"
+            >
+              {confirmAction.type === 'clear' ? 'Clear' : 'Delete'}
+            </button>
+          </div>
         </div>
       )}
 
@@ -739,7 +880,10 @@ export const WatchlistPanel: React.FC = () => {
                 {/* Items in Section */}
                 {!isCollapsed &&
                   items.map((item) => {
-                    const isSelected = item.symbol === selectedSymbol;
+                    if (item.symbol.endsWith('_SECTION')) {
+                      return null;
+                    }
+                    const isSelected = item.symbol === selectedSymbol || item.symbol === activeSymbol;
                     const badge = getBadgeInfo(item.symbol);
                     const isPositive = (item.changePct ?? 0) >= 0;
                     const isNegative = (item.changePct ?? 0) < 0;
@@ -755,7 +899,11 @@ export const WatchlistPanel: React.FC = () => {
                     return (
                       <div
                         key={item.symbol}
-                        onClick={() => setSelectedSymbol(item.symbol)}
+                        onClick={() => {
+                          setSelectedSymbol(item.symbol);
+                          setSymbol(item.symbol);
+                        }}
+                        title={`Load ${item.symbol} on active chart`}
                         className={`group relative grid grid-cols-12 items-center px-3 py-2 cursor-pointer transition-colors ${
                           isSelected
                             ? 'bg-[#2962ff]/20 text-white font-medium shadow-sm'

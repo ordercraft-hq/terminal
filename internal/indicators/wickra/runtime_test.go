@@ -69,8 +69,8 @@ func TestTableDrivenNumericalVerification(t *testing.T) {
 	}
 	defer engine.Close(ctx)
 
-	worker := engine.workerPool.Get().(*Worker)
-	defer engine.workerPool.Put(worker)
+	worker := engine.acquireWorker()
+	defer engine.releaseWorker(worker)
 
 	// 1. SMA(5)
 	smaDesc, _ := engine.GetDescriptor("wickra.sma")
@@ -393,5 +393,75 @@ func TestStreamingSessionLifecycle(t *testing.T) {
 
 	if err := session.Close(ctx); err != nil {
 		t.Fatalf("session.Close error: %v", err)
+	}
+}
+
+func TestWorkerPoolingAcrossSessions(t *testing.T) {
+	ctx := context.Background()
+	engine, err := NewEngine(ctx)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	defer engine.Close(ctx)
+
+	cfgs := []EvalIndicatorInstance{
+		{InstanceID: "pool_sma", IndicatorID: "wickra.sma", Inputs: map[string]interface{}{"period": 3}},
+	}
+
+	// Sequentially create and close 12 sessions: pooled worker should be reused instead of spawning 12 modules.
+	for i := 0; i < 12; i++ {
+		sess, err := engine.CreateSession(ctx, "BINANCE:BTCUSDT", "1m", cfgs)
+		if err != nil {
+			t.Fatalf("CreateSession %d failed: %v", i, err)
+		}
+		for bar := 0; bar < 3; bar++ {
+			plots, err := sess.Update(ctx, CandleData{Time: int64(1000 + bar*60), Close: float64(10 + bar)})
+			if err != nil {
+				t.Fatalf("Update %d.%d failed: %v", i, bar, err)
+			}
+			if bar == 2 {
+				if got := plots["pool_sma"]["plot"]; !almostEqual(got, 11.0, 1e-6) {
+					t.Fatalf("session %d expected SMA 11.0, got %f", i, got)
+				}
+			}
+		}
+		if err := sess.Close(ctx); err != nil {
+			t.Fatalf("Close %d failed: %v", i, err)
+		}
+	}
+
+	if engine.sessionSeq > 4 {
+		t.Fatalf("expected worker pool reuse (sessionSeq <= 4), got %d spawned workers", engine.sessionSeq)
+	}
+}
+
+func TestGetCatalogFiltering(t *testing.T) {
+	ctx := context.Background()
+	engine, err := NewEngine(ctx)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	defer engine.Close(ctx)
+
+	oscRSI := engine.GetCatalog("oscillators", "rsi")
+	if len(oscRSI) == 0 {
+		t.Fatalf("expected non-empty filtered results for oscillators + rsi")
+	}
+	foundRSI := false
+	for _, d := range oscRSI {
+		if d.ID == "wickra.rsi" {
+			foundRSI = true
+		}
+		if d.ID == "wickra.vwap_std_dev_bands" {
+			t.Fatalf("deprecated wickra.vwap_std_dev_bands must be excluded")
+		}
+	}
+	if !foundRSI {
+		t.Fatalf("expected wickra.rsi in filtered catalog")
+	}
+
+	all := engine.GetCatalog("", "")
+	if len(all) != engine.Catalog().Count()-1 {
+		t.Fatalf("expected %d descriptors (excluding deprecated vwap_std_dev_bands), got %d", engine.Catalog().Count()-1, len(all))
 	}
 }

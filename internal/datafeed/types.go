@@ -26,6 +26,20 @@ type TickData struct {
 	TradeID  string   `json:"trade_id,omitempty"`  // Exchange match/trade ID
 }
 
+// OrderBookLevel represents a single price level in the market depth book.
+type OrderBookLevel struct {
+	Price float64 `json:"price"`
+	Size  float64 `json:"size"`
+}
+
+// OrderBookDepth captures the snapshot or top levels of bids and asks.
+type OrderBookDepth struct {
+	Symbol string           `json:"symbol"`
+	Time   int64            `json:"time"`
+	Bids   []OrderBookLevel `json:"bids"`
+	Asks   []OrderBookLevel `json:"asks"`
+}
+
 // DeltaBar captures the buyer and seller volume distribution and delta for a candle period.
 type DeltaBar struct {
 	Time       int64   `json:"time"`        // Period start timestamp in seconds (UTC)
@@ -99,8 +113,9 @@ func NewDeltaAggregator(resolution string, tickSize float64) *DeltaAggregator {
 	}
 }
 
-// UpdateTick incorporates an incoming execution tick and returns the updated DeltaBar.
-func (a *DeltaAggregator) UpdateTick(t TickData) DeltaBar {
+// UpdateTick incorporates an incoming execution tick and returns the updated DeltaBar,
+// along with any completed previous DeltaBar that closed when the bucket advanced.
+func (a *DeltaAggregator) UpdateTick(t TickData) (DeltaBar, *DeltaBar) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -132,7 +147,13 @@ func (a *DeltaAggregator) UpdateTick(t TickData) DeltaBar {
 	}
 	tickDelta := askVol - bidVol
 
+	var closedBar *DeltaBar
+
 	if a.currentBar == nil || bucket > a.currentBar.Time {
+		if a.currentBar != nil {
+			c := *a.currentBar
+			closedBar = &c
+		}
 		// New bar
 		a.runningCVD += tickDelta
 		a.currentBar = &DeltaBar{
@@ -150,7 +171,7 @@ func (a *DeltaAggregator) UpdateTick(t TickData) DeltaBar {
 			MaxDelta:   math.Max(0, tickDelta),
 		}
 		a.levelsMap = make(map[int64]*FootprintPriceLevel)
-	} else {
+	} else if bucket == a.currentBar.Time {
 		// Existing bar update
 		if t.Price > a.currentBar.High {
 			a.currentBar.High = t.Price
@@ -171,6 +192,10 @@ func (a *DeltaAggregator) UpdateTick(t TickData) DeltaBar {
 		if a.currentBar.Delta > a.currentBar.MaxDelta {
 			a.currentBar.MaxDelta = a.currentBar.Delta
 		}
+	} else {
+		// Late or out-of-order tick (bucket < a.currentBar.Time).
+		// Drop/ignore for active bar OHLC to prevent stale ticks from corrupting current bar close.
+		return *a.currentBar, nil
 	}
 
 	// Update footprint level
@@ -187,7 +212,90 @@ func (a *DeltaAggregator) UpdateTick(t TickData) DeltaBar {
 	lvl.TotalVolume += t.Volume
 	lvl.Delta = lvl.AskVolume - lvl.BidVolume
 
-	return *a.currentBar
+	return *a.currentBar, closedBar
+}
+
+// SyncCandle synchronizes the aggregator's active bar with the authentic OHLCV candle from the provider.
+func (a *DeltaAggregator) SyncCandle(c Candle) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	bucket := (c.Time / a.targetStepSec) * a.targetStepSec
+	if a.currentBar == nil || bucket > a.currentBar.Time {
+		a.currentBar = &DeltaBar{
+			Time:       bucket,
+			Open:       c.Open,
+			High:       c.High,
+			Low:        c.Low,
+			Close:      c.Close,
+			Volume:     c.Volume,
+			MinDelta:   0,
+			MaxDelta:   0,
+			Cumulative: a.runningCVD,
+		}
+		a.levelsMap = make(map[int64]*FootprintPriceLevel)
+	} else if a.currentBar.Time == bucket {
+		a.currentBar.Open = c.Open
+		if c.High > a.currentBar.High {
+			a.currentBar.High = c.High
+		}
+		if c.Low < a.currentBar.Low && c.Low > 0 {
+			a.currentBar.Low = c.Low
+		}
+		a.currentBar.Close = c.Close
+		if c.Volume > a.currentBar.Volume {
+			a.currentBar.Volume = c.Volume
+		}
+	}
+}
+
+// SeedLevels initializes or merges historical footprint levels into the active aggregator bar.
+func (a *DeltaAggregator) SeedLevels(bar FootprintBar) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	bucket := (bar.Time / a.targetStepSec) * a.targetStepSec
+	if a.currentBar == nil || a.currentBar.Time == bucket {
+		if a.currentBar == nil {
+			a.currentBar = &DeltaBar{
+				Time:       bucket,
+				Open:       bar.Candle.Open,
+				High:       bar.Candle.High,
+				Low:        bar.Candle.Low,
+				Close:      bar.Candle.Close,
+				Volume:     bar.Candle.Volume,
+				Delta:      bar.TotalDelta,
+				Cumulative: a.runningCVD,
+			}
+		} else {
+			if bar.Candle.High > a.currentBar.High {
+				a.currentBar.High = bar.Candle.High
+			}
+			if bar.Candle.Low < a.currentBar.Low && bar.Candle.Low > 0 {
+				a.currentBar.Low = bar.Candle.Low
+			}
+		}
+		for _, lvl := range bar.Levels {
+			priceTier := int64(math.Round(lvl.Price / a.tickSize))
+			existing, exists := a.levelsMap[priceTier]
+			if !exists {
+				a.levelsMap[priceTier] = &FootprintPriceLevel{
+					Price:       lvl.Price,
+					BidVolume:   lvl.BidVolume,
+					AskVolume:   lvl.AskVolume,
+					TotalVolume: lvl.TotalVolume,
+					Delta:       lvl.Delta,
+				}
+			} else {
+				if lvl.TotalVolume > existing.TotalVolume {
+					existing.BidVolume = lvl.BidVolume
+					existing.AskVolume = lvl.AskVolume
+					existing.TotalVolume = lvl.TotalVolume
+					existing.Delta = lvl.Delta
+				}
+			}
+		}
+	}
 }
 
 // GetFootprintBar calculates the POC, VAH, and VAL from the active cluster levels.

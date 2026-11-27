@@ -1,25 +1,20 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import { Minus, Square, X, Maximize2, Minimize2 } from 'lucide-react';
 import { transport } from '../../transport/client';
+import { useSyncStore } from '../../store/syncStore';
 
 export const Titlebar: React.FC = () => {
-  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
+  const isFullscreen = useSyncStore((s) => s.isFullscreen);
+  const setIsFullscreen = useSyncStore((s) => s.setIsFullscreen);
   const isDesktop = typeof window !== 'undefined' && Boolean(window.runtime);
 
-  useEffect(() => {
-    const handleFsChange = () => {
-      setIsFullscreen(Boolean(document.fullscreenElement));
-    };
-
-    document.addEventListener('fullscreenchange', handleFsChange);
-    return () => {
-      document.removeEventListener('fullscreenchange', handleFsChange);
-    };
-  }, []);
-
   const handleToggleFullscreen = async () => {
-    const fs = await transport.toggleFullscreen();
-    setIsFullscreen(fs);
+    try {
+      const fs = await transport.toggleFullscreen();
+      setIsFullscreen(fs);
+    } catch {
+      setIsFullscreen(!isFullscreen);
+    }
   };
 
   return (
@@ -45,7 +40,7 @@ export const Titlebar: React.FC = () => {
         <button
           onClick={handleToggleFullscreen}
           className="w-8 h-7 flex items-center justify-center text-[#787b86] hover:text-[#d1d4dc] hover:bg-[#1e222d] rounded transition-colors cursor-pointer"
-          title={isFullscreen ? 'Exit Fullscreen (Alt+F)' : 'Fullscreen Mode (Alt+F)'}
+          title={isFullscreen ? 'Exit Fullscreen' : 'Fullscreen Mode'}
           aria-label="Toggle Fullscreen"
         >
           {isFullscreen ? <Minimize2 size={13} /> : <Maximize2 size={13} />}

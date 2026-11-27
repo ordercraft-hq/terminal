@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { ShieldAlert, Globe, Cpu, Check, X } from 'lucide-react';
 
 interface ScriptPermissionModalProps {
@@ -21,6 +21,15 @@ export const ScriptPermissionModal: React.FC<ScriptPermissionModalProps> = ({
     }
     return initial;
   });
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const next: Record<string, boolean> = {};
+    for (const p of requestedPermissions) {
+      next[p] = true;
+    }
+    setSelected(next);
+  }, [isOpen, requestedPermissions]);
 
   if (!isOpen) return null;
 

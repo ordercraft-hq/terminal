@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { useShallow } from 'zustand/react/shallow';
 import { useSyncStore } from '../../store/syncStore';
 import type { LayoutType } from '../../store/syncStore';
 import { Check, Link, Clock, Crosshair, Calendar } from 'lucide-react';
@@ -27,18 +28,22 @@ export const LayoutSelectorPopover: React.FC<LayoutSelectorPopoverProps> = ({
   const {
     layoutType,
     setLayoutType,
-    panes,
-    symbol: activeSymbol,
-    timeframe: activeTimeframe,
-    symbolLock,
-    intervalLock,
     crosshairLock,
     dateRangeLock,
     toggleLock,
-  } = useSyncStore();
-
-  const isSymbolSynced = symbolLock && !Object.values(panes).some((p) => p.symbol !== activeSymbol);
-  const isIntervalSynced = intervalLock && !Object.values(panes).some((p) => p.timeframe !== activeTimeframe);
+    isSymbolSynced,
+    isIntervalSynced,
+  } = useSyncStore(
+    useShallow((s) => ({
+      layoutType: s.layoutType,
+      setLayoutType: s.setLayoutType,
+      crosshairLock: s.crosshairLock,
+      dateRangeLock: s.dateRangeLock,
+      toggleLock: s.toggleLock,
+      isSymbolSynced: s.symbolLock && !Object.values(s.panes).some((p) => p.symbol !== s.symbol),
+      isIntervalSynced: s.intervalLock && !Object.values(s.panes).some((p) => p.timeframe !== s.timeframe),
+    }))
+  );
 
   useEffect(() => {
     if (isOpen && anchorRef.current) {

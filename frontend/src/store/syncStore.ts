@@ -1,6 +1,12 @@
 import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
+import {
+  persist,
+  subscribeWithSelector,
+  type PersistStorage,
+  type StorageValue,
+} from 'zustand/middleware';
 import { isTimeframeSupported, getFallbackTimeframe } from '../utils/timeframeSupport';
+import { isChartTypeSupported, getFallbackChartType } from '../utils/chartTypeSupport';
 import type {
   IndicatorInstance,
   IndicatorType,
@@ -15,7 +21,7 @@ import {
   migrateFavoriteIndicators,
   normalizeIndicatorId,
 } from '../indicators/migration';
-import { transport } from '../transport/client';
+import { transport, type LayoutMetadata } from '../transport/client';
 import { checkGitHubUpdate, type UpdateCheckResult } from '../services/updateService';
 import { APP_VERSION } from '../version';
 import { DEFAULT_SCRIPT_TEMPLATE } from '../components/BottomDrawer/templates';
@@ -34,7 +40,8 @@ export type ChartType =
   | 'baseline'
   | 'high_low'
   | 'heikin_ashi'
-  | 'renko';
+  | 'renko'
+  | 'footprint';
 export type CursorType = 'cross' | 'dot' | 'arrow';
 export type FavoriteItemType = DrawingToolType | CursorType;
 export type DrawingToolType =
@@ -123,7 +130,164 @@ export type RightSidebarTab =
   | 'notifications'
   | 'help'
   | 'issues'
+  | 'orderflow'
   | null;
+
+export interface ImbalanceRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  imbalancePercent: number; // e.g. 300
+  deltaFilter: number;       // e.g. 15
+  deltaFilterEnabled: boolean;
+  sellColor: string;         // e.g. '#d8b4e2'
+  sellLineWidth: number;     // e.g. 1.0
+  sellLineStyle: 'solid' | 'dashed' | 'dotted';
+  sellDisplay: boolean;
+  buyColor: string;          // e.g. '#8da9c4'
+  buyLineWidth: number;      // e.g. 1.0
+  buyLineStyle: 'solid' | 'dashed' | 'dotted';
+  buyDisplay: boolean;
+  createdAt?: number;
+}
+
+export interface ImbalanceGlobalSettings {
+  skipZeroValues: boolean;
+  showStackedImbalances: boolean;
+  showMitigatedZones: boolean;
+  drawZoneBorders: boolean;
+  stackedMinLevels: number;
+}
+
+export interface OrderflowSettings {
+  enabled: boolean;
+  aggregateProfiles: boolean;
+  convertClusterToCandlesOnZoom: boolean;
+  includeEmptyLevels: boolean;
+  barVisualization: 'None' | 'Bid x Ask' | 'Delta';
+  candleZone: 'Candle' | 'Bar' | 'None';
+  candleZonePosition: 'Footprint #1' | 'Behind' | 'Front';
+  barMarginPx: number;
+  calculateFontSizeAuto: boolean;
+  maxValueCalculation: 'Daily' | 'Session' | 'Visible range' | 'Bar';
+  activeSubTab: 'general' | 'imbalances' | 'stats' | 'volumeProfile';
+
+  // General tab options
+  showPOC: boolean;
+  pocColor: string;
+  imbalanceRepresentation: 'Highlight text' | 'Border box' | 'Box & text';
+  imbalanceBuyColor: string;
+  imbalanceSellColor: string;
+  textColor: string;
+  zeroColor: string;
+  bidColor: string;
+  askColor: string;
+  deltaPositiveColor: string;
+  deltaNegativeColor: string;
+
+  // Imbalance tab options
+  imbalanceRules: ImbalanceRule[];
+  imbalanceGlobalSettings: ImbalanceGlobalSettings;
+
+  // Stats tab options
+  showStats: boolean;
+  statsPosition: 'Below' | 'Above' | 'As per candle';
+  showDelta: boolean;
+  showTotalVolume: boolean;
+  totalVolumeColor: string;
+  showDeltaPercent: boolean;
+  deltaPercentColor: string;
+  showMinMaxDelta: boolean;
+  minDeltaColor: string;
+  maxDeltaColor: string;
+
+  // Vol Profile tab options
+  volProfileEnabled: boolean;
+  volProfileMode?: 'footprint' | 'profile' | 'both' | 'noCandle';
+  volProfileTickInterval: number;
+  volProfileBarColor: string;
+  volProfilePocBarColor: string;
+  volProfilePocBarEnabled: boolean;
+  volProfileShowValueArea: boolean;
+  volProfileValueAreaPercent: number;
+  volProfileValueAreaBarColor: string;
+  volProfileValueAreaBarEnabled: boolean;
+}
+
+export const DEFAULT_ORDERFLOW_SETTINGS: OrderflowSettings = {
+  enabled: false,
+  aggregateProfiles: true,
+  convertClusterToCandlesOnZoom: true,
+  includeEmptyLevels: true,
+  barVisualization: 'Bid x Ask',
+  candleZone: 'Candle',
+  candleZonePosition: 'Footprint #1',
+  barMarginPx: 0,
+  calculateFontSizeAuto: true,
+  maxValueCalculation: 'Daily',
+  activeSubTab: 'general',
+
+  showPOC: true,
+  pocColor: '#ffb700',
+  imbalanceRepresentation: 'Highlight text',
+  imbalanceBuyColor: '#00e676',
+  imbalanceSellColor: '#ff5252',
+  textColor: '#d1d4dc',
+  zeroColor: '#505460',
+  bidColor: '#f23645',
+  askColor: '#089981',
+  deltaPositiveColor: '#089981',
+  deltaNegativeColor: '#f23645',
+
+  imbalanceRules: [
+    {
+      id: 'imb_default',
+      name: '300% • Delta ≥ 15',
+      enabled: true,
+      imbalancePercent: 300,
+      deltaFilter: 15,
+      deltaFilterEnabled: true,
+      sellColor: '#d8b4e2',
+      sellLineWidth: 1.0,
+      sellLineStyle: 'solid',
+      sellDisplay: true,
+      buyColor: '#8da9c4',
+      buyLineWidth: 1.0,
+      buyLineStyle: 'solid',
+      buyDisplay: true,
+      createdAt: 1700000000000,
+    },
+  ],
+  imbalanceGlobalSettings: {
+    skipZeroValues: false,
+    showStackedImbalances: true,
+    showMitigatedZones: true,
+    drawZoneBorders: false,
+    stackedMinLevels: 3,
+  },
+
+  showStats: true,
+  statsPosition: 'Below',
+  showDelta: true,
+  showTotalVolume: true,
+  totalVolumeColor: '#d1d4dc',
+  showDeltaPercent: false,
+  deltaPercentColor: '#ffb700',
+  showMinMaxDelta: false,
+  minDeltaColor: '#f23645',
+  maxDeltaColor: '#089981',
+
+  volProfileEnabled: false,
+  volProfileMode: 'footprint',
+  volProfileTickInterval: 1,
+  volProfileBarColor: '#50535e',
+  volProfilePocBarColor: '#d1d4dc',
+  volProfilePocBarEnabled: true,
+  volProfileShowValueArea: true,
+  volProfileValueAreaPercent: 70.0,
+  volProfileValueAreaBarColor: '#787b86',
+  volProfileValueAreaBarEnabled: true,
+};
 
 export interface WatchlistItem {
   symbol: string;
@@ -135,6 +299,14 @@ export interface WatchlistItem {
   volume?: number;
   prevPrice?: number;
   lastUpdated?: number;
+}
+
+export interface WatchlistTickUpdate {
+  lastPrice?: number;
+  change?: number;
+  changePct?: number;
+  volume?: number;
+  name?: string;
 }
 
 export interface WatchlistTableSettings {
@@ -215,6 +387,7 @@ export interface ChartPaneConfig {
   chartType: ChartType;
   timezone: string;
   settings?: ChartVisualSettings;
+  orderflowSettings?: OrderflowSettings;
 }
 
 export interface HistorySnapshot {
@@ -521,8 +694,8 @@ interface SyncStoreState {
   chartSettings: ChartVisualSettings;
   openChartSettings: (paneId?: string) => void;
   closeChartSettings: () => void;
-  updateChartSettings: (partial: Partial<ChartVisualSettings>) => void;
-  updatePaneSettings: (paneId: string, partial: Partial<ChartVisualSettings>) => void;
+  updateChartSettings: (partial: Partial<ChartVisualSettings>, skipHistory?: boolean) => void;
+  updatePaneSettings: (paneId: string, partial: Partial<ChartVisualSettings>, skipHistory?: boolean) => void;
   applySettingsToAllPanes: (settings?: ChartVisualSettings) => void;
   resetChartSettings: (paneId?: string) => void;
 
@@ -578,6 +751,7 @@ interface SyncStoreState {
   setLayout: (id: string, name: string) => void;
   saveCurrentLayout: () => Promise<string>;
   loadLayoutById: (targetId: string, targetName: string) => Promise<boolean>;
+  initializeStartupLayout: () => Promise<void>;
   createNewLayout: (newName: string) => Promise<string>;
   cloneCurrentLayout: (copyName: string) => Promise<string>;
   renameCurrentLayout: (newName: string) => Promise<void>;
@@ -620,11 +794,11 @@ interface SyncStoreState {
   addIndicatorToPane: (paneId: string, type: IndicatorType) => IndicatorInstance;
   removeIndicatorFromPane: (paneId: string, indicatorId: string) => void;
   clearIndicatorsFromPane: (paneId: string) => void;
-  updateIndicatorInputs: (paneId: string, indicatorId: string, inputs: Record<string, IndicatorInputValue>) => void;
-  updateIndicatorStyles: (paneId: string, indicatorId: string, styles: Record<string, IndicatorPlotStyle>) => void;
-  updateIndicatorBands: (paneId: string, indicatorId: string, bands: IndicatorBandStyle[]) => void;
-  updateIndicatorLevels: (paneId: string, indicatorId: string, levels: IndicatorLevelStyle[]) => void;
-  updateIndicatorMeta: (paneId: string, indicatorId: string, meta: Partial<IndicatorInstance>) => void;
+  updateIndicatorInputs: (paneId: string, indicatorId: string, inputs: Record<string, IndicatorInputValue>, skipHistory?: boolean) => void;
+  updateIndicatorStyles: (paneId: string, indicatorId: string, styles: Record<string, IndicatorPlotStyle>, skipHistory?: boolean) => void;
+  updateIndicatorBands: (paneId: string, indicatorId: string, bands: IndicatorBandStyle[], skipHistory?: boolean) => void;
+  updateIndicatorLevels: (paneId: string, indicatorId: string, levels: IndicatorLevelStyle[], skipHistory?: boolean) => void;
+  updateIndicatorMeta: (paneId: string, indicatorId: string, meta: Partial<IndicatorInstance>, skipHistory?: boolean) => void;
   toggleIndicatorVisibility: (paneId: string, indicatorId: string) => void;
   swapIndicators: (paneId: string, id1: string, id2: string) => void;
   toggleFavoriteIndicator: (type: string) => void;
@@ -635,6 +809,18 @@ interface SyncStoreState {
   setActiveRightSidebarTab: (tab: RightSidebarTab) => void;
   toggleRightSidebarTab: (tab: RightSidebarTab) => void;
   setRightSidebarWidth: (width: number) => void;
+
+  // Orderflow & L2 Suite
+  orderflowSettings: OrderflowSettings;
+  hasL2Provider: boolean;
+  setOrderflowSettings: (settings: Partial<OrderflowSettings>) => void;
+  updatePaneOrderflowSettings: (paneId: string, partial: Partial<OrderflowSettings>) => void;
+  setHasL2Provider: (hasL2: boolean) => void;
+  addImbalanceRule: (rule: Omit<ImbalanceRule, 'id'>) => Promise<void>;
+  updateImbalanceRule: (id: string, partial: Partial<ImbalanceRule>) => Promise<void>;
+  deleteImbalanceRule: (id: string) => Promise<void>;
+  setImbalanceGlobalSettings: (partial: Partial<ImbalanceGlobalSettings>) => void;
+  loadImbalanceRulesFromDb: () => Promise<void>;
 
   // Bottom Drawer & OrderScript Editor
   isBottomDrawerOpen: boolean;
@@ -664,6 +850,7 @@ interface SyncStoreState {
   clearWatchlist: (watchlistId: string) => void;
   sortWatchlist: (watchlistId: string, mode: 'symbol_asc' | 'symbol_desc' | 'chg_asc' | 'chg_desc' | 'vol_desc' | 'price_desc') => void;
   updateWatchlistTick: (symbol: string, price: number, change?: number, changePct?: number, volume?: number, name?: string) => void;
+  updateWatchlistTicks: (updates: Record<string, WatchlistTickUpdate>) => void;
 
   // Alerts
   alerts: AlertItem[];
@@ -682,6 +869,7 @@ interface SyncStoreState {
   historyPast: HistorySnapshot[];
   historyFuture: HistorySnapshot[];
   pushHistory: (description: string) => void;
+  commitSnapshot: (description: string) => void;
   undo: () => void;
   redo: () => void;
 
@@ -704,6 +892,17 @@ export const createDefaultVolumeIndicator = (paneId: string): IndicatorInstance 
     ma: { color: '#2962FF', lineWidth: 1, lineStyle: 'solid', plotType: 'line', visible: false, lastValueVisible: false, priceLineVisible: false },
   },
 });
+
+export const DEFAULT_INDICATORS: Record<string, IndicatorInstance[]> = {
+  'pane-1': [createDefaultVolumeIndicator('pane-1')],
+  'pane-2': [createDefaultVolumeIndicator('pane-2')],
+  'pane-3': [createDefaultVolumeIndicator('pane-3')],
+  'pane-4': [createDefaultVolumeIndicator('pane-4')],
+  'pane-5': [createDefaultVolumeIndicator('pane-5')],
+  'pane-6': [createDefaultVolumeIndicator('pane-6')],
+  'pane-7': [createDefaultVolumeIndicator('pane-7')],
+  'pane-8': [createDefaultVolumeIndicator('pane-8')],
+};
 
 export function getTimeframeSeconds(tf: string): number {
   const clean = tf.trim();
@@ -736,19 +935,188 @@ export function getTimeframeSeconds(tf: string): number {
   return 60;
 }
 
+function cloneSnapshotValue<T>(value: T): T {
+  if (typeof structuredClone === 'function') {
+    try {
+      return structuredClone(value);
+    } catch {
+      // Fallback for non-cloneable edge cases
+    }
+  }
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+interface SnapshotCloneCache {
+  panesRef?: Record<string, ChartPaneConfig>;
+  panesClone?: Record<string, ChartPaneConfig>;
+  drawingsRef?: UserDrawing[];
+  drawingsClone?: UserDrawing[];
+  deletedRef?: Record<string, boolean>;
+  deletedClone?: Record<string, boolean>;
+  indicatorsRef?: Record<string, IndicatorInstance[]>;
+  indicatorsClone?: Record<string, IndicatorInstance[]>;
+  chartSettingsRef?: ChartVisualSettings;
+  chartSettingsClone?: ChartVisualSettings;
+}
+
+const snapshotCloneCache: SnapshotCloneCache = {};
+
 function createSnapshot(state: SyncStoreState, description: string): HistorySnapshot {
+  const panesSrc = state.panes || {};
+  const drawingsSrc = state.drawings || [];
+  const deletedSrc = state.deletedDrawingIds || {};
+  const indicatorsSrc = state.indicators || {};
+  const chartSettingsSrc = state.chartSettings || DEFAULT_CHART_SETTINGS;
+
+  if (snapshotCloneCache.panesRef !== panesSrc || !snapshotCloneCache.panesClone) {
+    snapshotCloneCache.panesRef = panesSrc;
+    snapshotCloneCache.panesClone = cloneSnapshotValue(panesSrc);
+  }
+  if (snapshotCloneCache.drawingsRef !== drawingsSrc || !snapshotCloneCache.drawingsClone) {
+    snapshotCloneCache.drawingsRef = drawingsSrc;
+    snapshotCloneCache.drawingsClone = cloneSnapshotValue(drawingsSrc);
+  }
+  if (snapshotCloneCache.deletedRef !== deletedSrc || !snapshotCloneCache.deletedClone) {
+    snapshotCloneCache.deletedRef = deletedSrc;
+    snapshotCloneCache.deletedClone = { ...deletedSrc };
+  }
+  if (snapshotCloneCache.indicatorsRef !== indicatorsSrc || !snapshotCloneCache.indicatorsClone) {
+    snapshotCloneCache.indicatorsRef = indicatorsSrc;
+    snapshotCloneCache.indicatorsClone = cloneSnapshotValue(indicatorsSrc);
+  }
+  if (snapshotCloneCache.chartSettingsRef !== chartSettingsSrc || !snapshotCloneCache.chartSettingsClone) {
+    snapshotCloneCache.chartSettingsRef = chartSettingsSrc;
+    snapshotCloneCache.chartSettingsClone = cloneSnapshotValue(chartSettingsSrc);
+  }
+
   return {
     description,
     symbol: state.symbol,
     timeframe: state.timeframe,
     chartType: state.chartType,
     activePaneId: state.activePaneId,
-    panes: JSON.parse(JSON.stringify(state.panes || {})),
-    drawings: JSON.parse(JSON.stringify(state.drawings || [])),
-    deletedDrawingIds: { ...(state.deletedDrawingIds || {}) },
-    indicators: JSON.parse(JSON.stringify(state.indicators || {})),
-    chartSettings: JSON.parse(JSON.stringify(state.chartSettings || DEFAULT_CHART_SETTINGS)),
+    panes: snapshotCloneCache.panesClone,
+    drawings: snapshotCloneCache.drawingsClone,
+    deletedDrawingIds: snapshotCloneCache.deletedClone,
+    indicators: snapshotCloneCache.indicatorsClone,
+    chartSettings: snapshotCloneCache.chartSettingsClone,
   };
+}
+
+function buildLayoutPayload(state: SyncStoreState) {
+  return {
+    version: 2,
+    layoutType: state.layoutType,
+    layoutRatios: state.layoutRatios,
+    activePaneId: state.activePaneId,
+    panes: state.panes,
+    orderflowSettings: state.orderflowSettings,
+    indicators: state.indicators,
+    chartSettings: state.chartSettings,
+    symbol: state.symbol,
+    timeframe: state.timeframe,
+    chartType: state.chartType,
+    timezone: state.timezone,
+    symbolLock: state.symbolLock,
+    intervalLock: state.intervalLock,
+    crosshairLock: state.crosshairLock,
+    dateRangeLock: state.dateRangeLock,
+    trackTimeLock: state.trackTimeLock,
+    timestamp: Date.now(),
+  };
+}
+
+function createDebouncedPersistStorage<S>(delayMs = 300): PersistStorage<S> & { flushAll: () => void } {
+  const pendingWrites = new Map<string, StorageValue<S>>();
+  const writeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  const flushKey = (name: string) => {
+    const timer = writeTimers.get(name);
+    if (timer) {
+      clearTimeout(timer);
+      writeTimers.delete(name);
+    }
+    const pending = pendingWrites.get(name);
+    if (pending === undefined) return;
+    pendingWrites.delete(name);
+
+    if (typeof localStorage === 'undefined') return;
+    try {
+      localStorage.setItem(name, JSON.stringify(pending));
+    } catch (err) {
+      console.warn('[SyncStore] Failed to persist state to localStorage:', err);
+    }
+  };
+
+  const flushAll = () => {
+    for (const name of Array.from(pendingWrites.keys())) {
+      flushKey(name);
+    }
+  };
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('beforeunload', flushAll);
+  }
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        flushAll();
+      }
+    });
+  }
+
+  return {
+    getItem: (name: string): StorageValue<S> | null => {
+      const pending = pendingWrites.get(name);
+      if (pending !== undefined) {
+        return pending;
+      }
+      if (typeof localStorage === 'undefined') return null;
+      try {
+        const raw = localStorage.getItem(name);
+        if (!raw) return null;
+        return JSON.parse(raw) as StorageValue<S>;
+      } catch {
+        return null;
+      }
+    },
+    setItem: (name: string, value: StorageValue<S>): void => {
+      pendingWrites.set(name, value);
+      const existing = writeTimers.get(name);
+      if (existing) {
+        clearTimeout(existing);
+      }
+      const timer = setTimeout(() => {
+        flushKey(name);
+      }, delayMs);
+      const maybeUnref = timer as unknown as { unref?: () => void };
+      if (typeof maybeUnref.unref === 'function') {
+        maybeUnref.unref();
+      }
+      writeTimers.set(name, timer);
+    },
+    removeItem: (name: string): void => {
+      const existing = writeTimers.get(name);
+      if (existing) {
+        clearTimeout(existing);
+        writeTimers.delete(name);
+      }
+      pendingWrites.delete(name);
+      if (typeof localStorage === 'undefined') return;
+      try {
+        localStorage.removeItem(name);
+      } catch {
+        // Ignore storage errors
+      }
+    },
+    flushAll,
+  };
+}
+
+const debouncedWorkspaceStorage = createDebouncedPersistStorage<Partial<SyncStoreState>>(300);
+
+export function flushPersistedWorkspaceStorage(): void {
+  debouncedWorkspaceStorage.flushAll();
 }
 
 function syncDrawingChangesToBackend(
@@ -787,8 +1155,23 @@ function syncDrawingChangesToBackend(
   }
 }
 
+let layoutDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+export const triggerDebouncedLayoutSave = () => {
+  if (layoutDebounceTimer) {
+    clearTimeout(layoutDebounceTimer);
+  }
+  layoutDebounceTimer = setTimeout(async () => {
+    try {
+      await useSyncStore.getState().saveCurrentLayout();
+    } catch (e) {
+      console.warn('[SyncStore] Auto-saving layout failed:', e);
+    }
+  }, 500);
+};
+
 export const useSyncStore = create<SyncStoreState>()(
-  persist(
+  subscribeWithSelector(
+    persist(
     (set, get) => ({
       // Version & Updates
       updateCheckResult: {
@@ -801,12 +1184,9 @@ export const useSyncStore = create<SyncStoreState>()(
         try {
           let current = get().updateCheckResult.currentVersion || APP_VERSION;
           try {
-            const vRes = await fetch('/api/version');
-            if (vRes.ok) {
-              const vData = await vRes.json();
-              if (vData && vData.version) {
-                current = vData.version;
-              }
+            const serverVersion = await transport.getVersion();
+            if (serverVersion) {
+              current = serverVersion;
             }
           } catch {}
 
@@ -840,6 +1220,10 @@ export const useSyncStore = create<SyncStoreState>()(
           undoDescription: description,
           redoDescription: null,
         });
+      },
+
+      commitSnapshot: (description: string) => {
+        get().pushHistory(description);
       },
 
       undo: () => {
@@ -973,8 +1357,10 @@ export const useSyncStore = create<SyncStoreState>()(
           isChartSettingsOpen: false,
           targetSettingsPaneId: null,
         }),
-      updatePaneSettings: (paneId, partial) => {
-        get().pushHistory('change chart settings');
+      updatePaneSettings: (paneId, partial, skipHistory = false) => {
+        if (!skipHistory) {
+          get().pushHistory('change chart settings');
+        }
         set((state) => {
           const curPane = state.panes[paneId] || DEFAULT_PANES[paneId] || {
             id: paneId,
@@ -996,8 +1382,10 @@ export const useSyncStore = create<SyncStoreState>()(
           };
         });
       },
-      updateChartSettings: (partial) => {
-        get().pushHistory('change chart settings');
+      updateChartSettings: (partial, skipHistory = false) => {
+        if (!skipHistory) {
+          get().pushHistory('change chart settings');
+        }
         set((state) => {
           const targetId = state.targetSettingsPaneId || state.activePaneId;
           if (targetId && state.panes[targetId]) {
@@ -1095,6 +1483,7 @@ export const useSyncStore = create<SyncStoreState>()(
         set((state) => {
           const neededPanes = getPanesForLayout(layoutType);
           const updatedPanes = { ...state.panes };
+          const updatedIndicators = { ...state.indicators };
           // Ensure all needed panes exist with valid defaults
           neededPanes.forEach((id) => {
             const existing = updatedPanes[id];
@@ -1113,11 +1502,54 @@ export const useSyncStore = create<SyncStoreState>()(
                 timeframe: state.intervalLock ? state.timeframe : existing.timeframe,
               };
             }
+            if (updatedIndicators[id] === undefined) {
+              updatedIndicators[id] = [createDefaultVolumeIndicator(id)];
+            }
           });
+
+          if (!neededPanes.includes(state.activePaneId)) {
+            const nextActiveId = neededPanes[0] || 'pane-1';
+            const nextActivePane = updatedPanes[nextActiveId];
+            if (nextActivePane) {
+              const validCt = getFallbackChartType(nextActivePane.symbol, nextActivePane.chartType);
+              const isFootprint = validCt === 'footprint';
+              const nextOrderflowSettings = {
+                ...(nextActivePane.orderflowSettings || state.orderflowSettings),
+                enabled: isFootprint ? (nextActivePane.orderflowSettings?.enabled ?? true) : false,
+              };
+              if (validCt !== nextActivePane.chartType) {
+                updatedPanes[nextActiveId] = {
+                  ...nextActivePane,
+                  chartType: validCt,
+                  orderflowSettings: nextOrderflowSettings,
+                };
+              }
+              return {
+                layoutType,
+                maximizedPaneId: null,
+                activePaneId: nextActiveId,
+                symbol: nextActivePane.symbol,
+                timeframe: nextActivePane.timeframe,
+                chartType: validCt,
+                orderflowSettings: nextOrderflowSettings,
+                panes: updatedPanes,
+                indicators: updatedIndicators,
+              };
+            }
+            return {
+              layoutType,
+              maximizedPaneId: null,
+              activePaneId: nextActiveId,
+              panes: updatedPanes,
+              indicators: updatedIndicators,
+            };
+          }
+
           return {
             layoutType,
             maximizedPaneId: null,
             panes: updatedPanes,
+            indicators: updatedIndicators,
           };
         }),
 
@@ -1125,11 +1557,27 @@ export const useSyncStore = create<SyncStoreState>()(
         set((state) => {
           const pane = state.panes[activePaneId];
           if (pane) {
+            const validCt = getFallbackChartType(pane.symbol, pane.chartType);
+            const isFootprint = validCt === 'footprint';
+            const updatedPane = validCt !== pane.chartType
+              ? {
+                  ...pane,
+                  chartType: validCt,
+                  orderflowSettings: {
+                    ...(pane.orderflowSettings || state.orderflowSettings),
+                    enabled: isFootprint ? (pane.orderflowSettings?.enabled ?? true) : false,
+                  },
+                }
+              : pane;
             return {
               activePaneId,
-              symbol: pane.symbol,
-              timeframe: pane.timeframe,
-              chartType: pane.chartType,
+              symbol: updatedPane.symbol,
+              timeframe: updatedPane.timeframe,
+              chartType: validCt,
+              orderflowSettings: updatedPane.orderflowSettings || state.orderflowSettings,
+              panes: validCt !== pane.chartType
+                ? { ...state.panes, [activePaneId]: updatedPane }
+                : state.panes,
             };
           }
           return { activePaneId };
@@ -1152,6 +1600,13 @@ export const useSyncStore = create<SyncStoreState>()(
             timezone: state.timezone,
           };
           const next = { ...cur, ...partial };
+          if (partial.symbol && partial.symbol !== cur.symbol) {
+            next.timeframe = getFallbackTimeframe(partial.symbol, next.timeframe);
+            next.chartType = getFallbackChartType(partial.symbol, next.chartType);
+            if (next.chartType !== 'footprint' && next.orderflowSettings) {
+              next.orderflowSettings = { ...next.orderflowSettings, enabled: false };
+            }
+          }
           const isAct = state.activePaneId === id;
           return {
             panes: { ...state.panes, [id]: next },
@@ -1160,6 +1615,7 @@ export const useSyncStore = create<SyncStoreState>()(
                   symbol: next.symbol,
                   timeframe: next.timeframe,
                   chartType: next.chartType,
+                  orderflowSettings: next.orderflowSettings || state.orderflowSettings,
                 }
               : {}),
           };
@@ -1175,10 +1631,31 @@ export const useSyncStore = create<SyncStoreState>()(
             const updatedPanes: Record<string, ChartPaneConfig> = {};
             for (const [id, cfg] of Object.entries(state.panes)) {
               const validTf = getFallbackTimeframe(newSymbol, cfg.timeframe);
-              updatedPanes[id] = { ...cfg, symbol: newSymbol, timeframe: validTf };
+              const validCt = getFallbackChartType(newSymbol, cfg.chartType);
+              const isFootprint = validCt === 'footprint';
+              updatedPanes[id] = {
+                ...cfg,
+                symbol: newSymbol,
+                timeframe: validTf,
+                chartType: validCt,
+                orderflowSettings: {
+                  ...(cfg.orderflowSettings || state.orderflowSettings),
+                  enabled: isFootprint ? (cfg.orderflowSettings?.enabled ?? true) : false,
+                },
+              };
             }
             const activeTf = getFallbackTimeframe(newSymbol, state.timeframe);
-            return { symbol: newSymbol, timeframe: activeTf, panes: updatedPanes };
+            const activeCt = getFallbackChartType(newSymbol, state.chartType);
+            return {
+              symbol: newSymbol,
+              timeframe: activeTf,
+              chartType: activeCt,
+              orderflowSettings: {
+                ...state.orderflowSettings,
+                enabled: activeCt === 'footprint' ? state.orderflowSettings.enabled : false,
+              },
+              panes: updatedPanes,
+            };
           } else {
             const activeId = state.activePaneId || 'pane-1';
             const cur = state.panes[activeId] || {
@@ -1189,12 +1666,28 @@ export const useSyncStore = create<SyncStoreState>()(
               timezone: state.timezone,
             };
             const validTf = getFallbackTimeframe(newSymbol, cur.timeframe);
+            const validCt = getFallbackChartType(newSymbol, cur.chartType);
+            const isFootprint = validCt === 'footprint';
             return {
               symbol: newSymbol,
               timeframe: validTf,
+              chartType: validCt,
+              orderflowSettings: {
+                ...state.orderflowSettings,
+                enabled: isFootprint ? state.orderflowSettings.enabled : false,
+              },
               panes: {
                 ...state.panes,
-                [activeId]: { ...cur, symbol: newSymbol, timeframe: validTf },
+                [activeId]: {
+                  ...cur,
+                  symbol: newSymbol,
+                  timeframe: validTf,
+                  chartType: validCt,
+                  orderflowSettings: {
+                    ...(cur.orderflowSettings || state.orderflowSettings),
+                    enabled: isFootprint ? (cur.orderflowSettings?.enabled ?? true) : false,
+                  },
+                },
               },
             };
           }
@@ -1238,9 +1731,13 @@ export const useSyncStore = create<SyncStoreState>()(
 
       setChartType: (chartType) => {
         if (!chartType || chartType === get().chartType) return;
+        const activeId = get().activePaneId || 'pane-1';
+        const activeSymbol = get().panes[activeId]?.symbol || get().symbol;
+        if (!isChartTypeSupported(activeSymbol, chartType).supported) {
+          return;
+        }
         get().pushHistory('change chart type');
         set((state) => {
-          const activeId = state.activePaneId || 'pane-1';
           const cur = state.panes[activeId] || {
             id: activeId,
             symbol: state.symbol,
@@ -1252,7 +1749,18 @@ export const useSyncStore = create<SyncStoreState>()(
             chartType,
             panes: {
               ...state.panes,
-              [activeId]: { ...cur, chartType },
+              [activeId]: {
+                ...cur,
+                chartType,
+                orderflowSettings: {
+                  ...(cur.orderflowSettings || state.orderflowSettings),
+                  enabled: chartType === 'footprint',
+                },
+              },
+            },
+            orderflowSettings: {
+              ...state.orderflowSettings,
+              enabled: chartType === 'footprint',
             },
           };
         });
@@ -1471,25 +1979,7 @@ export const useSyncStore = create<SyncStoreState>()(
         }),
       saveCurrentLayout: async () => {
         const state = get();
-        const payload = {
-          version: 2,
-          layoutType: state.layoutType,
-          layoutRatios: state.layoutRatios,
-          activePaneId: state.activePaneId,
-          panes: state.panes,
-          indicators: state.indicators,
-          chartSettings: state.chartSettings,
-          symbol: state.symbol,
-          timeframe: state.timeframe,
-          chartType: state.chartType,
-          timezone: state.timezone,
-          symbolLock: state.symbolLock,
-          intervalLock: state.intervalLock,
-          crosshairLock: state.crosshairLock,
-          dateRangeLock: state.dateRangeLock,
-          trackTimeLock: state.trackTimeLock,
-          timestamp: Date.now(),
-        };
+        const payload = buildLayoutPayload(state);
         set({ isSavingLayout: true });
         try {
           const savedId = await transport.saveLayout(
@@ -1500,6 +1990,9 @@ export const useSyncStore = create<SyncStoreState>()(
             JSON.stringify(payload)
           );
           set({ isSavingLayout: false, lastSavedTimestamp: Date.now() });
+          if (typeof window !== 'undefined') {
+            localStorage.setItem('ordercraft:last_used_layout_id', state.layoutId);
+          }
           return savedId;
         } catch (err) {
           set({ isSavingLayout: false });
@@ -1523,10 +2016,41 @@ export const useSyncStore = create<SyncStoreState>()(
 
               // 2. Panes & Active Pane
               if (parsed.panes && typeof parsed.panes === 'object') {
-                set({ panes: parsed.panes });
+                const sanitizedPanes: Record<string, ChartPaneConfig> = {};
+                for (const [id, p] of Object.entries(parsed.panes as Record<string, ChartPaneConfig>)) {
+                  const validCt = getFallbackChartType(p.symbol, p.chartType);
+                  sanitizedPanes[id] = {
+                    ...p,
+                    chartType: validCt,
+                    orderflowSettings: p.orderflowSettings
+                      ? {
+                          ...p.orderflowSettings,
+                          enabled: validCt === 'footprint' ? Boolean(p.orderflowSettings.enabled) : false,
+                        }
+                      : undefined,
+                  };
+                }
+                set({ panes: sanitizedPanes });
               }
+              const targetPaneId = (parsed.activePaneId && parsed.panes?.[parsed.activePaneId])
+                ? parsed.activePaneId
+                : 'pane-1';
               if (parsed.activePaneId && parsed.panes?.[parsed.activePaneId]) {
                 get().setActivePaneId(parsed.activePaneId);
+              }
+
+              // Restore OrderFlow & Footprint Settings
+              const activeOfs = parsed.orderflowSettings || parsed.panes?.[targetPaneId]?.orderflowSettings;
+              if (activeOfs) {
+                const activeSym = parsed.symbol || parsed.panes?.[targetPaneId]?.symbol || get().symbol;
+                const isL2 = isChartTypeSupported(activeSym, 'footprint').supported;
+                set({
+                  orderflowSettings: {
+                    ...DEFAULT_ORDERFLOW_SETTINGS,
+                    ...activeOfs,
+                    enabled: isL2 ? Boolean(activeOfs.enabled) : false,
+                  },
+                });
               }
 
               // 3. Indicators (All Panes) — Migrated losslessly for multi-state regime lines
@@ -1550,7 +2074,8 @@ export const useSyncStore = create<SyncStoreState>()(
                 get().setTimeframe(parsed.timeframe);
               }
               if (parsed.chartType) {
-                get().setChartType(parsed.chartType);
+                const activeSym = parsed.symbol || get().symbol;
+                get().setChartType(getFallbackChartType(activeSym, parsed.chartType));
               }
               if (parsed.timezone) {
                 get().setTimezone(parsed.timezone);
@@ -1572,64 +2097,75 @@ export const useSyncStore = create<SyncStoreState>()(
           // 7. Update layout identity & clear drawing caches to trigger re-fetch for new layout
           get().setLayout(targetId, targetName);
           set({ lastSavedTimestamp: Date.now() });
+          if (typeof window !== 'undefined') {
+            localStorage.setItem('ordercraft:last_used_layout_id', targetId);
+          }
           return true;
         } catch (err) {
           console.error('Failed to load layout:', err);
           throw err;
         }
       },
+      initializeStartupLayout: async () => {
+        try {
+          const layouts = await transport.getLayouts();
+          if (!layouts || layouts.length === 0) {
+            return;
+          }
+
+          // 1. Look for recorded last-used layout ID in localStorage
+          const savedLastUsedId =
+            typeof window !== 'undefined'
+              ? localStorage.getItem('ordercraft:last_used_layout_id')
+              : null;
+
+          let targetLayout: LayoutMetadata | undefined;
+
+          if (savedLastUsedId) {
+            targetLayout = layouts.find((l) => l.id === savedLastUsedId);
+          }
+
+          // 2. If not found or not set, find layout with latest timestamp
+          if (!targetLayout) {
+            const sortedByTime = [...layouts].sort(
+              (a, b) => (b.timestamp || 0) - (a.timestamp || 0)
+            );
+            targetLayout = sortedByTime[0];
+          }
+
+          // 3. Load the target layout if found
+          if (targetLayout) {
+            await get().loadLayoutById(targetLayout.id, targetLayout.name);
+            if (typeof window !== 'undefined') {
+              localStorage.setItem('ordercraft:last_used_layout_id', targetLayout.id);
+            }
+          }
+        } catch (err) {
+          console.warn('[SyncStore] Failed to initialize startup layout:', err);
+        }
+      },
       createNewLayout: async (newName: string) => {
         const newId = `layout_${Date.now()}`;
         const state = get();
-        const payload = {
-          version: 2,
-          layoutType: state.layoutType,
-          layoutRatios: state.layoutRatios,
-          activePaneId: state.activePaneId,
-          panes: state.panes,
-          indicators: state.indicators,
-          chartSettings: state.chartSettings,
-          symbol: state.symbol,
-          timeframe: state.timeframe,
-          chartType: state.chartType,
-          timezone: state.timezone,
-          symbolLock: state.symbolLock,
-          intervalLock: state.intervalLock,
-          crosshairLock: state.crosshairLock,
-          dateRangeLock: state.dateRangeLock,
-          trackTimeLock: state.trackTimeLock,
-          timestamp: Date.now(),
-        };
+        const payload = buildLayoutPayload(state);
         await transport.saveLayout(newId, newName, state.symbol, state.timeframe, JSON.stringify(payload));
         get().setLayout(newId, newName);
         set({ lastSavedTimestamp: Date.now() });
+        if (typeof window !== 'undefined') {
+          localStorage.setItem('ordercraft:last_used_layout_id', newId);
+        }
         return newId;
       },
       cloneCurrentLayout: async (copyName: string) => {
         const newId = `layout_${Date.now()}`;
         const state = get();
-        const payload = {
-          version: 2,
-          layoutType: state.layoutType,
-          layoutRatios: state.layoutRatios,
-          activePaneId: state.activePaneId,
-          panes: state.panes,
-          indicators: state.indicators,
-          chartSettings: state.chartSettings,
-          symbol: state.symbol,
-          timeframe: state.timeframe,
-          chartType: state.chartType,
-          timezone: state.timezone,
-          symbolLock: state.symbolLock,
-          intervalLock: state.intervalLock,
-          crosshairLock: state.crosshairLock,
-          dateRangeLock: state.dateRangeLock,
-          trackTimeLock: state.trackTimeLock,
-          timestamp: Date.now(),
-        };
+        const payload = buildLayoutPayload(state);
         await transport.saveLayout(newId, copyName, state.symbol, state.timeframe, JSON.stringify(payload));
         get().setLayout(newId, copyName);
         set({ lastSavedTimestamp: Date.now() });
+        if (typeof window !== 'undefined') {
+          localStorage.setItem('ordercraft:last_used_layout_id', newId);
+        }
         return newId;
       },
       renameCurrentLayout: async (newName: string) => {
@@ -1752,7 +2288,7 @@ export const useSyncStore = create<SyncStoreState>()(
 
       // Technical Indicators
       indicators: {
-        'pane-1': [createDefaultVolumeIndicator('pane-1')],
+        ...DEFAULT_INDICATORS,
       },
       favoriteIndicators: ['volume', 'sma', 'bollinger_bands', 'rsi', 'macd', 'supertrend'],
       isIndicatorsModalOpen: false,
@@ -1786,7 +2322,9 @@ export const useSyncStore = create<SyncStoreState>()(
         };
 
         set((state) => {
-          const currentList = state.indicators[paneId] || [];
+          const currentList = state.indicators[paneId] !== undefined
+            ? state.indicators[paneId]
+            : [createDefaultVolumeIndicator(paneId)];
           return {
             indicators: {
               ...state.indicators,
@@ -1799,12 +2337,16 @@ export const useSyncStore = create<SyncStoreState>()(
       },
 
       removeIndicatorFromPane: (paneId: string, indicatorId: string) => {
-        const currentList = get().indicators[paneId] || [];
+        const currentList = get().indicators[paneId] !== undefined
+          ? get().indicators[paneId]
+          : [createDefaultVolumeIndicator(paneId)];
         if (!currentList.some((ind) => ind.id === indicatorId)) return;
         get().pushHistory('remove indicator');
         set((state) => {
-          const currentList = state.indicators[paneId] || [];
-          const updated = currentList.filter((ind) => ind.id !== indicatorId);
+          const list = state.indicators[paneId] !== undefined
+            ? state.indicators[paneId]
+            : [createDefaultVolumeIndicator(paneId)];
+          const updated = list.filter((ind) => ind.id !== indicatorId);
           return {
             indicators: {
               ...state.indicators,
@@ -1815,7 +2357,9 @@ export const useSyncStore = create<SyncStoreState>()(
       },
 
       clearIndicatorsFromPane: (paneId: string) => {
-        const currentList = get().indicators[paneId] || [];
+        const currentList = get().indicators[paneId] !== undefined
+          ? get().indicators[paneId]
+          : [createDefaultVolumeIndicator(paneId)];
         if (currentList.length === 0) return;
         get().pushHistory('remove all indicators');
         set((state) => ({
@@ -1827,11 +2371,15 @@ export const useSyncStore = create<SyncStoreState>()(
       },
 
       swapIndicators: (paneId: string, id1: string, id2: string) => {
-        const list = get().indicators[paneId] || [];
+        const list = get().indicators[paneId] !== undefined
+          ? get().indicators[paneId]
+          : [createDefaultVolumeIndicator(paneId)];
         if (!list.some((i) => i.id === id1) || !list.some((i) => i.id === id2)) return;
         get().pushHistory('reorder indicators');
         set((state) => {
-          const list = [...(state.indicators[paneId] || [])];
+          const list = [...(state.indicators[paneId] !== undefined
+            ? state.indicators[paneId]
+            : [createDefaultVolumeIndicator(paneId)])];
           const idx1 = list.findIndex((i) => i.id === id1);
           const idx2 = list.findIndex((i) => i.id === id2);
           if (idx1 === -1 || idx2 === -1) return state;
@@ -1847,10 +2395,14 @@ export const useSyncStore = create<SyncStoreState>()(
         });
       },
 
-      updateIndicatorInputs: (paneId: string, indicatorId: string, inputs: Record<string, IndicatorInputValue>) => {
-        get().pushHistory('modify indicator settings');
+      updateIndicatorInputs: (paneId: string, indicatorId: string, inputs: Record<string, IndicatorInputValue>, skipHistory = false) => {
+        if (!skipHistory) {
+          get().pushHistory('modify indicator settings');
+        }
         set((state) => {
-          const currentList = state.indicators[paneId] || [];
+          const currentList = state.indicators[paneId] !== undefined
+            ? state.indicators[paneId]
+            : [createDefaultVolumeIndicator(paneId)];
           const updated = currentList.map((ind) =>
             ind.id === indicatorId ? { ...ind, inputs: { ...ind.inputs, ...inputs } } : ind
           );
@@ -1863,10 +2415,14 @@ export const useSyncStore = create<SyncStoreState>()(
         });
       },
 
-      updateIndicatorStyles: (paneId: string, indicatorId: string, styles: Record<string, IndicatorPlotStyle>) => {
-        get().pushHistory('modify indicator settings');
+      updateIndicatorStyles: (paneId: string, indicatorId: string, styles: Record<string, IndicatorPlotStyle>, skipHistory = false) => {
+        if (!skipHistory) {
+          get().pushHistory('modify indicator settings');
+        }
         set((state) => {
-          const currentList = state.indicators[paneId] || [];
+          const currentList = state.indicators[paneId] !== undefined
+            ? state.indicators[paneId]
+            : [createDefaultVolumeIndicator(paneId)];
           const updated = currentList.map((ind) =>
             ind.id === indicatorId ? { ...ind, styles: { ...ind.styles, ...styles } } : ind
           );
@@ -1879,10 +2435,14 @@ export const useSyncStore = create<SyncStoreState>()(
         });
       },
 
-      updateIndicatorBands: (paneId: string, indicatorId: string, bands: IndicatorBandStyle[]) => {
-        get().pushHistory('modify indicator bands');
+      updateIndicatorBands: (paneId: string, indicatorId: string, bands: IndicatorBandStyle[], skipHistory = false) => {
+        if (!skipHistory) {
+          get().pushHistory('modify indicator bands');
+        }
         set((state) => {
-          const currentList = state.indicators[paneId] || [];
+          const currentList = state.indicators[paneId] !== undefined
+            ? state.indicators[paneId]
+            : [createDefaultVolumeIndicator(paneId)];
           const updated = currentList.map((ind) =>
             ind.id === indicatorId ? { ...ind, bands } : ind
           );
@@ -1895,10 +2455,14 @@ export const useSyncStore = create<SyncStoreState>()(
         });
       },
 
-      updateIndicatorLevels: (paneId: string, indicatorId: string, levels: IndicatorLevelStyle[]) => {
-        get().pushHistory('modify indicator levels');
+      updateIndicatorLevels: (paneId: string, indicatorId: string, levels: IndicatorLevelStyle[], skipHistory = false) => {
+        if (!skipHistory) {
+          get().pushHistory('modify indicator levels');
+        }
         set((state) => {
-          const currentList = state.indicators[paneId] || [];
+          const currentList = state.indicators[paneId] !== undefined
+            ? state.indicators[paneId]
+            : [createDefaultVolumeIndicator(paneId)];
           const updated = currentList.map((ind) =>
             ind.id === indicatorId ? { ...ind, levels } : ind
           );
@@ -1911,10 +2475,14 @@ export const useSyncStore = create<SyncStoreState>()(
         });
       },
 
-      updateIndicatorMeta: (paneId: string, indicatorId: string, meta: Partial<IndicatorInstance>) => {
-        get().pushHistory('modify indicator meta');
+      updateIndicatorMeta: (paneId: string, indicatorId: string, meta: Partial<IndicatorInstance>, skipHistory = false) => {
+        if (!skipHistory) {
+          get().pushHistory('modify indicator meta');
+        }
         set((state) => {
-          const currentList = state.indicators[paneId] || [];
+          const currentList = state.indicators[paneId] !== undefined
+            ? state.indicators[paneId]
+            : [createDefaultVolumeIndicator(paneId)];
           const updated = currentList.map((ind) =>
             ind.id === indicatorId ? { ...ind, ...meta } : ind
           );
@@ -1930,7 +2498,9 @@ export const useSyncStore = create<SyncStoreState>()(
       toggleIndicatorVisibility: (paneId: string, indicatorId: string) => {
         get().pushHistory('toggle indicator visibility');
         set((state) => {
-          const currentList = state.indicators[paneId] || [];
+          const currentList = state.indicators[paneId] !== undefined
+            ? state.indicators[paneId]
+            : [createDefaultVolumeIndicator(paneId)];
           const updated = currentList.map((ind) =>
             ind.id === indicatorId ? { ...ind, visible: !ind.visible } : ind
           );
@@ -1962,6 +2532,309 @@ export const useSyncStore = create<SyncStoreState>()(
         })),
       setRightSidebarWidth: (width: number) =>
         set({ rightSidebarWidth: Math.max(280, Math.min(600, width)) }),
+
+      // Orderflow & L2 Suite
+      orderflowSettings: DEFAULT_ORDERFLOW_SETTINGS,
+      hasL2Provider: false,
+      setOrderflowSettings: (settings: Partial<OrderflowSettings>) => {
+        set((state) => {
+          const activeId = state.activePaneId || 'pane-1';
+          const curPane = state.panes[activeId] || DEFAULT_PANES[activeId] || {
+            id: activeId,
+            symbol: state.symbol,
+            timeframe: state.timeframe,
+            chartType: state.chartType,
+            timezone: state.timezone,
+          };
+          const curSettings = curPane.orderflowSettings || state.orderflowSettings;
+          const newSettings = { ...curSettings, ...settings };
+          let targetChartType: ChartType | undefined;
+          if (settings.enabled !== undefined) {
+            const desired: ChartType = settings.enabled ? 'footprint' : 'candles';
+            targetChartType = getFallbackChartType(curPane.symbol, desired);
+            if (targetChartType !== 'footprint') {
+              newSettings.enabled = false;
+            }
+          }
+          return {
+            orderflowSettings: newSettings,
+            ...(targetChartType ? { chartType: targetChartType } : {}),
+            panes: {
+              ...state.panes,
+              [activeId]: {
+                ...curPane,
+                orderflowSettings: newSettings,
+                ...(targetChartType ? { chartType: targetChartType } : {}),
+              },
+            },
+          };
+        });
+        triggerDebouncedLayoutSave();
+      },
+      updatePaneOrderflowSettings: (paneId: string, partial: Partial<OrderflowSettings>) => {
+        set((state) => {
+          const curPane = state.panes[paneId] || DEFAULT_PANES[paneId] || {
+            id: paneId,
+            symbol: state.symbol,
+            timeframe: state.timeframe,
+            chartType: state.chartType,
+            timezone: state.timezone,
+          };
+          const curSettings = curPane.orderflowSettings || state.orderflowSettings;
+          const nextSettings = { ...curSettings, ...partial };
+          let targetChartType: ChartType | undefined;
+          if (partial.enabled !== undefined) {
+            const desired: ChartType = partial.enabled ? 'footprint' : 'candles';
+            targetChartType = getFallbackChartType(curPane.symbol, desired);
+            if (targetChartType !== 'footprint') {
+              nextSettings.enabled = false;
+            }
+          } else if (partial.volProfileMode !== undefined) {
+            if (partial.volProfileMode === 'profile' || partial.volProfileMode === 'both' || partial.volProfileMode === 'noCandle') {
+              targetChartType = getFallbackChartType(curPane.symbol, 'footprint');
+              nextSettings.volProfileEnabled = targetChartType === 'footprint';
+            } else {
+              nextSettings.volProfileEnabled = false;
+            }
+          } else if (partial.volProfileEnabled !== undefined && partial.volProfileEnabled) {
+            targetChartType = getFallbackChartType(curPane.symbol, 'footprint');
+            nextSettings.volProfileEnabled = targetChartType === 'footprint';
+          }
+          const isActive = (state.activePaneId || 'pane-1') === paneId;
+          return {
+            orderflowSettings: isActive ? nextSettings : state.orderflowSettings,
+            ...(isActive && targetChartType ? { chartType: targetChartType } : {}),
+            panes: {
+              ...state.panes,
+              [paneId]: {
+                ...curPane,
+                orderflowSettings: nextSettings,
+                ...(targetChartType ? { chartType: targetChartType } : {}),
+              },
+            },
+          };
+        });
+        triggerDebouncedLayoutSave();
+      },
+      setHasL2Provider: (hasL2: boolean) => set({ hasL2Provider: hasL2 }),
+      addImbalanceRule: async (ruleInput) => {
+        const newRule: ImbalanceRule = {
+          ...ruleInput,
+          id: `imb_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          createdAt: Date.now(),
+        };
+        set((state) => {
+          const activeId = state.activePaneId || 'pane-1';
+          const curPane = state.panes[activeId] || DEFAULT_PANES[activeId] || {
+            id: activeId,
+            symbol: state.symbol,
+            timeframe: state.timeframe,
+            chartType: state.chartType,
+            timezone: state.timezone,
+          };
+          const curOfs = curPane.orderflowSettings || state.orderflowSettings;
+          const rules = [...(curOfs.imbalanceRules || []), newRule];
+          const nextOfs = { ...curOfs, imbalanceRules: rules };
+          return {
+            orderflowSettings: nextOfs,
+            panes: {
+              ...state.panes,
+              [activeId]: {
+                ...curPane,
+                orderflowSettings: nextOfs,
+              },
+            },
+          };
+        });
+        try {
+          await transport.saveImbalanceRule({
+            id: newRule.id,
+            name: newRule.name,
+            settings: JSON.stringify(newRule),
+            created_at: Math.floor((newRule.createdAt || Date.now()) / 1000),
+          });
+        } catch (err) {
+          console.warn('[SyncStore] Failed to save imbalance rule to SQLite:', err);
+        }
+        triggerDebouncedLayoutSave();
+      },
+      updateImbalanceRule: async (id, partial) => {
+        let updatedRule: ImbalanceRule | undefined;
+        set((state) => {
+          const activeId = state.activePaneId || 'pane-1';
+          const curPane = state.panes[activeId] || DEFAULT_PANES[activeId] || {
+            id: activeId,
+            symbol: state.symbol,
+            timeframe: state.timeframe,
+            chartType: state.chartType,
+            timezone: state.timezone,
+          };
+          const curOfs = curPane.orderflowSettings || state.orderflowSettings;
+          const rules = (curOfs.imbalanceRules || []).map((r) => {
+            if (r.id === id) {
+              updatedRule = { ...r, ...partial };
+              return updatedRule;
+            }
+            return r;
+          });
+          const nextOfs = { ...curOfs, imbalanceRules: rules };
+          return {
+            orderflowSettings: nextOfs,
+            panes: {
+              ...state.panes,
+              [activeId]: {
+                ...curPane,
+                orderflowSettings: nextOfs,
+              },
+            },
+          };
+        });
+        if (updatedRule) {
+          try {
+            await transport.saveImbalanceRule({
+              id: updatedRule.id,
+              name: updatedRule.name,
+              settings: JSON.stringify(updatedRule),
+              created_at: Math.floor((updatedRule.createdAt || Date.now()) / 1000),
+            });
+          } catch (err) {
+            console.warn('[SyncStore] Failed to update imbalance rule in SQLite:', err);
+          }
+        }
+        triggerDebouncedLayoutSave();
+      },
+      deleteImbalanceRule: async (id) => {
+        set((state) => {
+          const activeId = state.activePaneId || 'pane-1';
+          const curPane = state.panes[activeId] || DEFAULT_PANES[activeId] || {
+            id: activeId,
+            symbol: state.symbol,
+            timeframe: state.timeframe,
+            chartType: state.chartType,
+            timezone: state.timezone,
+          };
+          const curOfs = curPane.orderflowSettings || state.orderflowSettings;
+          const rules = (curOfs.imbalanceRules || []).filter((r) => r.id !== id);
+          const nextOfs = { ...curOfs, imbalanceRules: rules };
+          return {
+            orderflowSettings: nextOfs,
+            panes: {
+              ...state.panes,
+              [activeId]: {
+                ...curPane,
+                orderflowSettings: nextOfs,
+              },
+            },
+          };
+        });
+        try {
+          await transport.deleteImbalanceRule(id);
+        } catch (err) {
+          console.warn('[SyncStore] Failed to delete imbalance rule from SQLite:', err);
+        }
+        triggerDebouncedLayoutSave();
+      },
+      setImbalanceGlobalSettings: (partial) => {
+        set((state) => {
+          const activeId = state.activePaneId || 'pane-1';
+          const curPane = state.panes[activeId] || DEFAULT_PANES[activeId] || {
+            id: activeId,
+            symbol: state.symbol,
+            timeframe: state.timeframe,
+            chartType: state.chartType,
+            timezone: state.timezone,
+          };
+          const curOfs = curPane.orderflowSettings || state.orderflowSettings;
+          const nextOfs = {
+            ...curOfs,
+            imbalanceGlobalSettings: {
+              ...curOfs.imbalanceGlobalSettings,
+              ...partial,
+            },
+          };
+          return {
+            orderflowSettings: nextOfs,
+            panes: {
+              ...state.panes,
+              [activeId]: {
+                ...curPane,
+                orderflowSettings: nextOfs,
+              },
+            },
+          };
+        });
+        triggerDebouncedLayoutSave();
+      },
+      loadImbalanceRulesFromDb: async () => {
+        try {
+          const dbRules = await transport.getImbalanceRules();
+          if (dbRules && dbRules.length > 0) {
+            const parsed: ImbalanceRule[] = dbRules.map((d) => {
+              try {
+                const s = JSON.parse(d.settings);
+                return { ...s, id: d.id, name: d.name || s.name };
+              } catch {
+                return {
+                  id: d.id,
+                  name: d.name,
+                  enabled: true,
+                  imbalancePercent: 300,
+                  deltaFilter: 15,
+                  deltaFilterEnabled: true,
+                  sellColor: '#d8b4e2',
+                  sellLineWidth: 1.0,
+                  sellLineStyle: 'solid',
+                  sellDisplay: true,
+                  buyColor: '#8da9c4',
+                  buyLineWidth: 1.0,
+                  buyLineStyle: 'solid',
+                  buyDisplay: true,
+                };
+              }
+            });
+            set((state) => {
+              const updatedPanes = { ...state.panes };
+              for (const pid of Object.keys(updatedPanes)) {
+                const p = updatedPanes[pid];
+                if (p) {
+                  const curOfs = p.orderflowSettings || state.orderflowSettings;
+                  updatedPanes[pid] = {
+                    ...p,
+                    orderflowSettings: {
+                      ...curOfs,
+                      imbalanceRules: parsed,
+                    },
+                  };
+                }
+              }
+              return {
+                orderflowSettings: {
+                  ...state.orderflowSettings,
+                  imbalanceRules: parsed,
+                },
+                panes: updatedPanes,
+              };
+            });
+          } else {
+            // Seed DB with initial default rule if DB is empty
+            const defaultRule = DEFAULT_ORDERFLOW_SETTINGS.imbalanceRules[0];
+            if (defaultRule) {
+              try {
+                await transport.saveImbalanceRule({
+                  id: defaultRule.id,
+                  name: defaultRule.name,
+                  settings: JSON.stringify(defaultRule),
+                  created_at: Math.floor(Date.now() / 1000),
+                });
+              } catch {
+                // Ignore seed error
+              }
+            }
+          }
+        } catch (err) {
+          console.warn('[SyncStore] Could not load imbalance rules from DB:', err);
+        }
+      },
 
       // Bottom Drawer & OrderScript Editor
       isBottomDrawerOpen: false,
@@ -2122,6 +2995,50 @@ export const useSyncStore = create<SyncStoreState>()(
           });
           return hasChanged ? { watchlists: updated } : state;
         }),
+      updateWatchlistTicks: (updates: Record<string, WatchlistTickUpdate>) =>
+        set((state) => {
+          const entries = Object.entries(updates);
+          if (entries.length === 0) return state;
+
+          const exactMap = new Map<string, WatchlistTickUpdate>();
+          const strippedMap = new Map<string, WatchlistTickUpdate>();
+          for (const [rawKey, tick] of entries) {
+            const upper = rawKey.toUpperCase();
+            exactMap.set(upper, tick);
+            const stripped = upper.replace(/^OANDA:|^BINANCE:/, '');
+            if (!strippedMap.has(stripped)) {
+              strippedMap.set(stripped, tick);
+            }
+          }
+
+          const now = Date.now();
+          let hasChanged = false;
+          const updated = state.watchlists.map((w) => {
+            let itemChanged = false;
+            const nextItems = w.items.map((it) => {
+              const itUpper = it.symbol.toUpperCase();
+              const tick =
+                exactMap.get(itUpper) ??
+                strippedMap.get(itUpper.replace(/^OANDA:|^BINANCE:/, ''));
+
+              if (!tick) return it;
+              itemChanged = true;
+              hasChanged = true;
+              return {
+                ...it,
+                name: tick.name || it.name,
+                prevPrice: tick.lastPrice !== undefined ? it.lastPrice : it.prevPrice,
+                lastPrice: tick.lastPrice !== undefined ? tick.lastPrice : it.lastPrice,
+                change: tick.change !== undefined ? tick.change : it.change,
+                changePct: tick.changePct !== undefined ? tick.changePct : it.changePct,
+                volume: tick.volume !== undefined ? tick.volume : it.volume,
+                lastUpdated: now,
+              };
+            });
+            return itemChanged ? { ...w, items: nextItems } : w;
+          });
+          return hasChanged ? { watchlists: updated } : state;
+        }),
 
       // Alerts
       alerts: [] as AlertItem[],
@@ -2162,7 +3079,7 @@ export const useSyncStore = create<SyncStoreState>()(
             alerts: state.alerts.map((a) =>
               a.id === alertId ? { ...a, active: false, triggeredAt: Date.now() } : a
             ),
-            alertLogs: [newLog, ...state.alertLogs],
+            alertLogs: [newLog, ...state.alertLogs].slice(0, 200),
           };
         }),
       clearAlertLogs: () => set({ alertLogs: [] }),
@@ -2170,6 +3087,7 @@ export const useSyncStore = create<SyncStoreState>()(
     {
       name: 'ordercraft_workspace_sync_v2',
       version: 3,
+      storage: debouncedWorkspaceStorage,
       migrate: (persistedState: unknown, version: number) => {
         const state = persistedState as Record<string, unknown>;
         if (state) {
@@ -2192,6 +3110,11 @@ export const useSyncStore = create<SyncStoreState>()(
               state.indicators = migrateIndicatorsRecord(
                 state.indicators as Record<string, IndicatorInstance[]>
               );
+              Object.keys(DEFAULT_PANES).forEach((id) => {
+                if ((state.indicators as Record<string, IndicatorInstance[]>)[id] === undefined) {
+                  (state.indicators as Record<string, IndicatorInstance[]>)[id] = [createDefaultVolumeIndicator(id)];
+                }
+              });
             }
           } else {
             // General safety migration
@@ -2199,6 +3122,11 @@ export const useSyncStore = create<SyncStoreState>()(
               state.indicators = migrateIndicatorsRecord(
                 state.indicators as Record<string, IndicatorInstance[]>
               );
+              Object.keys(DEFAULT_PANES).forEach((id) => {
+                if ((state.indicators as Record<string, IndicatorInstance[]>)[id] === undefined) {
+                  (state.indicators as Record<string, IndicatorInstance[]>)[id] = [createDefaultVolumeIndicator(id)];
+                }
+              });
             }
           }
           if (state.favoriteIndicators && Array.isArray(state.favoriteIndicators)) {
@@ -2243,9 +3171,10 @@ export const useSyncStore = create<SyncStoreState>()(
         watchlists: state.watchlists,
         activeWatchlistId: state.activeWatchlistId,
         watchlistTableSettings: state.watchlistTableSettings,
+        orderflowSettings: state.orderflowSettings,
         alerts: state.alerts,
         alertLogs: state.alertLogs,
       }),
     }
-  )
+  ))
 );

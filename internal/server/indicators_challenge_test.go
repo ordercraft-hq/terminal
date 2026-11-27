@@ -41,6 +41,7 @@ func setupChallengeServer(t *testing.T, useRealEngine bool) (*Server, *httptest.
 
 	cleanup := func() {
 		httpSrv.Close()
+		_ = srv.Shutdown(context.Background())
 		st.Close()
 		_ = os.Remove(tmpDB)
 	}

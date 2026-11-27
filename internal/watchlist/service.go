@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ordercraft-hq/terminal/internal/datafeed"
 )
 
 type WatchlistQuote struct {
@@ -68,32 +70,35 @@ type cachedQuotes struct {
 	fetchedAt time.Time
 }
 
+const defaultMaxQuoteCacheEntries = 256
+
 type Service struct {
-	mu           sync.RWMutex
-	client       *http.Client
-	crumb        string
-	crumbExpires time.Time
-	quotesCache  map[string]cachedQuotes
-	quoteTTL     time.Duration
-	userAgent    string
-	baseQuoteURL string
-	baseCrumbURL string
-	baseSearchURL string
+	mu              sync.RWMutex
+	client          *http.Client
+	crumb           string
+	crumbExpires    time.Time
+	quotesCache     map[string]cachedQuotes
+	maxCacheEntries int
+	quoteTTL        time.Duration
+	userAgent       string
+	baseQuoteURL    string
+	baseCrumbURL    string
+	baseSearchURL   string
+	flight          datafeed.SingleFlight[[]WatchlistQuote]
+	crumbFlight     datafeed.SingleFlight[string]
 }
 
 func NewService() *Service {
 	jar, _ := cookiejar.New(nil)
 	return &Service{
-		client: &http.Client{
-			Jar:     jar,
-			Timeout: 12 * time.Second,
-		},
-		quotesCache:   make(map[string]cachedQuotes),
-		quoteTTL:      15 * time.Second,
-		userAgent:     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-		baseQuoteURL:  "https://query2.finance.yahoo.com/v7/finance/quote",
-		baseCrumbURL:  "https://query2.finance.yahoo.com/v1/test/getcrumb",
-		baseSearchURL: "https://query2.finance.yahoo.com/v1/finance/search",
+		client:          datafeed.NewHTTPClientWithJar(jar, 12*time.Second),
+		quotesCache:     make(map[string]cachedQuotes),
+		maxCacheEntries: defaultMaxQuoteCacheEntries,
+		quoteTTL:        15 * time.Second,
+		userAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+		baseQuoteURL:    "https://query2.finance.yahoo.com/v7/finance/quote",
+		baseCrumbURL:    "https://query2.finance.yahoo.com/v1/test/getcrumb",
+		baseSearchURL:   "https://query2.finance.yahoo.com/v1/finance/search",
 	}
 }
 
@@ -178,55 +183,88 @@ func (s *Service) ensureCrumb(ctx context.Context) (string, error) {
 	}
 	s.mu.RUnlock()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.crumbFlight.Do(ctx, "yahoo_crumb", func(fetchCtx context.Context) (string, error) {
+		s.mu.RLock()
+		if s.crumb != "" && time.Now().Before(s.crumbExpires) {
+			crumb := s.crumb
+			s.mu.RUnlock()
+			return crumb, nil
+		}
+		crumbURL := s.baseCrumbURL
+		s.mu.RUnlock()
 
-	// Double check
-	if s.crumb != "" && time.Now().Before(s.crumbExpires) {
-		return s.crumb, nil
-	}
+		// 1. Visit fc.yahoo.com to set cookie (skip external host when overridden in tests)
+		if strings.Contains(crumbURL, "finance.yahoo.com") {
+			initReq, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, "https://fc.yahoo.com", nil)
+			if err == nil {
+				initReq.Header.Set("User-Agent", s.userAgent)
+				resp, initErr := s.client.Do(initReq)
+				if initErr == nil {
+					io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}
+			}
+		}
 
-	// 1. Visit fc.yahoo.com to set cookie
-	initReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://fc.yahoo.com", nil)
-	if err == nil {
-		initReq.Header.Set("User-Agent", s.userAgent)
-		resp, initErr := s.client.Do(initReq)
-		if initErr == nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
+		// 2. Fetch crumb
+		crumbReq, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, crumbURL, nil)
+		if err != nil {
+			return "", err
+		}
+		crumbReq.Header.Set("User-Agent", s.userAgent)
+
+		crumbResp, err := s.client.Do(crumbReq)
+		if err != nil {
+			return "", err
+		}
+		defer crumbResp.Body.Close()
+
+		if crumbResp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("crumb request failed with status: %d", crumbResp.StatusCode)
+		}
+
+		bodyBytes, err := io.ReadAll(io.LimitReader(crumbResp.Body, 64<<10))
+		if err != nil {
+			return "", err
+		}
+
+		crumb := strings.TrimSpace(string(bodyBytes))
+		if crumb == "" {
+			return "", fmt.Errorf("received empty crumb from Yahoo")
+		}
+
+		s.mu.Lock()
+		s.crumb = crumb
+		s.crumbExpires = time.Now().Add(2 * time.Hour)
+		s.mu.Unlock()
+		return crumb, nil
+	})
+}
+
+func (s *Service) evictQuotesLocked(now time.Time) {
+	for k, v := range s.quotesCache {
+		if now.Sub(v.fetchedAt) >= s.quoteTTL {
+			delete(s.quotesCache, k)
 		}
 	}
-
-	// 2. Fetch crumb
-	crumbReq, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseCrumbURL, nil)
-	if err != nil {
-		return "", err
+	maxEntries := s.maxCacheEntries
+	if maxEntries <= 0 {
+		maxEntries = defaultMaxQuoteCacheEntries
 	}
-	crumbReq.Header.Set("User-Agent", s.userAgent)
-
-	crumbResp, err := s.client.Do(crumbReq)
-	if err != nil {
-		return "", err
+	for len(s.quotesCache) >= maxEntries {
+		var oldestKey string
+		var oldestTime time.Time
+		for k, v := range s.quotesCache {
+			if oldestKey == "" || v.fetchedAt.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = v.fetchedAt
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(s.quotesCache, oldestKey)
 	}
-	defer crumbResp.Body.Close()
-
-	if crumbResp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("crumb request failed with status: %d", crumbResp.StatusCode)
-	}
-
-	bodyBytes, err := io.ReadAll(crumbResp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	crumb := strings.TrimSpace(string(bodyBytes))
-	if crumb == "" {
-		return "", fmt.Errorf("received empty crumb from Yahoo")
-	}
-
-	s.crumb = crumb
-	s.crumbExpires = time.Now().Add(2 * time.Hour)
-	return crumb, nil
 }
 
 func (s *Service) GetQuotes(ctx context.Context, rawSymbols []string) ([]WatchlistQuote, error) {
@@ -263,87 +301,102 @@ func (s *Service) GetQuotes(ctx context.Context, rawSymbols []string) ([]Watchli
 		return cached.data, nil
 	}
 
-	crumb, err := s.ensureCrumb(ctx)
-	if err != nil {
-		// If crumb acquisition failed, try direct without crumb or return fallback
-		crumb = ""
-	}
+	return s.flight.Do(ctx, cacheKey, func(fetchCtx context.Context) ([]WatchlistQuote, error) {
+		s.mu.RLock()
+		cachedInner, okInner := s.quotesCache[cacheKey]
+		baseQuoteURL := s.baseQuoteURL
+		s.mu.RUnlock()
 
-	endpoint := fmt.Sprintf("%s?symbols=%s", s.baseQuoteURL, url.QueryEscape(strings.Join(yahooSymbols, ",")))
-	if crumb != "" {
-		endpoint += "&crumb=" + url.QueryEscape(crumb)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", s.userAgent)
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		if ok && len(cached.data) > 0 {
-			return cached.data, nil
+		if okInner && time.Since(cachedInner.fetchedAt) < s.quoteTTL {
+			return cachedInner.data, nil
 		}
-		return getFallbackQuotes(symbolMap), nil
-	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusUnauthorized {
-		// Reset crumb and invalidate
+		crumb, err := s.ensureCrumb(fetchCtx)
+		if err != nil {
+			// If crumb acquisition failed, try direct without crumb or return fallback
+			crumb = ""
+		}
+
+		endpoint := fmt.Sprintf("%s?symbols=%s", baseQuoteURL, url.QueryEscape(strings.Join(yahooSymbols, ",")))
+		if crumb != "" {
+			endpoint += "&crumb=" + url.QueryEscape(crumb)
+		}
+
+		req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", s.userAgent)
+
+		resp, err := s.client.Do(req)
+		if err != nil {
+			if okInner && len(cachedInner.data) > 0 {
+				return cachedInner.data, nil
+			}
+			return getFallbackQuotes(symbolMap), nil
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusUnauthorized {
+			// Reset crumb and invalidate
+			s.mu.Lock()
+			s.crumb = ""
+			s.mu.Unlock()
+			if okInner && len(cachedInner.data) > 0 {
+				return cachedInner.data, nil
+			}
+			return getFallbackQuotes(symbolMap), nil
+		}
+
+		var parsed rawQuoteResponse
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&parsed); err != nil {
+			if okInner && len(cachedInner.data) > 0 {
+				return cachedInner.data, nil
+			}
+			return getFallbackQuotes(symbolMap), nil
+		}
+
+		var results []WatchlistQuote
+		for _, it := range parsed.QuoteResponse.Result {
+			name := it.ShortName
+			if name == "" {
+				name = it.LongName
+			}
+			if name == "" {
+				name = it.Symbol
+			}
+
+			origKey := symbolMap[it.Symbol]
+			if origKey == "" {
+				origKey = it.Symbol
+			}
+
+			results = append(results, WatchlistQuote{
+				Symbol:      it.Symbol,
+				OriginalKey: origKey,
+				Name:        name,
+				Price:       it.RegularMarketPrice,
+				Change:      it.RegularMarketChange,
+				ChangePct:   it.RegularMarketChangePercent,
+				Volume:      it.RegularMarketVolume,
+				Currency:    it.Currency,
+				Exchange:    it.Exchange,
+			})
+		}
+
+		now := time.Now()
 		s.mu.Lock()
-		s.crumb = ""
+		if _, exists := s.quotesCache[cacheKey]; !exists {
+			s.evictQuotesLocked(now)
+		}
+		s.quotesCache[cacheKey] = cachedQuotes{
+			data:      results,
+			fetchedAt: now,
+		}
 		s.mu.Unlock()
-		if ok && len(cached.data) > 0 {
-			return cached.data, nil
-		}
-		return getFallbackQuotes(symbolMap), nil
-	}
 
-	var parsed rawQuoteResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		if ok && len(cached.data) > 0 {
-			return cached.data, nil
-		}
-		return getFallbackQuotes(symbolMap), nil
-	}
-
-	var results []WatchlistQuote
-	for _, it := range parsed.QuoteResponse.Result {
-		name := it.ShortName
-		if name == "" {
-			name = it.LongName
-		}
-		if name == "" {
-			name = it.Symbol
-		}
-
-		origKey := symbolMap[it.Symbol]
-		if origKey == "" {
-			origKey = it.Symbol
-		}
-
-		results = append(results, WatchlistQuote{
-			Symbol:      it.Symbol,
-			OriginalKey: origKey,
-			Name:        name,
-			Price:       it.RegularMarketPrice,
-			Change:      it.RegularMarketChange,
-			ChangePct:   it.RegularMarketChangePercent,
-			Volume:      it.RegularMarketVolume,
-			Currency:    it.Currency,
-			Exchange:    it.Exchange,
-		})
-	}
-
-	s.mu.Lock()
-	s.quotesCache[cacheKey] = cachedQuotes{
-		data:      results,
-		fetchedAt: time.Now(),
-	}
-	s.mu.Unlock()
-
-	return results, nil
+		return results, nil
+	})
 }
 
 func (s *Service) Search(ctx context.Context, query string) ([]SearchItem, error) {
@@ -352,7 +405,11 @@ func (s *Service) Search(ctx context.Context, query string) ([]SearchItem, error
 		return nil, nil
 	}
 
-	endpoint := fmt.Sprintf("%s?q=%s&quotesCount=10&newsCount=0", s.baseSearchURL, url.QueryEscape(query))
+	s.mu.RLock()
+	baseSearchURL := s.baseSearchURL
+	s.mu.RUnlock()
+
+	endpoint := fmt.Sprintf("%s?q=%s&quotesCount=10&newsCount=0", baseSearchURL, url.QueryEscape(query))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -370,7 +427,7 @@ func (s *Service) Search(ctx context.Context, query string) ([]SearchItem, error
 	}
 
 	var raw rawSearchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&raw); err != nil {
 		return getFallbackSearch(query), nil
 	}
 

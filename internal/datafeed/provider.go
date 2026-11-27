@@ -33,3 +33,24 @@ type DataProvider interface {
 	Subscribe(ctx context.Context, symbol, resolution string, onCandle func(c Candle)) error
 	Unsubscribe(symbol, resolution string) error
 }
+
+// DataTier represents the capability level of the market data provider.
+type DataTier string
+
+const (
+	DataTierL1 DataTier = "L1" // OHLCV Candles only
+	DataTierL2 DataTier = "L2" // Ticks, Orderbook Depth, Footprint
+)
+
+// L2DataProvider extends DataProvider for Level 2 market depth and tick trade flow.
+type L2DataProvider interface {
+	DataProvider
+	GetDataTier() DataTier
+	SubscribeTicks(ctx context.Context, symbol string, onTick func(t TickData)) error
+	UnsubscribeTicks(symbol string) error
+	SubscribeDepth(ctx context.Context, symbol string, onDepth func(d OrderBookDepth)) error
+	UnsubscribeDepth(symbol string) error
+	GetFootprintHistory(ctx context.Context, symbol, resolution string, from, to int64, count int) ([]FootprintBar, error)
+	SubscribeFootprint(ctx context.Context, symbol, resolution string, onFootprint func(f FootprintBar)) error
+	UnsubscribeFootprint(symbol, resolution string) error
+}

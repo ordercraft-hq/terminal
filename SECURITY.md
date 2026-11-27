@@ -10,6 +10,7 @@ Only the latest release of OrderCraft receives active security patches.
 
 | Version | Supported |
 |---|---|
+| `v0.3.x` | :white_check_mark: |
 | `v0.2.x` | :white_check_mark: |
 | `v0.1.x` | :white_check_mark: |
 | `< v0.1.0` | :x: |

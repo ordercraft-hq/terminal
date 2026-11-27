@@ -268,6 +268,7 @@ export interface IndicatorInstance {
   showLabelsOnPriceScale?: boolean;
   showValuesInStatusLine?: boolean;
   showInputsInStatusLine?: boolean;
+  visibility?: Record<string, boolean>;
 }
 
 export type IndicatorConfig = IndicatorInstance;

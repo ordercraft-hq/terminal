@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { useSyncStore } from '../../store/syncStore';
 import { transport } from '../../transport/client';
 import type { LayoutMetadata } from '../../transport/client';
@@ -24,13 +25,26 @@ export const LayoutModal: React.FC = () => {
     createNewLayout,
     cloneCurrentLayout,
     renameCurrentLayout,
-  } = useSyncStore();
+  } = useSyncStore(
+    useShallow((s) => ({
+      isLayoutModalOpen: s.isLayoutModalOpen,
+      closeLayoutModal: s.closeLayoutModal,
+      layoutId: s.layoutId,
+      layoutName: s.layoutName,
+      loadLayoutById: s.loadLayoutById,
+      createNewLayout: s.createNewLayout,
+      cloneCurrentLayout: s.cloneCurrentLayout,
+      renameCurrentLayout: s.renameCurrentLayout,
+    }))
+  );
 
   const [savedLayouts, setSavedLayouts] = useState<LayoutMetadata[]>([]);
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [sortOrder, setSortOrder] = useState<'favorites' | 'recent' | 'az'>('favorites');
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<{ id: string; name: string } | null>(null);
 
   // Sub-modal state for Create / Copy / Rename
   const [subModalMode, setSubModalMode] = useState<'none' | 'new' | 'copy' | 'rename'>('none');
@@ -38,6 +52,25 @@ export const LayoutModal: React.FC = () => {
   const [modalInputText, setModalInputText] = useState<string>('');
 
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const timersRef = useRef<number[]>([]);
+
+  const scheduleTimeout = useCallback((fn: () => void, ms: number) => {
+    const id = window.setTimeout(() => {
+      timersRef.current = timersRef.current.filter((t) => t !== id);
+      fn();
+    }, ms);
+    timersRef.current.push(id);
+    return id;
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      for (const id of timersRef.current) {
+        window.clearTimeout(id);
+      }
+      timersRef.current = [];
+    };
+  }, []);
 
   // Load layouts from SQLite backend
   const fetchLayouts = useCallback(async () => {
@@ -58,11 +91,13 @@ export const LayoutModal: React.FC = () => {
       setSearchQuery('');
       setSubModalMode('none');
       setSuccessMsg(null);
-      setTimeout(() => {
+      setErrorMsg(null);
+      setConfirmDelete(null);
+      scheduleTimeout(() => {
         searchInputRef.current?.focus();
       }, 50);
     }
-  }, [isLayoutModalOpen, fetchLayouts]);
+  }, [isLayoutModalOpen, fetchLayouts, scheduleTimeout]);
 
   // Handle Escape key to close
   useEffect(() => {
@@ -130,30 +165,39 @@ export const LayoutModal: React.FC = () => {
 
   // Load layout
   const handleSelectLayout = async (targetId: string, targetName: string) => {
+    setErrorMsg(null);
     try {
       await loadLayoutById(targetId, targetName);
       setSuccessMsg(`Loaded "${targetName}"`);
-      setTimeout(() => {
+      scheduleTimeout(() => {
         closeLayoutModal();
       }, 200);
     } catch (err) {
       console.error(err);
-      alert('Failed to load layout');
+      setErrorMsg('Failed to load layout');
     }
   };
 
-  // Delete layout
-  const handleDeleteLayout = async (e: React.MouseEvent, targetId: string, targetName: string) => {
+  // Request delete confirmation
+  const handleDeleteLayout = (e: React.MouseEvent, targetId: string, targetName: string) => {
     e.stopPropagation();
-    if (!confirm(`Are you sure you want to delete layout "${targetName}"?`)) return;
+    setErrorMsg(null);
+    setConfirmDelete({ id: targetId, name: targetName });
+  };
+
+  const confirmDeleteLayout = async () => {
+    if (!confirmDelete) return;
+    const { id: targetId, name: targetName } = confirmDelete;
+    setConfirmDelete(null);
+    setErrorMsg(null);
     try {
       await transport.deleteLayout(targetId);
       setSavedLayouts((prev) => prev.filter((item) => item.id !== targetId));
       setSuccessMsg(`Deleted "${targetName}"`);
-      setTimeout(() => setSuccessMsg(null), 2500);
+      scheduleTimeout(() => setSuccessMsg(null), 2500);
     } catch (err) {
       console.error(err);
-      alert('Failed to delete layout');
+      setErrorMsg('Failed to delete layout');
     }
   };
 
@@ -163,6 +207,7 @@ export const LayoutModal: React.FC = () => {
     const cleanName = modalInputText.trim();
     if (!cleanName) return;
 
+    setErrorMsg(null);
     try {
       if (subModalMode === 'new') {
         await createNewLayout(cleanName);
@@ -182,10 +227,10 @@ export const LayoutModal: React.FC = () => {
       setModalInputText('');
       setTargetLayout(null);
       fetchLayouts();
-      setTimeout(() => setSuccessMsg(null), 2500);
+      scheduleTimeout(() => setSuccessMsg(null), 2500);
     } catch (err) {
       console.error(err);
-      alert('Failed to process layout request');
+      setErrorMsg('Failed to process layout request');
     }
   };
 
@@ -209,11 +254,46 @@ export const LayoutModal: React.FC = () => {
           </button>
         </div>
 
-        {/* Success toast notification */}
+        {/* Success / Error / Delete Confirmation banners */}
         {successMsg && (
           <div className="mx-4 mt-2 px-3 py-1.5 rounded bg-[#089981]/20 border border-[#089981] text-[#089981] text-xs flex items-center space-x-2 animate-in fade-in duration-150">
             <Check size={13} />
             <span>{successMsg}</span>
+          </div>
+        )}
+        {errorMsg && (
+          <div className="mx-4 mt-2 px-3 py-1.5 rounded bg-[#f23645]/15 border border-[#f23645]/50 text-[#f23645] text-xs flex items-center justify-between">
+            <span>{errorMsg}</span>
+            <button
+              type="button"
+              onClick={() => setErrorMsg(null)}
+              className="text-[#f23645] hover:text-white cursor-pointer"
+            >
+              <X size={12} />
+            </button>
+          </div>
+        )}
+        {confirmDelete && (
+          <div className="mx-4 mt-2 px-3 py-2 rounded bg-[#f23645]/10 border border-[#f23645]/40 text-xs flex items-center justify-between gap-2">
+            <span className="text-[#d1d4dc] truncate">
+              Delete layout &ldquo;{confirmDelete.name}&rdquo;?
+            </span>
+            <div className="flex items-center space-x-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => setConfirmDelete(null)}
+                className="px-2 py-0.5 rounded bg-[#2a2e39] hover:bg-[#363a45] text-[#d1d4dc] cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={confirmDeleteLayout}
+                className="px-2.5 py-0.5 rounded bg-[#f23645] hover:bg-[#d92b3a] text-white font-semibold cursor-pointer"
+              >
+                Delete
+              </button>
+            </div>
           </div>
         )}
 

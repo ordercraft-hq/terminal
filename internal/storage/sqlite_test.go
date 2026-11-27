@@ -2,9 +2,11 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -178,6 +180,46 @@ func TestStorageLifecycle(t *testing.T) {
 	if len(chartTmplsAfter) != 1 || chartTmplsAfter[0].ID != "ctmpl_light" {
 		t.Fatalf("Expected 1 chart template (ctmpl_light), got %+v", chartTmplsAfter)
 	}
+
+	// 6. Test Imbalance Rules (Orderflow DB)
+	imb1 := &ImbalanceRule{
+		ID:        "imb_1",
+		Name:      "300% Delta 15",
+		Settings:  `{"imbalancePercent":300,"deltaFilter":15,"sellColor":"#d8b4e2","buyColor":"#8da9c4"}`,
+		CreatedAt: time.Now().Unix(),
+	}
+	imb2 := &ImbalanceRule{
+		ID:        "imb_2",
+		Name:      "400% Delta 30",
+		Settings:  `{"imbalancePercent":400,"deltaFilter":30,"sellColor":"#ff5252","buyColor":"#00e676"}`,
+		CreatedAt: time.Now().Unix(),
+	}
+
+	if err := s.SaveImbalanceRule(ctx, imb1); err != nil {
+		t.Fatalf("SaveImbalanceRule imb1 failed: %v", err)
+	}
+	if err := s.SaveImbalanceRule(ctx, imb2); err != nil {
+		t.Fatalf("SaveImbalanceRule imb2 failed: %v", err)
+	}
+
+	imbRules, err := s.GetImbalanceRules(ctx)
+	if err != nil {
+		t.Fatalf("GetImbalanceRules failed: %v", err)
+	}
+	if len(imbRules) != 2 {
+		t.Fatalf("Expected 2 imbalance rules, got %d", len(imbRules))
+	}
+
+	if err := s.DeleteImbalanceRule(ctx, "imb_1"); err != nil {
+		t.Fatalf("DeleteImbalanceRule failed: %v", err)
+	}
+	imbRulesAfter, err := s.GetImbalanceRules(ctx)
+	if err != nil {
+		t.Fatalf("GetImbalanceRules after delete failed: %v", err)
+	}
+	if len(imbRulesAfter) != 1 || imbRulesAfter[0].ID != "imb_2" {
+		t.Fatalf("Expected 1 imbalance rule (imb_2), got %+v", imbRulesAfter)
+	}
 }
 
 func TestStorage_APIKeyEncryption(t *testing.T) {
@@ -320,6 +362,60 @@ func TestStorage_UserIndicators(t *testing.T) {
 	}
 	if deleted != nil {
 		t.Fatalf("Expected nil after delete, got %+v", deleted)
+	}
+}
+
+func TestStorageConcurrentWritesNoBusy(t *testing.T) {
+	tmpDB := filepath.Join(t.TempDir(), "test_concurrent.db")
+	s, err := NewStorage(tmpDB)
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	const workers = 20
+	const writesPerWorker = 10
+
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*writesPerWorker*2)
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < writesPerWorker; i++ {
+				id := fmt.Sprintf("draw_%d_%d", workerID, i)
+				if err := s.SaveDrawing(ctx, &Drawing{
+					ID:       id,
+					LayoutID: "layout_concurrent",
+					ToolType: "TrendLine",
+					Symbol:   "BINANCE:BTCUSDT",
+					Data:     `{"anchors":[]}`,
+				}); err != nil {
+					errs <- fmt.Errorf("SaveDrawing(%s): %w", id, err)
+					return
+				}
+				if _, err := s.GetDrawings(ctx, "layout_concurrent", "BINANCE:BTCUSDT"); err != nil {
+					errs <- fmt.Errorf("GetDrawings: %w", err)
+					return
+				}
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent SQLite access failed: %v", err)
+	}
+
+	drawings, err := s.GetDrawings(ctx, "layout_concurrent", "BINANCE:BTCUSDT")
+	if err != nil {
+		t.Fatalf("final GetDrawings failed: %v", err)
+	}
+	if len(drawings) != workers*writesPerWorker {
+		t.Fatalf("expected %d drawings, got %d", workers*writesPerWorker, len(drawings))
 	}
 }
 

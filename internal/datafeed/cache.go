@@ -1,6 +1,8 @@
 package datafeed
 
 import (
+	"container/list"
+	"strings"
 	"sync"
 	"time"
 )
@@ -13,9 +15,9 @@ type cacheEntry struct {
 
 // CandleCache is an in-memory concurrent-safe LRU/TTL cache for candle queries.
 type CandleCache struct {
-	mu       sync.RWMutex
-	entries  map[string]*cacheEntry
-	keys     []string // order of keys for basic eviction
+	mu       sync.Mutex
+	entries  map[string]*list.Element
+	order    *list.List // front = most recently used, back = least recently used
 	capacity int
 	ttl      time.Duration
 }
@@ -29,8 +31,8 @@ func NewCandleCache(capacity int, ttl time.Duration) *CandleCache {
 		ttl = 10 * time.Second
 	}
 	return &CandleCache{
-		entries:  make(map[string]*cacheEntry),
-		keys:     make([]string, 0, capacity),
+		entries:  make(map[string]*list.Element),
+		order:    list.New(),
 		capacity: capacity,
 		ttl:      ttl,
 	}
@@ -38,52 +40,85 @@ func NewCandleCache(capacity int, ttl time.Duration) *CandleCache {
 
 // Get looks up candles by cache key. Returns (candles, true) if found and not expired.
 func (c *CandleCache) Get(key string) ([]Candle, bool) {
-	c.mu.RLock()
-	entry, ok := c.entries[key]
-	if !ok {
-		c.mu.RUnlock()
-		return nil, false
-	}
-	if time.Now().After(entry.expiresAt) {
-		c.mu.RUnlock()
-		// Expired: lazily delete on write
-		c.mu.Lock()
-		delete(c.entries, key)
-		c.mu.Unlock()
-		return nil, false
-	}
-	result := make([]Candle, len(entry.candles))
-	copy(result, entry.candles)
-	c.mu.RUnlock()
-	return result, true
-}
-
-// Set stores candles in the cache with the configured TTL.
-func (c *CandleCache) Set(key string, candles []Candle) {
-	if len(candles) == 0 {
-		return
-	}
+	now := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// If at capacity and key is new, evict oldest
-	if _, exists := c.entries[key]; !exists {
-		if len(c.keys) >= c.capacity {
-			oldest := c.keys[0]
-			c.keys = c.keys[1:]
-			delete(c.entries, oldest)
-		}
-		c.keys = append(c.keys, key)
+	elem, ok := c.entries[key]
+	if !ok {
+		return nil, false
+	}
+	entry := elem.Value.(*cacheEntry)
+	if now.After(entry.expiresAt) {
+		c.order.Remove(elem)
+		delete(c.entries, key)
+		return nil, false
+	}
+	c.order.MoveToFront(elem)
+
+	result := make([]Candle, len(entry.candles))
+	copy(result, entry.candles)
+	return result, true
+}
+
+// Set stores candles in the cache with the configured default TTL.
+func (c *CandleCache) Set(key string, candles []Candle) {
+	c.SetWithTTL(key, candles, c.ttl)
+}
+
+// SetWithTTL stores candles in the cache with a custom TTL (falls back to default TTL if <= 0).
+func (c *CandleCache) SetWithTTL(key string, candles []Candle, ttl time.Duration) {
+	if len(candles) == 0 {
+		return
+	}
+	if ttl <= 0 {
+		ttl = c.ttl
 	}
 
 	stored := make([]Candle, len(candles))
 	copy(stored, candles)
+	now := time.Now()
 
-	c.entries[key] = &cacheEntry{
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if elem, exists := c.entries[key]; exists {
+		entry := elem.Value.(*cacheEntry)
+		entry.candles = stored
+		entry.expiresAt = now.Add(ttl)
+		c.order.MoveToFront(elem)
+		return
+	}
+
+	// Reclaim any expired entries before evicting a live LRU entry.
+	if c.order.Len() >= c.capacity {
+		for e := c.order.Back(); e != nil; {
+			prev := e.Prev()
+			ent := e.Value.(*cacheEntry)
+			if now.After(ent.expiresAt) {
+				c.order.Remove(e)
+				delete(c.entries, ent.key)
+			}
+			e = prev
+		}
+		for c.order.Len() >= c.capacity {
+			oldest := c.order.Back()
+			if oldest == nil {
+				break
+			}
+			ent := oldest.Value.(*cacheEntry)
+			c.order.Remove(oldest)
+			delete(c.entries, ent.key)
+		}
+	}
+
+	entry := &cacheEntry{
 		candles:   stored,
-		expiresAt: time.Now().Add(c.ttl),
+		expiresAt: now.Add(ttl),
 		key:       key,
 	}
+	elem := c.order.PushFront(entry)
+	c.entries[key] = elem
 }
 
 // InvalidateSymbol evicts all entries matching a specific symbol prefix.
@@ -91,21 +126,28 @@ func (c *CandleCache) InvalidateSymbol(symbolPrefix string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	newKeys := make([]string, 0, len(c.keys))
-	for _, k := range c.keys {
-		if len(k) >= len(symbolPrefix) && k[:len(symbolPrefix)] == symbolPrefix {
-			delete(c.entries, k)
-		} else {
-			newKeys = append(newKeys, k)
+	for e := c.order.Front(); e != nil; {
+		next := e.Next()
+		ent := e.Value.(*cacheEntry)
+		if strings.HasPrefix(ent.key, symbolPrefix) {
+			c.order.Remove(e)
+			delete(c.entries, ent.key)
 		}
+		e = next
 	}
-	c.keys = newKeys
 }
 
 // Clear flushes all entries from the cache.
 func (c *CandleCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries = make(map[string]*cacheEntry)
-	c.keys = c.keys[:0]
+	c.entries = make(map[string]*list.Element)
+	c.order.Init()
+}
+
+// Len returns the number of entries currently tracked by the cache.
+func (c *CandleCache) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.order.Len()
 }

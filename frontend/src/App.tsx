@@ -6,9 +6,13 @@ import { WorkspaceGrid } from './components/WorkspaceGrid/WorkspaceGrid';
 import { FavoriteDrawingsBar } from './drawings/components/FavoriteDrawingsBar';
 import { RightSidebar } from './components/RightSidebar/RightSidebar';
 import { useSyncStore } from './store/syncStore';
-import { CommandPalette } from './components/Modals/CommandPalette';
-import { ChangeIntervalModal } from './components/Modals/ChangeIntervalModal';
 
+const CommandPalette = React.lazy(() =>
+  import('./components/Modals/CommandPalette').then((m) => ({ default: m.CommandPalette }))
+);
+const ChangeIntervalModal = React.lazy(() =>
+  import('./components/Modals/ChangeIntervalModal').then((m) => ({ default: m.ChangeIntervalModal }))
+);
 const LayoutModal = React.lazy(() =>
   import('./components/Modals/LayoutModal').then((m) => ({ default: m.LayoutModal }))
 );
@@ -38,7 +42,16 @@ export const App: React.FC = () => {
   const isIndicatorsModalOpen = useSyncStore((s) => s.isIndicatorsModalOpen);
   const closeIndicatorsModal = useSyncStore((s) => s.closeIndicatorsModal);
   const activeSettingsIndicator = useSyncStore((s) => s.activeSettingsIndicator);
+  const isBottomDrawerOpen = useSyncStore((s) => s.isBottomDrawerOpen);
+  const isCommandPaletteOpen = useSyncStore((s) => s.isCommandPaletteOpen);
+  const isIntervalModalOpen = useSyncStore((s) => s.isIntervalModalOpen);
   const checkForUpdates = useSyncStore((s) => s.checkForUpdates);
+  const initializeStartupLayout = useSyncStore((s) => s.initializeStartupLayout);
+
+  // Load last saved / used layout on application startup
+  useEffect(() => {
+    initializeStartupLayout();
+  }, [initializeStartupLayout]);
 
   // Background non-blocking update check on application startup
   useEffect(() => {
@@ -152,7 +165,7 @@ export const App: React.FC = () => {
       <TopToolbar />
 
       {/* 3. Main Workspace Area */}
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 flex overflow-hidden relative z-0">
         {/* Left Drawing Tools Sidebar */}
         <LeftDrawingBar />
 
@@ -168,14 +181,14 @@ export const App: React.FC = () => {
 
       {/* 4. Global Modals (Lazy Loaded on Demand) */}
       <Suspense fallback={null}>
-        <CommandPalette />
-        <ChangeIntervalModal />
+        {isCommandPaletteOpen && <CommandPalette />}
+        {isIntervalModalOpen && <ChangeIntervalModal />}
         {isLayoutModalOpen && <LayoutModal />}
         {isObjectTreeOpen && <ObjectTreeModal isOpen={isObjectTreeOpen} onClose={closeObjectTree} />}
         {isChartSettingsOpen && <ChartSettingsModal isOpen={isChartSettingsOpen} onClose={closeChartSettings} />}
         {isIndicatorsModalOpen && <IndicatorsModal isOpen={isIndicatorsModalOpen} onClose={closeIndicatorsModal} />}
         {activeSettingsIndicator && <IndicatorSettingsModal />}
-        <ScriptEditorDrawer />
+        {isBottomDrawerOpen && <ScriptEditorDrawer />}
       </Suspense>
     </div>
   );

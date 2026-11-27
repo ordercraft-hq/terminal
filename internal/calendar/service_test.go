@@ -4,7 +4,10 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestCalendarService(t *testing.T) {
@@ -55,6 +58,36 @@ func TestCalendarService(t *testing.T) {
 	}
 	if len(freshEvents) != 4 {
 		t.Fatalf("expected 4 events on fresh call, got: %d", len(freshEvents))
+	}
+}
+
+func TestCalendarSingleFlight(t *testing.T) {
+	var hits atomic.Int32
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		time.Sleep(30 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`[{"title":"CPI","country":"USD","date":"2026-10-29T08:30:00-04:00","impact":"High","forecast":"3.0%","previous":"3.1%"}]`))
+	}))
+	defer mockServer.Close()
+
+	svc := NewService()
+	svc.SetFeedURL(mockServer.URL)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ev, err := svc.GetEvents(context.Background(), "", "")
+			if err != nil || len(ev) != 1 {
+				t.Errorf("unexpected events result: %v, %+v", err, ev)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("expected 1 coalesced calendar fetch, got %d", got)
 	}
 }
 

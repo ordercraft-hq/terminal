@@ -33,9 +33,7 @@ type CoinbaseProvider struct {
 // NewCoinbaseProvider creates and initializes a Coinbase market data provider.
 func NewCoinbaseProvider() *CoinbaseProvider {
 	cp := &CoinbaseProvider{
-		client: &http.Client{
-			Timeout: 15 * time.Second,
-		},
+		client:  datafeed.NewHTTPClient(15 * time.Second),
 		baseURL: "https://api.exchange.coinbase.com",
 		wsURL:   "wss://ws-feed.exchange.coinbase.com",
 		subs:    make(map[string]context.CancelFunc),

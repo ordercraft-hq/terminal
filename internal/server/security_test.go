@@ -220,3 +220,67 @@ func TestSecurity_IsLoopbackHost(t *testing.T) {
 	}
 }
 
+func TestSecurity_HardenedEndpoints(t *testing.T) {
+	st, err := storage.NewStorage(":memory:")
+	if err != nil {
+		t.Fatalf("Failed to init memory storage: %v", err)
+	}
+	defer st.Close()
+
+	srv := NewServer(st)
+	srv.SetBindHost("127.0.0.1")
+	handler := srv.Handler()
+
+	// 1. DNS rebinding host rejection in loopback mode
+	req := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	req.Host = "rebind.example:8448"
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("Expected 403 Forbidden for DNS-rebound Host header, got %d", w.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	req.Host = "127.0.0.1:8448"
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK for loopback Host header, got %d", w.Code)
+	}
+
+	// 2. OANDA URL override in apiSecret must be rejected
+	oandaPayload := `{"provider":"OANDA","accountId":"1","apiKey":"tok","apiSecret":"http://127.0.0.1:9999"}`
+	req = httptest.NewRequest(http.MethodPost, "/api/providers/configure", strings.NewReader(oandaPayload))
+	req.Host = "127.0.0.1:8448"
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("Expected 400 Bad Request for OANDA URL override in apiSecret, got %d", w.Code)
+	}
+
+	// 3. POST /api/indicators/user enforces 64KB code cap
+	oversizedCode := strings.Repeat("a", 70000)
+	indPayload := `{"name":"big","code":"` + oversizedCode + `"}`
+	req = httptest.NewRequest(http.MethodPost, "/api/indicators/user", strings.NewReader(indPayload))
+	req.Host = "127.0.0.1:8448"
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("Expected 400 Bad Request for >64KB script persistence, got %d", w.Code)
+	}
+
+	// 4. POST /api/indicators/eval enforces indicator fan-out cap (>64)
+	items := make([]string, 65)
+	for i := range items {
+		items[i] = `{"instanceId":"i","indicatorId":"wickra.sma"}`
+	}
+	evalPayload := `{"indicators":[` + strings.Join(items, ",") + `]}`
+	req = httptest.NewRequest(http.MethodPost, "/api/indicators/eval", strings.NewReader(evalPayload))
+	req.Host = "127.0.0.1:8448"
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("Expected 400 Bad Request for >64 indicators fan-out, got %d", w.Code)
+	}
+}
+

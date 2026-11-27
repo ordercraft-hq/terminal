@@ -51,9 +51,13 @@ func NewSafeDialContext(dialer *net.Dialer, resolver *net.Resolver) func(ctx con
 			return nil, fmt.Errorf("invalid address %q: %w", addr, err)
 		}
 
-		var ips []net.IP
+		var (
+			ips                     []net.IP
+			isExplicitLoopbackLiteral bool
+		)
 		if ip := net.ParseIP(host); ip != nil {
 			ips = []net.IP{ip}
+			isExplicitLoopbackLiteral = ip.IsLoopback()
 		} else {
 			addrs, err := resolver.LookupIPAddr(ctx, host)
 			if err != nil {
@@ -69,9 +73,11 @@ func NewSafeDialContext(dialer *net.Dialer, resolver *net.Resolver) func(ctx con
 		}
 
 		// TOCTOU DNS Rebinding / SSRF Check:
-		// Verify every resolved IP. If ANY IP is a metadata or link-local address, abort immediately.
+		// Verify every resolved IP before opening a TCP socket. Non-loopback domain names
+		// resolving to loopback IPs (DNS rebinding) are always blocked.
+		allowLoopbackTarget := isExplicitLoopbackLiteral || strings.EqualFold(host, "localhost")
 		for _, ip := range ips {
-			if IsMetadataIP(ip) {
+			if IsMetadataIP(ip) || isRestrictedInternalIP(ip) || (!allowLoopbackTarget && ip.IsLoopback()) {
 				return nil, ErrSSRFProtection
 			}
 		}
@@ -93,10 +99,10 @@ func NewSafeDialContext(dialer *net.Dialer, resolver *net.Resolver) func(ctx con
 }
 
 // NewSafeHttpClient creates a client configured with a 5s timeout, SSRF protection,
-// and connection-time TOCTOU DNS rebinding defense.
+// direct dial-time IP validation (no ambient HTTP_PROXY bypass), and connection-time TOCTOU defense.
 func NewSafeHttpClient() *SafeHttpClient {
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy:                 nil,
 		DialContext:           NewSafeDialContext(nil, nil),
 		MaxIdleConns:          50,
 		IdleConnTimeout:       30 * time.Second,
@@ -141,6 +147,31 @@ func IsMetadataIP(ip net.IP) bool {
 	// Check IPv4 link-local 169.254.0.0/16
 	if v4 := ip.To4(); v4 != nil {
 		return v4[0] == 169 && v4[1] == 254
+	}
+	return false
+}
+
+// isRestrictedInternalIP checks whether ip falls into private (RFC1918/ULA), CGNAT (100.64.0.0/10),
+// unspecified (0.0.0.0/::), or multicast ranges that untrusted scripts must never dial.
+func isRestrictedInternalIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsPrivate() || ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		// CGNAT 100.64.0.0/10 (includes Alibaba/cloud internal 100.100.100.200)
+		if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+			return true
+		}
+		//Benchmarking 198.18.0.0/15
+		if v4[0] == 198 && (v4[1] == 18 || v4[1] == 19) {
+			return true
+		}
+	} else if len(ip) == net.IPv6len && (ip[0]&0xfe) == 0xfc {
+		// IPv6 ULA fc00::/7
+		return true
 	}
 	return false
 }
@@ -224,17 +255,27 @@ func CheckUrlAllowed(parsedURL *url.URL, grantedPerms []string) error {
 		return fmt.Errorf("invalid URL: empty hostname")
 	}
 
-	// Resolve IP addresses
-	ips, err := net.LookupIP(hostname)
-	if err == nil {
+	// Check literal IPs synchronously; domain DNS lookups are also re-checked at dial time in NewSafeDialContext.
+	isLoopback := IsLoopbackHost(hostname)
+	if literalIP := net.ParseIP(hostname); literalIP != nil {
+		if IsMetadataIP(literalIP) || isRestrictedInternalIP(literalIP) {
+			return ErrSSRFProtection
+		}
+		if literalIP.IsLoopback() || literalIP.IsUnspecified() {
+			isLoopback = true
+		}
+	} else if ips, err := net.LookupIP(hostname); err == nil {
 		for _, ip := range ips {
-			if IsMetadataIP(ip) {
+			if IsMetadataIP(ip) || isRestrictedInternalIP(ip) {
 				return ErrSSRFProtection
 			}
-		}
-	} else if ip := net.ParseIP(hostname); ip != nil {
-		if IsMetadataIP(ip) {
-			return ErrSSRFProtection
+			if ip.IsLoopback() || ip.IsUnspecified() {
+				if isLoopback {
+					// Explicit "localhost" resolution falls through to strict loopback port permission check below.
+					continue
+				}
+				return ErrSSRFProtection
+			}
 		}
 	}
 
@@ -245,17 +286,6 @@ func CheckUrlAllowed(parsedURL *url.URL, grantedPerms []string) error {
 			port = "443"
 		} else {
 			port = "80"
-		}
-	}
-
-	// Check loopback
-	isLoopback := IsLoopbackHost(hostname)
-	if !isLoopback && len(ips) > 0 {
-		for _, ip := range ips {
-			if ip.IsLoopback() || ip.IsUnspecified() {
-				isLoopback = true
-				break
-			}
 		}
 	}
 
@@ -296,7 +326,7 @@ func (c *SafeHttpClient) Get(ctx context.Context, targetURL string, headers map[
 		return nil, 0, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("User-Agent", "OrderCraft-ScriptRuntime/0.2.0")
+	req.Header.Set("User-Agent", "OrderCraft-ScriptRuntime/0.3.0")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	for k, v := range headers {
 		req.Header.Set(k, v)

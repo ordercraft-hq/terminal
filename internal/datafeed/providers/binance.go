@@ -25,10 +25,16 @@ type BinanceProvider struct {
 	isUS          bool
 	mu            sync.Mutex
 	cancelLoad    context.CancelFunc
-	subs          map[string]context.CancelFunc
+	subs          map[string]binanceSubEntry
+	subSeq        uint64
 	symbolsMu     sync.RWMutex
 	cachedSymbols []datafeed.SymbolInfo
 	lastFetched   time.Time
+}
+
+type binanceSubEntry struct {
+	id     uint64
+	cancel context.CancelFunc
 }
 
 func NewBinanceProvider() *BinanceProvider {
@@ -44,13 +50,11 @@ func NewBinanceProvider() *BinanceProvider {
 	}
 
 	bp := &BinanceProvider{
-		client: &http.Client{
-			Timeout: 15 * time.Second,
-		},
+		client:  datafeed.NewHTTPClient(15 * time.Second),
 		baseURL: baseURL,
 		wsHost:  wsHost,
 		isUS:    isUS,
-		subs:    make(map[string]context.CancelFunc),
+		subs:    make(map[string]binanceSubEntry),
 	}
 	// Pre-load full instruments dynamically from Binance API asynchronously
 	ctx, cancel := context.WithCancel(context.Background())
@@ -424,6 +428,10 @@ type binanceWsPayload struct {
 }
 
 func (b *BinanceProvider) Subscribe(ctx context.Context, symbol, resolution string, onCandle func(c datafeed.Candle)) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	cleanSymbol := symbol
 	if parts := strings.Split(symbol, ":"); len(parts) == 2 {
 		cleanSymbol = parts[1]
@@ -433,13 +441,15 @@ func (b *BinanceProvider) Subscribe(ctx context.Context, symbol, resolution stri
 	subKey := fmt.Sprintf("%s:%s", cleanSymbol, strings.ToLower(resolution))
 
 	b.mu.Lock()
-	if existingCancel, ok := b.subs[subKey]; ok {
-		existingCancel()
+	if existing, ok := b.subs[subKey]; ok {
+		existing.cancel()
 		delete(b.subs, subKey)
 	}
 
-	subCtx, cancel := context.WithCancel(context.Background())
-	b.subs[subKey] = cancel
+	b.subSeq++
+	subID := b.subSeq
+	subCtx, cancel := context.WithCancel(ctx)
+	b.subs[subKey] = binanceSubEntry{id: subID, cancel: cancel}
 	b.mu.Unlock()
 
 	targetStepSec := datafeed.ResolutionToSeconds(resolution)
@@ -451,7 +461,17 @@ func (b *BinanceProvider) Subscribe(ctx context.Context, symbol, resolution stri
 		}
 	}
 
-	go b.runStream(subCtx, cleanSymbol, interval, callback)
+	go func() {
+		defer func() {
+			cancel()
+			b.mu.Lock()
+			if cur, ok := b.subs[subKey]; ok && cur.id == subID {
+				delete(b.subs, subKey)
+			}
+			b.mu.Unlock()
+		}()
+		b.runStream(subCtx, cleanSymbol, interval, callback)
+	}()
 	return nil
 }
 
@@ -464,8 +484,8 @@ func (b *BinanceProvider) Unsubscribe(symbol, resolution string) error {
 	subKey := fmt.Sprintf("%s:%s", cleanSymbol, strings.ToLower(resolution))
 
 	b.mu.Lock()
-	if cancel, ok := b.subs[subKey]; ok {
-		cancel()
+	if entry, ok := b.subs[subKey]; ok {
+		entry.cancel()
 		delete(b.subs, subKey)
 	}
 	b.mu.Unlock()

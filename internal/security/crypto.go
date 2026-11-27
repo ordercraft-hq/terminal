@@ -99,15 +99,30 @@ func (c *Cipher) Decrypt(ciphertext string) (string, error) {
 	return string(plaintext), nil
 }
 
+func isPlaceholderKey(val string) bool {
+	low := strings.ToLower(strings.TrimSpace(val))
+	return low == "" ||
+		strings.Contains(low, "your_") ||
+		strings.Contains(low, "placeholder") ||
+		strings.Contains(low, "changeme")
+}
+
 // ResolveMasterKey derives or retrieves the 32-byte AES key.
 // Priority order:
 // 1. ORDERCRAFT_ENCRYPTION_KEY / ORDERCRAFT_MASTER_KEY environment variable.
-// 2. Local master key file at keyFilePath (created with 0600 permissions if non-existent).
+// 2. Local master key file at keyFilePath (created with owner-only permissions if non-existent).
 // 3. Ephemeral random key if keyFilePath is empty or in-memory.
 func ResolveMasterKey(keyFilePath string) ([]byte, error) {
 	// 1. Check environment variables
 	for _, envVar := range []string{"ORDERCRAFT_ENCRYPTION_KEY", "ORDERCRAFT_MASTER_KEY"} {
-		if val := strings.TrimSpace(os.Getenv(envVar)); val != "" {
+		if rawVal, set := os.LookupEnv(envVar); set {
+			val := strings.TrimSpace(rawVal)
+			if val == "" {
+				continue
+			}
+			if isPlaceholderKey(val) {
+				return nil, fmt.Errorf("%s contains an insecure placeholder key; remove it or set a 32-byte hex/base64 secret", envVar)
+			}
 			return normalizeKeyString(val), nil
 		}
 	}
@@ -122,13 +137,22 @@ func ResolveMasterKey(keyFilePath string) ([]byte, error) {
 	}
 
 	// 3. File-based master key
-	if _, err := os.Stat(keyFilePath); err == nil {
-		// Keyfile exists - read it
+	if info, err := os.Stat(keyFilePath); err == nil {
+		if info.IsDir() {
+			return nil, fmt.Errorf("key path %s is a directory", keyFilePath)
+		}
+		if err := EnforcePrivateFilePermissions(keyFilePath); err != nil {
+			return nil, fmt.Errorf("failed to enforce permissions on key file %s: %w", keyFilePath, err)
+		}
 		raw, err := os.ReadFile(keyFilePath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read key file %s: %w", keyFilePath, err)
 		}
-		return normalizeKeyBytes(raw), nil
+		trimmed := strings.TrimSpace(string(raw))
+		if isPlaceholderKey(trimmed) {
+			return nil, fmt.Errorf("key file %s is empty or contains a placeholder key", keyFilePath)
+		}
+		return normalizeKeyString(trimmed), nil
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("failed to stat key file %s: %w", keyFilePath, err)
 	}
@@ -143,12 +167,24 @@ func ResolveMasterKey(keyFilePath string) ([]byte, error) {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return nil, fmt.Errorf("failed to create key directory: %w", err)
 		}
+		_ = EnforcePrivateDirPermissions(dir)
 	}
 
-	// Save with strict 0600 permissions (read/write only by owner)
+	// Save with strict owner-only permissions (0600 on Unix + owner-only DACL on Windows)
 	encoded := hex.EncodeToString(key)
-	if err := os.WriteFile(keyFilePath, []byte(encoded), 0600); err != nil {
-		return nil, fmt.Errorf("failed to write key file %s: %w", keyFilePath, err)
+	f, err := os.OpenFile(keyFilePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create key file %s: %w", keyFilePath, err)
+	}
+	if _, writeErr := f.Write([]byte(encoded)); writeErr != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("failed to write key file %s: %w", keyFilePath, writeErr)
+	}
+	if closeErr := f.Close(); closeErr != nil {
+		return nil, fmt.Errorf("failed to close key file %s: %w", keyFilePath, closeErr)
+	}
+	if err := EnforcePrivateFilePermissions(keyFilePath); err != nil {
+		return nil, fmt.Errorf("failed to enforce permissions on new key file %s: %w", keyFilePath, err)
 	}
 
 	return key, nil

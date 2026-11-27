@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ordercraft-hq/terminal/internal/datafeed"
@@ -16,16 +17,121 @@ import (
 	"nhooyr.io/websocket/wsjson"
 )
 
+const (
+	clientWriteTimeout  = 3 * time.Second
+	maxHistoryCandles   = 2000
+	maxConsecutiveDrops = 256
+)
+
+type sharedSessionKey struct {
+	topic     string
+	configKey string
+}
+
+type sharedIndicatorSession struct {
+	hub        *StreamHub
+	key        sharedSessionKey
+	inner      IndicatorSession
+	refCount   int
+	closed     atomic.Bool
+	seeded     bool
+	hasUpdates bool
+	mu         sync.Mutex // serializes inner.Update / Seed calls across concurrent Broadcasts
+}
+
+func (s *sharedIndicatorSession) update(ctx context.Context, c wickra.CandleData) (map[string]map[string]float64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed.Load() || s.inner == nil {
+		return nil, nil
+	}
+	s.hasUpdates = true
+	return s.inner.Update(ctx, c)
+}
+
+func (s *sharedIndicatorSession) seedIfIdle(ctx context.Context, candles []wickra.CandleData) {
+	if len(candles) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed.Load() || s.inner == nil || s.seeded || s.hasUpdates {
+		return
+	}
+	s.seeded = true
+	if seeder, ok := s.inner.(interface {
+		Seed(context.Context, []wickra.CandleData) error
+	}); ok {
+		_ = seeder.Seed(ctx, candles)
+	}
+}
+
+func (s *sharedIndicatorSession) release(ctx context.Context) error {
+	s.hub.sharedMu.Lock()
+	if s.closed.Load() {
+		s.hub.sharedMu.Unlock()
+		return nil
+	}
+	s.refCount--
+	if s.refCount > 0 {
+		s.hub.sharedMu.Unlock()
+		return nil
+	}
+	s.closed.Store(true)
+	if s.hub.sharedSessions != nil {
+		delete(s.hub.sharedSessions, s.key)
+	}
+	s.hub.sharedMu.Unlock()
+
+	s.mu.Lock()
+	inner := s.inner
+	s.inner = nil
+	s.mu.Unlock()
+	if inner != nil {
+		return inner.Close(ctx)
+	}
+	return nil
+}
+
+type hubSessionHandle struct {
+	shared    *sharedIndicatorSession
+	closeOnce sync.Once
+}
+
+func (h *hubSessionHandle) Update(ctx context.Context, c wickra.CandleData) (map[string]map[string]float64, error) {
+	if h.shared == nil {
+		return nil, nil
+	}
+	return h.shared.update(ctx, c)
+}
+
+func (h *hubSessionHandle) Close(ctx context.Context) error {
+	var err error
+	h.closeOnce.Do(func() {
+		if h.shared != nil {
+			err = h.shared.release(ctx)
+		}
+	})
+	return err
+}
+
 // StreamHub coordinates WebSocket connections from frontend clients
 // and multiplexes subscriptions to underlying data providers.
 type StreamHub struct {
 	coordinator     *datafeed.Coordinator
 	indicatorEngine IndicatorEngine
+	ctx             context.Context
+	cancel          context.CancelFunc
 	mu              sync.RWMutex
 	clients         map[*HubClient]bool
 	topics          map[string]map[*HubClient]bool
+	topicCancels    map[string]context.CancelFunc
 	lastCandles     map[string]datafeed.Candle
 	historyCandles  map[string][]wickra.CandleData
+	sharedMu        sync.Mutex
+	sharedSessions  map[sharedSessionKey]*sharedIndicatorSession
+	indWorkerOnce   sync.Once
+	indJobs         chan func()
 	authToken       string
 }
 
@@ -39,6 +145,7 @@ type HubClient struct {
 	send             chan []byte
 	done             chan struct{}
 	closeOnce        sync.Once
+	droppedMsgs      atomic.Int64
 }
 
 type ClientActionMessage struct {
@@ -58,12 +165,75 @@ type CandleBroadcastMessage struct {
 }
 
 func NewStreamHub(coordinator *datafeed.Coordinator) *StreamHub {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &StreamHub{
 		coordinator:    coordinator,
+		ctx:            ctx,
+		cancel:         cancel,
 		clients:        make(map[*HubClient]bool),
 		topics:         make(map[string]map[*HubClient]bool),
+		topicCancels:   make(map[string]context.CancelFunc),
 		lastCandles:    make(map[string]datafeed.Candle),
 		historyCandles: make(map[string][]wickra.CandleData),
+		sharedSessions: make(map[sharedSessionKey]*sharedIndicatorSession),
+	}
+}
+
+func (h *StreamHub) hubContext() context.Context {
+	if h.ctx != nil {
+		return h.ctx
+	}
+	return context.Background()
+}
+
+func (h *StreamHub) enqueueIndicatorJob(job func()) {
+	ctx := h.hubContext()
+	if ctx.Err() != nil {
+		return
+	}
+	h.indWorkerOnce.Do(func() {
+		h.indJobs = make(chan func(), 256)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case fn := <-h.indJobs:
+					if fn != nil {
+						fn()
+					}
+				}
+			}
+		}()
+	})
+	select {
+	case h.indJobs <- job:
+	default:
+		// Drop overload indicator update rather than stalling upstream provider read loops
+	}
+}
+
+// Close cancels all active provider subscription contexts and closes connected clients.
+func (h *StreamHub) Close() {
+	if h.cancel != nil {
+		h.cancel()
+	}
+
+	h.mu.Lock()
+	for key, cancelFn := range h.topicCancels {
+		if cancelFn != nil {
+			cancelFn()
+		}
+		delete(h.topicCancels, key)
+	}
+	clients := make([]*HubClient, 0, len(h.clients))
+	for cl := range h.clients {
+		clients = append(clients, cl)
+	}
+	h.mu.Unlock()
+
+	for _, cl := range clients {
+		cl.close()
 	}
 }
 
@@ -143,7 +313,9 @@ func (h *StreamHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (c *HubClient) close() {
 	c.closeOnce.Do(func() {
 		close(c.done)
-		c.conn.Close(websocket.StatusNormalClosure, "client closed")
+		if c.conn != nil {
+			c.conn.Close(websocket.StatusNormalClosure, "client closed")
+		}
 		c.indicatorMu.Lock()
 		for _, s := range c.indicatorSubs {
 			if s != nil {
@@ -153,12 +325,132 @@ func (c *HubClient) close() {
 		c.indicatorSubs = nil
 		c.indicatorConfigs = nil
 		c.indicatorMu.Unlock()
-		c.hub.removeClient(c)
+		if c.hub != nil {
+			c.hub.removeClient(c)
+		}
 	})
+}
+
+type writeTimeoutCtx struct {
+	parent   context.Context
+	mu       sync.Mutex
+	done     chan struct{}
+	err      error
+	deadline time.Time
+	closed   bool
+}
+
+func newWriteTimeoutCtx(parent context.Context) *writeTimeoutCtx {
+	return &writeTimeoutCtx{
+		parent: parent,
+		done:   make(chan struct{}),
+	}
+}
+
+func (w *writeTimeoutCtx) Deadline() (time.Time, bool) {
+	w.mu.Lock()
+	d := w.deadline
+	w.mu.Unlock()
+	return d, !d.IsZero()
+}
+
+func (w *writeTimeoutCtx) Done() <-chan struct{} {
+	w.mu.Lock()
+	ch := w.done
+	w.mu.Unlock()
+	return ch
+}
+
+func (w *writeTimeoutCtx) Err() error {
+	w.mu.Lock()
+	err := w.err
+	w.mu.Unlock()
+	return err
+}
+
+func (w *writeTimeoutCtx) Value(key any) any {
+	return w.parent.Value(key)
+}
+
+func (w *writeTimeoutCtx) setDeadline(d time.Time) {
+	w.mu.Lock()
+	w.deadline = d
+	w.mu.Unlock()
+}
+
+func (w *writeTimeoutCtx) trigger(err error) {
+	w.mu.Lock()
+	if !w.closed {
+		w.closed = true
+		w.err = err
+		close(w.done)
+	}
+	w.mu.Unlock()
+}
+
+func (w *writeTimeoutCtx) resetAfterFire() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.parent.Err() != nil {
+		return false
+	}
+	if w.closed {
+		w.done = make(chan struct{})
+		w.err = nil
+		w.closed = false
+	}
+	return true
+}
+
+func (c *HubClient) trySend(data []byte) {
+	select {
+	case <-c.done:
+		return
+	default:
+	}
+
+	select {
+	case c.send <- data:
+		c.droppedMsgs.Store(0)
+		return
+	default:
+	}
+
+	// Send queue full: coalesce by evicting one oldest stale frame and retrying.
+	select {
+	case <-c.send:
+	default:
+	}
+
+	select {
+	case c.send <- data:
+		if c.droppedMsgs.Add(1) > maxConsecutiveDrops {
+			go c.close()
+		}
+	default:
+		// Still blocked: disconnect sluggish/dead client cleanly outside caller locks.
+		go c.close()
+	}
 }
 
 func (c *HubClient) writePump(ctx context.Context) {
 	defer c.close()
+
+	wctx := newWriteTimeoutCtx(ctx)
+	stopParent := context.AfterFunc(ctx, func() {
+		err := ctx.Err()
+		if err == nil {
+			err = context.Canceled
+		}
+		wctx.trigger(err)
+	})
+	defer stopParent()
+
+	timer := time.AfterFunc(time.Hour, func() {
+		wctx.trigger(context.DeadlineExceeded)
+	})
+	timer.Stop()
+	defer timer.Stop()
 
 	for {
 		select {
@@ -170,10 +462,14 @@ func (c *HubClient) writePump(ctx context.Context) {
 			if !ok {
 				return
 			}
-			writeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			err := c.conn.Write(writeCtx, websocket.MessageText, msg)
-			cancel()
+			wctx.setDeadline(time.Now().Add(clientWriteTimeout))
+			timer.Reset(clientWriteTimeout)
+			err := c.conn.Write(wctx, websocket.MessageText, msg)
+			stopped := timer.Stop()
 			if err != nil {
+				return
+			}
+			if !stopped && !wctx.resetAfterFire() {
 				return
 			}
 		}
@@ -218,6 +514,72 @@ func (c *HubClient) readPump(ctx context.Context) {
 	}
 }
 
+func canonicalIndicatorConfigKey(configs []wickra.EvalIndicatorInstance) string {
+	b, err := json.Marshal(configs)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func (h *StreamHub) acquireSharedSession(
+	topicKey string,
+	symbol string,
+	resolution string,
+	eng IndicatorEngine,
+	configs []wickra.EvalIndicatorInstance,
+	seedCandles []wickra.CandleData,
+) (*hubSessionHandle, error) {
+	cfgKey := canonicalIndicatorConfigKey(configs)
+	sKey := sharedSessionKey{topic: topicKey, configKey: cfgKey}
+
+	h.sharedMu.Lock()
+	if h.sharedSessions == nil {
+		h.sharedSessions = make(map[sharedSessionKey]*sharedIndicatorSession)
+	}
+	if existing, ok := h.sharedSessions[sKey]; ok && !existing.closed.Load() {
+		existing.refCount++
+		h.sharedMu.Unlock()
+		return &hubSessionHandle{shared: existing}, nil
+	}
+	h.sharedMu.Unlock()
+
+	session, err := eng.CreateSession(context.Background(), symbol, resolution, configs)
+	if err != nil {
+		return nil, err
+	}
+
+	seeded := false
+	if len(seedCandles) > 0 {
+		if seeder, ok := session.(interface {
+			Seed(context.Context, []wickra.CandleData) error
+		}); ok {
+			if err := seeder.Seed(context.Background(), seedCandles); err == nil {
+				seeded = true
+			}
+		}
+	}
+
+	h.sharedMu.Lock()
+	if existing, ok := h.sharedSessions[sKey]; ok && !existing.closed.Load() {
+		existing.refCount++
+		h.sharedMu.Unlock()
+		_ = session.Close(context.Background())
+		return &hubSessionHandle{shared: existing}, nil
+	}
+	shared := &sharedIndicatorSession{
+		hub:      h,
+		key:      sKey,
+		inner:    session,
+		refCount: 1,
+		seeded:   seeded,
+	}
+	h.sharedSessions[sKey] = shared
+	h.sharedMu.Unlock()
+
+	return &hubSessionHandle{shared: shared}, nil
+}
+
 func (h *StreamHub) subscribeIndicators(client *HubClient, symbol, resolution string, configs []wickra.EvalIndicatorInstance, clientCandles []wickra.CandleData) {
 	select {
 	case <-client.done:
@@ -229,21 +591,31 @@ func (h *StreamHub) subscribeIndicators(client *HubClient, symbol, resolution st
 
 	h.mu.RLock()
 	eng := h.indicatorEngine
+	coord := h.coordinator
 	h.mu.RUnlock()
 
 	if eng == nil {
 		return
 	}
 
+	const (
+		maxClientIndicatorTopics  = 16
+		maxClientIndicatorConfigs = 32
+	)
+
 	client.indicatorMu.Lock()
 	if client.indicatorSubs == nil {
 		client.indicatorMu.Unlock()
 		return
 	}
+	if _, hasTopic := client.indicatorConfigs[key]; !hasTopic && len(client.indicatorConfigs) >= maxClientIndicatorTopics {
+		client.indicatorMu.Unlock()
+		return
+	}
 
 	// Merge new configs with existing configs by InstanceID
-	mergedConfigs := make([]wickra.EvalIndicatorInstance, 0)
-	configMap := make(map[string]wickra.EvalIndicatorInstance)
+	mergedConfigs := make([]wickra.EvalIndicatorInstance, 0, len(configs))
+	configMap := make(map[string]wickra.EvalIndicatorInstance, len(configs))
 	var order []string
 
 	if existing, ok := client.indicatorConfigs[key]; ok {
@@ -255,6 +627,9 @@ func (h *StreamHub) subscribeIndicators(client *HubClient, symbol, resolution st
 
 	for _, cfg := range configs {
 		if _, exists := configMap[cfg.InstanceID]; !exists {
+			if len(order) >= maxClientIndicatorConfigs {
+				continue
+			}
 			order = append(order, cfg.InstanceID)
 		}
 		configMap[cfg.InstanceID] = cfg
@@ -266,37 +641,88 @@ func (h *StreamHub) subscribeIndicators(client *HubClient, symbol, resolution st
 	client.indicatorConfigs[key] = mergedConfigs
 	client.indicatorMu.Unlock()
 
-	session, err := eng.CreateSession(context.Background(), symbol, resolution, mergedConfigs)
-	if err == nil {
-		client.indicatorMu.Lock()
-		if client.indicatorSubs != nil {
-			if prev := client.indicatorSubs[key]; prev != nil {
-				_ = prev.Close(context.Background())
-			}
-			client.indicatorSubs[key] = session
+	// Use clientCandles only for this client's session seed; never overwrite shared h.historyCandles[key] across clients.
+	var seedCandles []wickra.CandleData
+	needAsyncFetch := false
+	h.mu.RLock()
+	existingHist := h.historyCandles[key]
+	if len(clientCandles) > 0 {
+		start := 0
+		if len(clientCandles) > maxHistoryCandles {
+			start = len(clientCandles) - maxHistoryCandles
 		}
-		client.indicatorMu.Unlock()
+		seedCandles = make([]wickra.CandleData, len(clientCandles)-start)
+		copy(seedCandles, clientCandles[start:])
+	} else {
+		needAsyncFetch = len(existingHist) < 50 && coord != nil
+		if len(existingHist) > 0 {
+			seedCandles = make([]wickra.CandleData, len(existingHist))
+			copy(seedCandles, existingHist)
+		}
+	}
+	h.mu.RUnlock()
+
+	session, err := h.acquireSharedSession(key, symbol, resolution, eng, mergedConfigs, seedCandles)
+	if err != nil {
+		return
 	}
 
-	// Pre-load recent candle history for decoupled accurate indicator evaluations
-	h.mu.Lock()
-	if len(clientCandles) > 0 {
-		h.historyCandles[key] = clientCandles
-	} else if len(h.historyCandles[key]) < 50 && h.coordinator != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		rawHistory, err := h.coordinator.GetCandles(ctx, symbol, resolution, 0, 0, 1000)
-		cancel()
-		if err == nil && len(rawHistory) > 0 {
-			var cList []wickra.CandleData
-			for _, rc := range rawHistory {
-				cList = append(cList, wickra.CandleData{
-					Time: rc.Time, Open: rc.Open, High: rc.High, Low: rc.Low, Close: rc.Close, Volume: rc.Volume,
-				})
-			}
-			h.historyCandles[key] = cList
-		}
+	var prevSession IndicatorSession
+	var attached bool
+	client.indicatorMu.Lock()
+	select {
+	case <-client.done:
+		client.indicatorMu.Unlock()
+		_ = session.Close(context.Background())
+		return
+	default:
 	}
-	h.mu.Unlock()
+	if client.indicatorSubs != nil {
+		prevSession = client.indicatorSubs[key]
+		client.indicatorSubs[key] = session
+		attached = true
+	} else {
+		prevSession = session
+	}
+	client.indicatorMu.Unlock()
+
+	if prevSession != nil {
+		_ = prevSession.Close(context.Background())
+	}
+
+	if needAsyncFetch && attached {
+		sharedRef := session.shared
+		go func() {
+			fetchCtx, cancel := context.WithTimeout(h.hubContext(), 2*time.Second)
+			rawHistory, fetchErr := coord.GetCandles(fetchCtx, symbol, resolution, 0, 0, 1000)
+			cancel()
+			if fetchErr != nil || len(rawHistory) == 0 {
+				return
+			}
+			cList := make([]wickra.CandleData, len(rawHistory))
+			for i, rc := range rawHistory {
+				cList[i] = wickra.CandleData{
+					Time: rc.Time, Open: rc.Open, High: rc.High, Low: rc.Low, Close: rc.Close, Volume: rc.Volume,
+				}
+			}
+
+			var toSeed []wickra.CandleData
+			h.mu.Lock()
+			if h.historyCandles == nil {
+				h.historyCandles = make(map[string][]wickra.CandleData)
+			}
+			if len(h.historyCandles[key]) < 50 {
+				h.historyCandles[key] = cList
+				toSeed = make([]wickra.CandleData, len(cList))
+				copy(toSeed, cList)
+			}
+			h.mu.Unlock()
+
+			if len(toSeed) > 0 && sharedRef != nil {
+				sharedRef.seedIfIdle(h.hubContext(), toSeed)
+			}
+		}()
+	}
 }
 
 func (h *StreamHub) unsubscribeIndicators(client *HubClient, symbol, resolution string, instanceIDs []string) {
@@ -320,24 +746,26 @@ func (h *StreamHub) unsubscribeIndicators(client *HubClient, symbol, resolution 
 
 	// If no specific instance IDs were requested, unsubscribe ALL indicators on this topic
 	if len(instanceIDs) == 0 {
-		if session := client.indicatorSubs[key]; session != nil {
-			_ = session.Close(context.Background())
-			delete(client.indicatorSubs, key)
-		}
+		session := client.indicatorSubs[key]
+		delete(client.indicatorSubs, key)
 		if client.indicatorConfigs != nil {
 			delete(client.indicatorConfigs, key)
 		}
 		client.indicatorMu.Unlock()
+		if session != nil {
+			_ = session.Close(context.Background())
+		}
 		return
 	}
 
 	existing, exists := client.indicatorConfigs[key]
 	if !exists || len(existing) == 0 {
-		if session := client.indicatorSubs[key]; session != nil {
-			_ = session.Close(context.Background())
-			delete(client.indicatorSubs, key)
-		}
+		session := client.indicatorSubs[key]
+		delete(client.indicatorSubs, key)
 		client.indicatorMu.Unlock()
+		if session != nil {
+			_ = session.Close(context.Background())
+		}
 		return
 	}
 
@@ -354,14 +782,15 @@ func (h *StreamHub) unsubscribeIndicators(client *HubClient, symbol, resolution 
 	}
 
 	if len(remaining) == 0 {
-		if session := client.indicatorSubs[key]; session != nil {
-			_ = session.Close(context.Background())
-			delete(client.indicatorSubs, key)
-		}
+		session := client.indicatorSubs[key]
+		delete(client.indicatorSubs, key)
 		if client.indicatorConfigs != nil {
 			delete(client.indicatorConfigs, key)
 		}
 		client.indicatorMu.Unlock()
+		if session != nil {
+			_ = session.Close(context.Background())
+		}
 		return
 	}
 
@@ -376,33 +805,45 @@ func (h *StreamHub) unsubscribeIndicators(client *HubClient, symbol, resolution 
 		return
 	}
 
-	newSession, err := eng.CreateSession(context.Background(), symbol, resolution, remaining)
+	h.mu.RLock()
+	var seedCandles []wickra.CandleData
+	if hist := h.historyCandles[key]; len(hist) > 0 {
+		seedCandles = make([]wickra.CandleData, len(hist))
+		copy(seedCandles, hist)
+	}
+	h.mu.RUnlock()
+
+	newSession, err := h.acquireSharedSession(key, symbol, resolution, eng, remaining, seedCandles)
 	if err != nil {
 		log.Printf("[StreamHub] Failed to recreate indicator session after selective unsubscribe for %s: %v", key, err)
 		return
 	}
 
+	var prevSession IndicatorSession
 	client.indicatorMu.Lock()
-	defer client.indicatorMu.Unlock()
-
 	select {
 	case <-client.done:
+		client.indicatorMu.Unlock()
 		_ = newSession.Close(context.Background())
 		return
 	default:
 	}
 
 	if client.indicatorSubs == nil {
+		client.indicatorMu.Unlock()
 		_ = newSession.Close(context.Background())
 		return
 	}
 
-	if prev := client.indicatorSubs[key]; prev != nil {
-		_ = prev.Close(context.Background())
-	}
+	prevSession = client.indicatorSubs[key]
 	client.indicatorSubs[key] = newSession
 	if client.indicatorConfigs != nil {
 		client.indicatorConfigs[key] = remaining
+	}
+	client.indicatorMu.Unlock()
+
+	if prevSession != nil {
+		_ = prevSession.Close(context.Background())
 	}
 }
 
@@ -416,9 +857,8 @@ func (h *StreamHub) subscribe(client *HubClient, symbol, resolution string) {
 	key := h.topicKey(symbol, resolution)
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	if !h.clients[client] {
+		h.mu.Unlock()
 		return
 	}
 
@@ -429,37 +869,54 @@ func (h *StreamHub) subscribe(client *HubClient, symbol, resolution string) {
 		subscribers = make(map[*HubClient]bool)
 		h.topics[key] = subscribers
 
-		// First subscriber to this topic: start provider subscription
-		provider, cleanSym, err := h.coordinator.ResolveProvider(symbol)
-		if err == nil && provider != nil {
-			symCapture := symbol
-			resCapture := resolution
-			log.Printf("[StreamHub] Starting subscription for %s (%s)", symCapture, resCapture)
-			go func() {
-				_ = provider.Subscribe(context.Background(), cleanSym, resCapture, func(c datafeed.Candle) {
-					h.Broadcast(symCapture, resCapture, c)
-				})
-			}()
-		} else {
-			log.Printf("[StreamHub] Failed to resolve provider for %s: %v", symbol, err)
+		// First subscriber to this topic: start provider subscription with a cancellable lifetime context
+		if h.coordinator != nil {
+			provider, cleanSym, err := h.coordinator.ResolveProvider(symbol)
+			if err == nil && provider != nil {
+				if h.topicCancels == nil {
+					h.topicCancels = make(map[string]context.CancelFunc)
+				}
+				subCtx, subCancel := context.WithCancel(h.hubContext())
+				h.topicCancels[key] = subCancel
+
+				symCapture := symbol
+				resCapture := resolution
+				log.Printf("[StreamHub] Starting subscription for %s (%s)", symCapture, resCapture)
+				go func() {
+					_ = provider.Subscribe(subCtx, cleanSym, resCapture, func(c datafeed.Candle) {
+						h.Broadcast(symCapture, resCapture, c)
+					})
+				}()
+
+				// If provider also supports L2 footprint, hook it up as well
+				if l2p, ok := provider.(datafeed.L2DataProvider); ok {
+					go func() {
+						_ = l2p.SubscribeFootprint(subCtx, cleanSym, resCapture, func(fp datafeed.FootprintBar) {
+							h.BroadcastFootprint(symCapture, resCapture, fp)
+						})
+					}()
+				}
+			} else {
+				log.Printf("[StreamHub] Failed to resolve provider for %s: %v", symbol, err)
+			}
 		}
 	}
 
 	subscribers[client] = true
 
+	lastCandle, hasLast := h.lastCandles[key]
+	h.mu.Unlock()
+
 	// If we already have a recent candle for this topic, immediately send it to the client
-	if candle, ok := h.lastCandles[key]; ok {
+	if hasLast {
 		msg := CandleBroadcastMessage{
 			Type:       "candle",
 			Symbol:     symbol,
 			Resolution: resolution,
-			Candle:     candle,
+			Candle:     lastCandle,
 		}
 		if data, err := json.Marshal(msg); err == nil {
-			select {
-			case client.send <- data:
-			default:
-			}
+			client.trySend(data)
 		}
 	}
 }
@@ -475,24 +932,36 @@ func (h *StreamHub) unsubscribe(client *HubClient, symbol, resolution string) {
 		delete(subscribers, client)
 		if len(subscribers) == 0 {
 			delete(h.topics, key)
+			delete(h.historyCandles, key)
+			delete(h.lastCandles, key)
+			if cancelFn, ok := h.topicCancels[key]; ok {
+				cancelFn()
+				delete(h.topicCancels, key)
+			}
 
 			// No more clients for this topic: unsubscribe from provider
-			provider, cleanSym, err := h.coordinator.ResolveProvider(symbol)
-			if err == nil && provider != nil {
-				resCapture := resolution
-				log.Printf("[StreamHub] Stopping subscription for %s (%s)", symbol, resCapture)
-				go func() {
-					_ = provider.Unsubscribe(cleanSym, resCapture)
-				}()
+			if h.coordinator != nil {
+				provider, cleanSym, err := h.coordinator.ResolveProvider(symbol)
+				if err == nil && provider != nil {
+					resCapture := resolution
+					log.Printf("[StreamHub] Stopping subscription for %s (%s)", symbol, resCapture)
+					go func() {
+						_ = provider.Unsubscribe(cleanSym, resCapture)
+						if l2p, ok := provider.(datafeed.L2DataProvider); ok {
+							_ = l2p.UnsubscribeFootprint(cleanSym, resCapture)
+						}
+					}()
+				}
 			}
 		}
 	}
 	h.mu.Unlock()
 
+	var session IndicatorSession
 	client.indicatorMu.Lock()
 	if client.indicatorSubs != nil {
-		if session, ok := client.indicatorSubs[key]; ok && session != nil {
-			_ = session.Close(context.Background())
+		if s, ok := client.indicatorSubs[key]; ok {
+			session = s
 			delete(client.indicatorSubs, key)
 		}
 	}
@@ -500,6 +969,10 @@ func (h *StreamHub) unsubscribe(client *HubClient, symbol, resolution string) {
 		delete(client.indicatorConfigs, key)
 	}
 	client.indicatorMu.Unlock()
+
+	if session != nil {
+		_ = session.Close(context.Background())
+	}
 }
 
 func (h *StreamHub) removeClient(client *HubClient) {
@@ -514,16 +987,27 @@ func (h *StreamHub) removeClient(client *HubClient) {
 			delete(subscribers, client)
 			if len(subscribers) == 0 {
 				delete(h.topics, key)
+				delete(h.historyCandles, key)
+				delete(h.lastCandles, key)
+				if cancelFn, ok := h.topicCancels[key]; ok {
+					cancelFn()
+					delete(h.topicCancels, key)
+				}
 
-				parts := strings.Split(key, "::")
-				if len(parts) >= 2 {
-					sym := parts[0]
-					res := parts[1]
-					provider, cleanSym, err := h.coordinator.ResolveProvider(sym)
-					if err == nil && provider != nil {
-						go func() {
-							_ = provider.Unsubscribe(cleanSym, res)
-						}()
+				if h.coordinator != nil {
+					parts := strings.Split(key, "::")
+					if len(parts) >= 2 {
+						sym := parts[0]
+						res := parts[1]
+						provider, cleanSym, err := h.coordinator.ResolveProvider(sym)
+						if err == nil && provider != nil {
+							go func() {
+								_ = provider.Unsubscribe(cleanSym, res)
+								if l2p, ok := provider.(datafeed.L2DataProvider); ok {
+									_ = l2p.UnsubscribeFootprint(cleanSym, res)
+								}
+							}()
+						}
 					}
 				}
 			}
@@ -531,28 +1015,38 @@ func (h *StreamHub) removeClient(client *HubClient) {
 	}
 }
 
+func sanitizeSessionPlots(raw map[string]map[string]float64) map[string]map[string]float64 {
+	if len(raw) == 0 {
+		return nil
+	}
+	var sanitized map[string]map[string]float64
+	for instID, pMap := range raw {
+		if len(pMap) == 0 {
+			continue
+		}
+		var cleanMap map[string]float64
+		for pID, val := range pMap {
+			if math.IsNaN(val) || math.IsInf(val, 0) {
+				continue
+			}
+			if cleanMap == nil {
+				cleanMap = make(map[string]float64, len(pMap))
+			}
+			cleanMap[pID] = val
+		}
+		if len(cleanMap) > 0 {
+			if sanitized == nil {
+				sanitized = make(map[string]map[string]float64, len(raw))
+			}
+			sanitized[instID] = cleanMap
+		}
+	}
+	return sanitized
+}
+
 func (h *StreamHub) Broadcast(symbol, resolution string, candle datafeed.Candle) {
 	key := h.topicKey(symbol, resolution)
 
-	msg := CandleBroadcastMessage{
-		Type:       "candle",
-		Symbol:     symbol,
-		Resolution: resolution,
-		Candle:     candle,
-	}
-
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return
-	}
-
-	h.mu.Lock()
-	if h.lastCandles == nil {
-		h.lastCandles = make(map[string]datafeed.Candle)
-	}
-	h.lastCandles[key] = candle
-
-	// Update recent candle history in sliding window (ring buffer)
 	cData := wickra.CandleData{
 		Time:   candle.Time,
 		Open:   candle.Open,
@@ -561,6 +1055,14 @@ func (h *StreamHub) Broadcast(symbol, resolution string, candle datafeed.Candle)
 		Close:  candle.Close,
 		Volume: candle.Volume,
 	}
+
+	h.mu.Lock()
+	if h.lastCandles == nil {
+		h.lastCandles = make(map[string]datafeed.Candle)
+	}
+	h.lastCandles[key] = candle
+
+	// Update recent candle history in sliding window under h.mu.Lock().
 	if h.historyCandles == nil {
 		h.historyCandles = make(map[string][]wickra.CandleData)
 	}
@@ -568,7 +1070,7 @@ func (h *StreamHub) Broadcast(symbol, resolution string, candle datafeed.Candle)
 	if len(history) == 0 {
 		history = []wickra.CandleData{cData}
 	} else if cData.Time == history[len(history)-1].Time {
-		// Same in-progress bar: update current bar with latest tick while preserving authentic OHLC bounds & volume
+		// Same in-progress bar: update current bar while preserving OHLC bounds & volume
 		last := history[len(history)-1]
 		if last.Open != 0 {
 			cData.Open = last.Open
@@ -584,10 +1086,12 @@ func (h *StreamHub) Broadcast(symbol, resolution string, candle datafeed.Candle)
 		}
 		history[len(history)-1] = cData
 	} else if cData.Time > history[len(history)-1].Time {
-		// New bar opened: append and cap
+		// New bar opened: append and cap cleanly without aliasing stale prefix memory
 		history = append(history, cData)
-		if len(history) > 2000 {
-			history = history[len(history)-2000:]
+		if len(history) > maxHistoryCandles {
+			trim := len(history) - maxHistoryCandles
+			copy(history, history[trim:])
+			history = history[:maxHistoryCandles]
 		}
 	}
 	h.historyCandles[key] = history
@@ -602,70 +1106,120 @@ func (h *StreamHub) Broadcast(symbol, resolution string, candle datafeed.Candle)
 	for cl := range subscribers {
 		clientsList = append(clientsList, cl)
 	}
-	eng := h.indicatorEngine
 	h.mu.Unlock()
 
-	for _, cl := range clientsList {
-		select {
-		case cl.send <- data:
-		default:
-			// Buffer full, drop or close
+	// Marshal candle message only after confirming len(subscribers) > 0.
+	msg := CandleBroadcastMessage{
+		Type:       "candle",
+		Symbol:     symbol,
+		Resolution: resolution,
+		Candle:     candle,
+	}
+	if data, err := json.Marshal(msg); err == nil {
+		for _, cl := range clientsList {
+			cl.trySend(data)
 		}
 	}
 
-	// 2. Compute and broadcast indicator updates
-	// Using the true rolling history ensures technical indicators never collapse or stick to candle close.
-	if len(history) >= 2 && eng != nil {
-		evalHistory := history
-		if len(evalHistory) > 2000 {
-			evalHistory = evalHistory[len(evalHistory)-2000:]
+	// Incremental indicator session updates, deduplicated across clients sharing identical (topic, config).
+	type sessionGroup struct {
+		session IndicatorSession
+		clients []*HubClient
+	}
+	var groups []*sessionGroup
+	bySession := make(map[any]*sessionGroup, len(clientsList))
+
+	for _, cl := range clientsList {
+		cl.indicatorMu.Lock()
+		var sess IndicatorSession
+		if cl.indicatorSubs != nil {
+			sess = cl.indicatorSubs[key]
+		}
+		cl.indicatorMu.Unlock()
+
+		if sess == nil {
+			continue
 		}
 
-		for _, cl := range clientsList {
-			cl.indicatorMu.Lock()
-			cfgs := cl.indicatorConfigs[key]
-			cl.indicatorMu.Unlock()
+		var dedupKey any = sess
+		if handle, ok := sess.(*hubSessionHandle); ok && handle.shared != nil {
+			dedupKey = handle.shared
+		}
 
-			if len(cfgs) == 0 {
-				continue
-			}
+		grp, found := bySession[dedupKey]
+		if !found {
+			grp = &sessionGroup{session: sess}
+			bySession[dedupKey] = grp
+			groups = append(groups, grp)
+		}
+		grp.clients = append(grp.clients, cl)
+	}
 
-			evalResults, err := eng.Evaluate(context.Background(), evalHistory, cfgs)
-			if err != nil || len(evalResults) == 0 {
-				continue
-			}
-
-			sanitizedPlots := make(map[string]map[string]float64)
-			for _, res := range evalResults {
-				pMap := make(map[string]float64)
-				for pID, points := range res.Plots {
-					if len(points) > 0 {
-						lastPt := points[len(points)-1]
-						if !math.IsNaN(lastPt.Value) && !math.IsInf(lastPt.Value, 0) {
-							pMap[pID] = lastPt.Value
-						}
-					}
+	if len(groups) > 0 {
+		symCopy := symbol
+		resCopy := resolution
+		barTime := candle.Time
+		candleCopy := cData
+		h.enqueueIndicatorJob(func() {
+			for _, grp := range groups {
+				updCtx, cancel := context.WithTimeout(h.hubContext(), 250*time.Millisecond)
+				rawPlots, err := grp.session.Update(updCtx, candleCopy)
+				cancel()
+				if err != nil || len(rawPlots) == 0 {
+					continue
 				}
-				if len(pMap) > 0 {
-					sanitizedPlots[res.InstanceID] = pMap
-				}
-			}
 
-			if len(sanitizedPlots) > 0 {
+				sanitizedPlots := sanitizeSessionPlots(rawPlots)
+				if len(sanitizedPlots) == 0 {
+					continue
+				}
+
 				indMsg := IndicatorBroadcastMessage{
 					Type:       "indicator_update",
-					Symbol:     symbol,
-					Resolution: resolution,
-					Time:       candle.Time,
+					Symbol:     symCopy,
+					Resolution: resCopy,
+					Time:       barTime,
 					Plots:      sanitizedPlots,
 				}
 				if indData, err := json.Marshal(indMsg); err == nil {
-					select {
-					case cl.send <- indData:
-					default:
+					for _, cl := range grp.clients {
+						cl.trySend(indData)
 					}
 				}
 			}
-		}
+		})
+	}
+}
+
+// BroadcastFootprint delivers real-time Footprint cluster bars to subscribers.
+func (h *StreamHub) BroadcastFootprint(symbol, resolution string, fp datafeed.FootprintBar) {
+	key := h.topicKey(symbol, resolution)
+
+	h.mu.RLock()
+	subscribers, exists := h.topics[key]
+	if !exists || len(subscribers) == 0 {
+		h.mu.RUnlock()
+		return
+	}
+
+	clientsList := make([]*HubClient, 0, len(subscribers))
+	for cl := range subscribers {
+		clientsList = append(clientsList, cl)
+	}
+	h.mu.RUnlock()
+
+	msg := map[string]interface{}{
+		"type":       "footprint",
+		"symbol":     symbol,
+		"resolution": resolution,
+		"footprint":  fp,
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+
+	for _, cl := range clientsList {
+		cl.trySend(data)
 	}
 }

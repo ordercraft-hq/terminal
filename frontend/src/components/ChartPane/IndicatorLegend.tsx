@@ -1,5 +1,5 @@
 import React, { useMemo } from 'react';
-import { useSyncStore } from '../../store/syncStore';
+import { useSyncStore, createDefaultVolumeIndicator } from '../../store/syncStore';
 import type { IndicatorInstance, IndicatorCategory } from '../../indicators/types';
 import { INDICATOR_REGISTRY } from '../../indicators/registry';
 import { normalizeIndicatorId } from '../../indicators/migration';
@@ -107,7 +107,7 @@ export const IndicatorLegendItem: React.FC<IndicatorLegendItemProps> = ({
       key={ind.id}
       className={`group flex items-center gap-1.5 px-2 py-0.5 rounded transition-all w-fit text-[11px] font-sans ${
         isLightCanvas ? 'hover:bg-black/5' : 'hover:bg-white/10'
-      } backdrop-blur-xs`}
+      }`}
       style={{
         color: textColor,
         fontSize: `${statusTextSize}px`,
@@ -246,7 +246,9 @@ export const IndicatorLegend: React.FC<IndicatorLegendProps> = ({
   precision,
 }) => {
   const indicatorsMap = useSyncStore((s) => s.indicators);
-  const allIndicators = indicatorsMap[paneId] || [];
+  const allIndicators = indicatorsMap[paneId] !== undefined
+    ? indicatorsMap[paneId]
+    : [createDefaultVolumeIndicator(paneId)];
 
   const indicators = allIndicators.filter((ind) => {
     if (indicatorId && ind.id !== indicatorId) return false;

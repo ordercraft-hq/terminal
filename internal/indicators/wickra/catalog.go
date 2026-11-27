@@ -1,14 +1,18 @@
 package wickra
 
-import "sync"
+import (
+	"strings"
+	"sync"
+)
 
 // Catalog holds all 500+ registered Wickra indicator descriptors.
 type Catalog struct {
-	descriptors []IndicatorDescriptor
-	byID        map[string]*IndicatorDescriptor
-	byWasmClass map[string]*IndicatorDescriptor
-	byFamily    map[string][]*IndicatorDescriptor
-	byCategory  map[string][]*IndicatorDescriptor
+	descriptors  []IndicatorDescriptor
+	byID         map[string]*IndicatorDescriptor
+	byWasmClass  map[string]*IndicatorDescriptor
+	byFamily     map[string][]*IndicatorDescriptor
+	byCategory   map[string][]*IndicatorDescriptor
+	byGroupLower map[string][]*IndicatorDescriptor
 }
 
 var (
@@ -27,11 +31,12 @@ func DefaultCatalog() *Catalog {
 // NewCatalog constructs and returns the complete 500+ indicator catalog.
 func NewCatalog() *Catalog {
 	c := &Catalog{
-		descriptors: make([]IndicatorDescriptor, 0, 520),
-		byID:        make(map[string]*IndicatorDescriptor, 520),
-		byWasmClass: make(map[string]*IndicatorDescriptor, 520),
-		byFamily:    make(map[string][]*IndicatorDescriptor),
-		byCategory:  make(map[string][]*IndicatorDescriptor),
+		descriptors:  make([]IndicatorDescriptor, 0, 520),
+		byID:         make(map[string]*IndicatorDescriptor, 520),
+		byWasmClass:  make(map[string]*IndicatorDescriptor, 520),
+		byFamily:     make(map[string][]*IndicatorDescriptor),
+		byCategory:   make(map[string][]*IndicatorDescriptor),
+		byGroupLower: make(map[string][]*IndicatorDescriptor, 48),
 	}
 
 	c.registerMovingAverages()
@@ -104,6 +109,102 @@ func (c *Catalog) add(d IndicatorDescriptor) {
 	c.byWasmClass[d.WasmClass] = ptr
 	c.byFamily[d.Family] = append(c.byFamily[d.Family], ptr)
 	c.byCategory[d.Category] = append(c.byCategory[d.Category], ptr)
+
+	catLower := strings.ToLower(d.Category)
+	famLower := strings.ToLower(d.Family)
+	if catLower != "" {
+		c.byGroupLower[catLower] = append(c.byGroupLower[catLower], ptr)
+	}
+	if famLower != "" && famLower != catLower {
+		c.byGroupLower[famLower] = append(c.byGroupLower[famLower], ptr)
+	}
+}
+
+// containsFold reports whether s contains lowerSub (which must already be lowercase) case-insensitively.
+func containsFold(s, lowerSub string) bool {
+	if lowerSub == "" {
+		return true
+	}
+	// Fast ASCII path avoids allocating lowercased copies for all 515+ descriptors.
+	if len(s) < len(lowerSub) {
+		return false
+	}
+	for i := 0; i < len(lowerSub); i++ {
+		if lowerSub[i] >= 0x80 {
+			return strings.Contains(strings.ToLower(s), lowerSub)
+		}
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return strings.Contains(strings.ToLower(s), lowerSub)
+		}
+	}
+	limit := len(s) - len(lowerSub)
+	for i := 0; i <= limit; i++ {
+		matched := true
+		for j := 0; j < len(lowerSub); j++ {
+			b := s[i+j]
+			if b >= 'A' && b <= 'Z' {
+				b += 'a' - 'A'
+			}
+			if b != lowerSub[j] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
+// Filter returns descriptors matching category/family and search query without copying non-matching entries.
+func (c *Catalog) Filter(category, query string) []IndicatorDescriptor {
+	catLower := strings.ToLower(strings.TrimSpace(category))
+	qLower := strings.ToLower(strings.TrimSpace(query))
+
+	matchesQuery := func(d *IndicatorDescriptor) bool {
+		if d.ID == "wickra.vwap_std_dev_bands" {
+			return false // Exclude deprecated standalone indicator consolidated into canonical wickra.vwap
+		}
+		if qLower == "" {
+			return true
+		}
+		return containsFold(d.ID, qLower) ||
+			containsFold(d.Name, qLower) ||
+			containsFold(d.ShortName, qLower) ||
+			containsFold(d.WasmClass, qLower)
+	}
+
+	if catLower != "" {
+		candidates := c.byGroupLower[catLower]
+		if len(candidates) == 0 {
+			return nil
+		}
+		var filtered []IndicatorDescriptor
+		if qLower == "" {
+			filtered = make([]IndicatorDescriptor, 0, len(candidates))
+		}
+		for _, d := range candidates {
+			if matchesQuery(d) {
+				filtered = append(filtered, *d)
+			}
+		}
+		return filtered
+	}
+
+	var filtered []IndicatorDescriptor
+	if qLower == "" {
+		filtered = make([]IndicatorDescriptor, 0, len(c.descriptors))
+	}
+	for i := range c.descriptors {
+		d := &c.descriptors[i]
+		if matchesQuery(d) {
+			filtered = append(filtered, *d)
+		}
+	}
+	return filtered
 }
 
 var defaultSourceOptions = []SelectOption{

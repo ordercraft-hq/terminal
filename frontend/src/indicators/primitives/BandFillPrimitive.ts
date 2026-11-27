@@ -17,12 +17,30 @@ export interface BandPoint {
   lower: number; // Lower price level
 }
 
+function lowerBoundBand(data: readonly BandPoint[], targetTime: number): number {
+  let lo = 0;
+  let hi = data.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (data[mid].time < targetTime) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
 class BandFillRenderer implements IPrimitivePaneRenderer {
   private _data: readonly BandPoint[];
   private _fillColor: string;
   private _series: ISeriesApi<SeriesType, Time> | null;
   private _chart: IChartApiBase<Time> | null;
   private _visible: boolean;
+  private _segX: number[] = [];
+  private _upperY: number[] = [];
+  private _lowerY: number[] = [];
+  private _segLen = 0;
 
   constructor(
     data: readonly BandPoint[],
@@ -53,7 +71,8 @@ class BandFillRenderer implements IPrimitivePaneRenderer {
   }
 
   draw(target: CanvasRenderingTarget2D): void {
-    if (!this._visible || !this._series || !this._chart || this._data.length === 0) {
+    const len = this._data.length;
+    if (!this._visible || !this._series || !this._chart || len === 0) {
       return;
     }
 
@@ -63,30 +82,54 @@ class BandFillRenderer implements IPrimitivePaneRenderer {
     target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
       if (mediaSize.width <= 0 || mediaSize.height <= 0) return;
 
+      let startIdx = 0;
+      let endIdx = len - 1;
+      const visibleRange = typeof timeScale.getVisibleRange === 'function' ? timeScale.getVisibleRange() : null;
+      if (visibleRange && typeof visibleRange.from === 'number' && typeof visibleRange.to === 'number') {
+        const minT = Math.min(visibleRange.from, visibleRange.to);
+        const maxT = Math.max(visibleRange.from, visibleRange.to);
+        startIdx = Math.max(0, lowerBoundBand(this._data, minT) - 2);
+        endIdx = Math.min(len - 1, lowerBoundBand(this._data, maxT) + 2);
+      } else if (
+        typeof timeScale.getVisibleLogicalRange === 'function' &&
+        typeof timeScale.coordinateToTime === 'function'
+      ) {
+        const logicalRange = timeScale.getVisibleLogicalRange();
+        if (logicalRange) {
+          const t0 = timeScale.coordinateToTime(0);
+          const t1 = timeScale.coordinateToTime(mediaSize.width);
+          if (typeof t0 === 'number' && typeof t1 === 'number') {
+            const minT = Math.min(t0, t1);
+            const maxT = Math.max(t0, t1);
+            startIdx = Math.max(0, lowerBoundBand(this._data, minT) - 2);
+            endIdx = Math.min(len - 1, lowerBoundBand(this._data, maxT) + 2);
+          }
+        }
+      }
+
+      if (startIdx > endIdx) return;
+
       ctx.save();
       ctx.fillStyle = this._fillColor || 'rgba(41, 98, 255, 0.12)';
-
-      let currentUpper: { x: number; y: number }[] = [];
-      let currentLower: { x: number; y: number }[] = [];
+      this._segLen = 0;
 
       const flushSegment = () => {
-        if (currentUpper.length >= 2) {
+        if (this._segLen >= 2) {
           ctx.beginPath();
-          ctx.moveTo(currentUpper[0].x, currentUpper[0].y);
-          for (let i = 1; i < currentUpper.length; i++) {
-            ctx.lineTo(currentUpper[i].x, currentUpper[i].y);
+          ctx.moveTo(this._segX[0], this._upperY[0]);
+          for (let i = 1; i < this._segLen; i++) {
+            ctx.lineTo(this._segX[i], this._upperY[i]);
           }
-          for (let i = currentLower.length - 1; i >= 0; i--) {
-            ctx.lineTo(currentLower[i].x, currentLower[i].y);
+          for (let i = this._segLen - 1; i >= 0; i--) {
+            ctx.lineTo(this._segX[i], this._lowerY[i]);
           }
           ctx.closePath();
           ctx.fill();
         }
-        currentUpper = [];
-        currentLower = [];
+        this._segLen = 0;
       };
 
-      for (let i = 0; i < this._data.length; i++) {
+      for (let i = startIdx; i <= endIdx; i++) {
         const pt = this._data[i];
         if (
           pt.upper === null ||
@@ -114,8 +157,10 @@ class BandFillRenderer implements IPrimitivePaneRenderer {
           continue;
         }
 
-        currentUpper.push({ x, y: yUpper });
-        currentLower.push({ x, y: yLower });
+        const idx = this._segLen++;
+        this._segX[idx] = x;
+        this._upperY[idx] = yUpper;
+        this._lowerY[idx] = yLower;
       }
 
       flushSegment();

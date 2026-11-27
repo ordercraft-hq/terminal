@@ -1,68 +1,73 @@
 # ORDERCRAFT — Custom Data Provider Integration Guide
 
-This guide walks you through adding a **new market data provider** (crypto exchange, forex/CFD broker, equity feed, or custom trading engine bridge) to Ordercraft.
+This guide walks you through adding a **market data provider** to OrderCraft, covering both **Standard Level 1 (L1) Providers** (OHLCV candles) and **Advanced Level 2 (L2) Providers** (Tick data, Order Book Depth, and Orderflow / Footprint clusters).
 
-Ordercraft follows a **High-Performance, Off-Thread Architecture**:
-- All time-series normalization, candle aggregation, and WebSocket streaming live in pure Go backend ([`internal/datafeed/providers/`](internal/datafeed/providers/)).
-- The React + TypeScript frontend ([`frontend/`](frontend/)) receives pre-computed, normalized OHLCV data and renders it at 60–144fps using `lightweight-charts`.
+OrderCraft follows a **High-Performance, Off-Thread Architecture**:
+- All time-series normalization, candle aggregation, tick ingestion, and WebSocket streaming live in pure Go backend ([`internal/datafeed/`](internal/datafeed/)).
+- The React + TypeScript frontend ([`frontend/`](frontend/)) receives pre-computed, normalized OHLCV data and footprint clusters, rendering them at 60–144fps using `lightweight-charts` and custom series primitives.
 
 ---
 
-## Repository Architecture & File Map
+## 1. Provider Tiers: L1 vs. L2
 
-When adding a provider named `EXCHANGE` (e.g., `KRAKEN`, `COINBASE`, `BYBIT`), you will interact with the following directory structure:
+OrderCraft differentiates data providers by capability tier:
+
+| Tier | Capabilities | Core Interfaces | Chart Support | Reference Adapters |
+| :--- | :--- | :--- | :--- | :--- |
+| **Level 1 (L1)** | Historical & Real-Time OHLCV Candles, Instrument Search | `datafeed.DataProvider` | Candlesticks, Bars, Line, Area, Baseline, Heikin-Ashi | `binance.go`, `bybit.go`, `coinbase.go`, `oanda.go`, `alpaca.go` |
+| **Level 2 (L2)** | OHLCV Candles + Trade Execution Ticks + Order Book Depth + Footprint Candle Clusters | `datafeed.DataProvider` + `datafeed.L2DataProvider` | All L1 Charts + **Footprint (Cluster Chart)** + **Orderflow Suite** (Delta, Imbalances, Volume Profile) | `databridge.go` (DataBridge L2) |
+
+---
+
+## 2. Repository Architecture & File Map
+
+When adding a provider named `MYEXCHANGE` (e.g. crypto exchange, broker, or institutional bridge), you interact with the following directory structure:
 
 ```
 ordercraft/
 ├── internal/
 │   ├── datafeed/
-│   │   ├── provider.go                        <-- DataProvider interface & Candle models
+│   │   ├── provider.go                        <-- DataProvider & L2DataProvider interfaces
+│   │   ├── types.go                           <-- TickData, OrderBookDepth, FootprintBar, DeltaAggregator
 │   │   ├── coordinator.go                     <-- Multi-provider router & memory cache
 │   │   ├── aggregator.go                      <-- Candle bucketing & timeframe aggregation
 │   │   └── providers/
 │   │       ├── <name>.go                      <-- [CREATE] Your new provider adapter
-│   │       ├── <name>_test.go                 <-- [CREATE] Unit tests & mock HTTP tests
-│   │       ├── binance.go                     <-- [REFERENCE] Binance Spot & Futures
-│   │       ├── bybit.go                       <-- [REFERENCE] Bybit v5 Linear & Spot
-│   │       ├── coinbase.go                    <-- [REFERENCE] Coinbase Exchange Spot
-│   │       ├── alpaca.go                      <-- [REFERENCE] Alpaca US Stocks & Crypto
-│   │       └── oanda.go                       <-- [REFERENCE] OANDA v20 Forex / CFD
+│   │       ├── <name>_test.go                 <-- [CREATE] Unit tests & mock HTTP/WS tests
+│   │       ├── databridge.go                  <-- [REFERENCE: L2] DataBridge L2 orderflow adapter
+│   │       ├── binance.go                     <-- [REFERENCE: L1] Binance Spot & Futures
+│   │       ├── bybit.go                       <-- [REFERENCE: L1] Bybit v5 Linear & Spot
+│   │       ├── coinbase.go                    <-- [REFERENCE: L1] Coinbase Exchange Spot
+│   │       ├── alpaca.go                      <-- [REFERENCE: L1] Alpaca US Stocks & Crypto
+│   │       └── oanda.go                       <-- [REFERENCE: L1] OANDA v20 Forex / CFD
 │   └── server/
 │       ├── server.go                          <-- [MODIFY] Register provider & status API
+│       ├── hub.go                             <-- Auto-routes L1 candles & L2 footprint broadcasts
 │       └── providers_test.go                  <-- [MODIFY] Server provider count test
 └── frontend/
     └── src/
         ├── utils/
-        │   └── timeframeSupport.ts            <-- [MODIFY] Supported intervals & symbol routing
+        │   ├── timeframeSupport.ts            <-- [MODIFY] Supported intervals & symbol routing
+        │   └── chartTypeSupport.ts            <-- [MODIFY] Register L2 capability (unlocks Footprint)
         └── components/
             └── RightSidebar/
                 ├── RightDockRail.tsx          <-- Real-time connected feeds badge count
                 └── panels/
-                    └── ProvidersPanel.tsx     <-- [MODIFY] Providers UI panel & integrations
+                    ├── ProvidersPanel.tsx     <-- [MODIFY] Providers UI panel & integrations
+                    └── OrderflowPanel.tsx     <-- Displays Orderflow & Footprint controls when L2 active
 ```
 
 ---
 
-## Architecture Checklist
+## 3. Interface Contracts
 
-| # | Layer | Relative File Path | Action | Description |
-|---|---|---|---|---|
-| **1** | Go Backend | [`internal/datafeed/providers/<name>.go`](internal/datafeed/providers/) | **Create** | Implements the `datafeed.DataProvider` interface (REST + WS). |
-| **2** | Go Backend | [`internal/datafeed/providers/<name>_test.go`](internal/datafeed/providers/) | **Create** | Table-driven tests for normalization, mock REST parsing, and search. |
-| **3** | Go Backend | [`internal/server/server.go`](internal/server/server.go) | **Modify** | Register provider in `Coordinator` and update `/api/providers/status`. |
-| **4** | Go Backend | [`internal/server/providers_test.go`](internal/server/providers_test.go) | **Modify** | Update provider count and ID assertions. |
-| **5** | TypeScript | [`frontend/src/utils/timeframeSupport.ts`](frontend/src/utils/timeframeSupport.ts) | **Modify** | Register supported intervals, symbol routing, and UI display name. |
-| **6** | React UI | [`frontend/src/components/RightSidebar/panels/ProvidersPanel.tsx`](frontend/src/components/RightSidebar/panels/ProvidersPanel.tsx) | **Modify** | Add initial state entry and update supported integrations list. |
+### 3.1 Standard Level 1 (`DataProvider`) Interface
 
----
-
-## 1. The `DataProvider` Interface Contract
-
-Every adapter in `internal/datafeed/providers/` must implement the `datafeed.DataProvider` interface defined in [`internal/datafeed/provider.go`](internal/datafeed/provider.go):
+Defined in [`internal/datafeed/provider.go`](internal/datafeed/provider.go):
 
 ```go
 type DataProvider interface {
-    // Unique uppercase exchange identifier (e.g., "COINBASE", "BINANCE", "BYBIT")
+    // Unique uppercase exchange identifier (e.g., "COINBASE", "BINANCE", "MYEXCHANGE")
     Name() string
 
     // Native intervals supported by the provider (e.g. []string{"1m", "5m", "15m", "1h", "1d"})
@@ -74,7 +79,7 @@ type DataProvider interface {
     // Instrument search matching against cached or live symbols
     Search(ctx context.Context, query string) ([]SymbolInfo, error)
 
-    // Real-time streaming subscription (calls onCandle callback for live ticks/bars)
+    // Real-time streaming subscription (invokes onCandle callback on live ticks/bars)
     Subscribe(ctx context.Context, symbol, resolution string, onCandle func(c Candle)) error
 
     // Cancels and cleans up a live subscription without leaking channels or goroutines
@@ -82,7 +87,44 @@ type DataProvider interface {
 }
 ```
 
-### Core Data Models
+### 3.2 Advanced Level 2 (`L2DataProvider`) Interface
+
+Defined in [`internal/datafeed/provider.go`](internal/datafeed/provider.go):
+
+```go
+type DataTier string
+
+const (
+    DataTierL1 DataTier = "L1" // OHLCV Candles only
+    DataTierL2 DataTier = "L2" // Ticks, Orderbook Depth, Footprint
+)
+
+type L2DataProvider interface {
+    DataProvider
+
+    // Returns DataTierL2
+    GetDataTier() DataTier
+
+    // Real-time market execution ticks (aggressor trade stream)
+    SubscribeTicks(ctx context.Context, symbol string, onTick func(t TickData)) error
+    UnsubscribeTicks(symbol string) error
+
+    // Real-time Level 2 order book market depth (bids and asks ladder)
+    SubscribeDepth(ctx context.Context, symbol string, onDepth func(d OrderBookDepth)) error
+    UnsubscribeDepth(symbol string) error
+
+    // Historical Footprint candle clusters (price levels with bid/ask volume)
+    GetFootprintHistory(ctx context.Context, symbol, resolution string, from, to int64, count int) ([]FootprintBar, error)
+
+    // Real-time streaming Footprint updates (emits as ticks aggregate into the forming bar)
+    SubscribeFootprint(ctx context.Context, symbol, resolution string, onFootprint func(f FootprintBar)) error
+    UnsubscribeFootprint(symbol, resolution string) error
+}
+```
+
+### 3.3 Core Data Models
+
+Defined in [`internal/datafeed/provider.go`](internal/datafeed/provider.go) and [`internal/datafeed/types.go`](internal/datafeed/types.go):
 
 ```go
 type Candle struct {
@@ -96,21 +138,61 @@ type Candle struct {
 
 type SymbolInfo struct {
     Symbol      string `json:"symbol"`       // e.g. "BTC-USD" or "BTCUSDT"
-    FullSymbol  string `json:"full_symbol"`  // e.g. "COINBASE:BTC-USD"
-    Description string `json:"description"`  // e.g. "Bitcoin / US Dollar (Coinbase)"
-    Exchange    string `json:"exchange"`     // e.g. "COINBASE"
+    FullSymbol  string `json:"full_symbol"`  // e.g. "MYEXCHANGE:BTC-USD"
+    Description string `json:"description"`  // e.g. "Bitcoin / US Dollar (MyExchange)"
+    Exchange    string `json:"exchange"`     // e.g. "MYEXCHANGE"
     Type        string `json:"type"`         // "crypto", "forex", "stock", "bridge"
     PriceScale  int    `json:"price_scale"`  // e.g. 100 for 2 decimals, 10000 for 4 decimals
+}
+
+type TickData struct {
+    Time     int64    `json:"time"`                // Unix timestamp in seconds (UTC)
+    TimeNano int64    `json:"time_nano,omitempty"` // Unix timestamp in nanoseconds (UTC)
+    Price    float64  `json:"price"`               // Execution price
+    Volume   float64  `json:"volume"`              // Execution quantity/size
+    Side     TickSide `json:"side"`                // "buy", "sell", or "unknown"
+    Symbol   string   `json:"symbol,omitempty"`    // Full symbol (e.g. "MYEXCHANGE:BTCUSDT")
+    TradeID  string   `json:"trade_id,omitempty"`  // Exchange match/trade ID
+}
+
+type OrderBookDepth struct {
+    Symbol string           `json:"symbol"`
+    Time   int64            `json:"time"`
+    Bids   []OrderBookLevel `json:"bids"`
+    Asks   []OrderBookLevel `json:"asks"`
+}
+
+type FootprintPriceLevel struct {
+    Price       float64 `json:"price"`        // Discretized price tier
+    BidVolume   float64 `json:"bid_volume"`   // Aggressor sell volume
+    AskVolume   float64 `json:"ask_volume"`   // Aggressor buy volume
+    TotalVolume float64 `json:"total_volume"` // BidVolume + AskVolume
+    Delta       float64 `json:"delta"`        // AskVolume - BidVolume
+    Imbalance   bool    `json:"imbalance"`    // Exceeds imbalance ratio
+}
+
+type FootprintBar struct {
+    Time        int64                 `json:"time"`        // Period start timestamp in seconds (UTC)
+    Resolution  string                `json:"resolution"`  // Candle timeframe resolution (e.g. "5m")
+    Candle      Candle                `json:"candle"`      // Underlying OHLCV candle
+    Levels      []FootprintPriceLevel `json:"levels"`      // Price levels sorted ascending by price
+    TotalBid    float64               `json:"total_bid"`   // Aggregate bid volume in bar
+    TotalAsk    float64               `json:"total_ask"`   // Aggregate ask volume in bar
+    TotalDelta  float64               `json:"total_delta"` // TotalAsk - TotalBid
+    POC         float64               `json:"poc"`         // Point of Control (highest volume price)
+    POCVolume   float64               `json:"poc_volume"`  // Total volume traded at POC
+    VAH         float64               `json:"vah"`         // Value Area High (70% volume containment)
+    VAL         float64               `json:"val"`         // Value Area Low (70% volume containment)
 }
 ```
 
 ---
 
-## 2. Step-by-Step Implementation
+## 4. Implementing a Standard Level 1 (L1) Provider
 
-### Step 1: Create the Provider (`internal/datafeed/providers/<name>.go`)
+Follow this workflow when your data source provides historical bars and live OHLCV candle streams.
 
-Create a new file in `internal/datafeed/providers/<name>.go` (for example, `myexchange.go`):
+### Step 1: Create the Adapter (`internal/datafeed/providers/<name>.go`)
 
 ```go
 package providers
@@ -119,10 +201,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -150,7 +230,6 @@ func NewMyExchangeProvider() *MyExchangeProvider {
 		subs:    make(map[string]context.CancelFunc),
 	}
 	p.seedDefaultSymbols()
-	go p.loadInstruments(context.Background())
 	return p
 }
 
@@ -162,7 +241,6 @@ func (p *MyExchangeProvider) SupportedResolutions() []string {
 	return []string{"1m", "5m", "15m", "1h", "4h", "1d"}
 }
 
-// Normalize symbols (e.g. MYEXCHANGE:BTCUSD -> BTC-USD)
 func (p *MyExchangeProvider) normalizeSymbol(raw string) string {
 	clean := raw
 	if parts := strings.Split(raw, ":"); len(parts) == 2 {
@@ -171,7 +249,6 @@ func (p *MyExchangeProvider) normalizeSymbol(raw string) string {
 	return strings.ToUpper(strings.TrimSpace(clean))
 }
 
-// Fetch historical candles via REST API
 func (p *MyExchangeProvider) GetHistory(ctx context.Context, symbol, resolution string, from, to int64, count int) ([]datafeed.Candle, error) {
 	sym := p.normalizeSymbol(symbol)
 	if count <= 0 {
@@ -183,7 +260,6 @@ func (p *MyExchangeProvider) GetHistory(ctx context.Context, symbol, resolution 
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "OrderCraft/1.0 (Terminal Workstation)")
 
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -195,12 +271,12 @@ func (p *MyExchangeProvider) GetHistory(ctx context.Context, symbol, resolution 
 		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}
 
-	// Parse JSON candles (ensure oldest -> newest chronological order!)
 	var rawData [][]float64
 	if err := json.NewDecoder(resp.Body).Decode(&rawData); err != nil {
 		return nil, err
 	}
 
+	// NOTE: Lightweight-charts requires strict chronological order (oldest -> newest)
 	candles := make([]datafeed.Candle, 0, len(rawData))
 	for _, row := range rawData {
 		candles = append(candles, datafeed.Candle{
@@ -215,7 +291,6 @@ func (p *MyExchangeProvider) GetHistory(ctx context.Context, symbol, resolution 
 	return candles, nil
 }
 
-// Search instruments
 func (p *MyExchangeProvider) Search(ctx context.Context, query string) ([]datafeed.SymbolInfo, error) {
 	p.symbolsMu.RLock()
 	defer p.symbolsMu.RUnlock()
@@ -240,7 +315,6 @@ func (p *MyExchangeProvider) Search(ctx context.Context, query string) ([]datafe
 	return res, nil
 }
 
-// Real-time WebSocket streaming
 func (p *MyExchangeProvider) Subscribe(ctx context.Context, symbol, resolution string, onCandle func(c datafeed.Candle)) error {
 	sym := p.normalizeSymbol(symbol)
 	subKey := fmt.Sprintf("%s@%s", sym, resolution)
@@ -272,42 +346,7 @@ func (p *MyExchangeProvider) Unsubscribe(symbol, resolution string) error {
 }
 
 func (p *MyExchangeProvider) runWebSocket(ctx context.Context, symbol, resolution string, onCandle func(c datafeed.Candle)) {
-	backoff := 1 * time.Second
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		conn, _, err := websocket.Dial(ctx, p.wsURL, nil)
-		if err != nil {
-			select {
-			case <-time.After(backoff):
-				backoff = min(backoff*2, 30*time.Second)
-				continue
-			case <-ctx.Done():
-				return
-			}
-		}
-		backoff = 1 * time.Second
-
-		// Send subscription payload
-		wsjson.Write(ctx, conn, map[string]interface{}{
-			"action": "subscribe",
-			"symbol": symbol,
-		})
-
-		// Read loop
-		for {
-			var msg map[string]interface{}
-			if err := wsjson.Read(ctx, conn, &msg); err != nil {
-				conn.Close(websocket.StatusAbnormalClosure, "read error")
-				break
-			}
-			// Build and deliver live bar to onCandle()
-		}
-	}
+	// Implement exponential backoff reconnection loop using nhooyr.io/websocket
 }
 
 func (p *MyExchangeProvider) seedDefaultSymbols() {
@@ -324,224 +363,361 @@ func (p *MyExchangeProvider) seedDefaultSymbols() {
 		},
 	}
 }
-
-func (p *MyExchangeProvider) loadInstruments(ctx context.Context) {
-	// Optional: Fetch live products from REST endpoint and update p.cachedSymbols
-}
 ```
 
 ---
 
-### Step 2: Add Provider Unit Tests (`internal/datafeed/providers/<name>_test.go`)
+## 5. Implementing an Advanced Level 2 (L2) Provider
 
-Create `internal/datafeed/providers/myexchange_test.go`:
+If your provider supplies **execution ticks**, **order book depth**, or **footprint clusters** (such as direct exchange WebSocket trade feeds or local Level 2 DataBridge feeds):
+
+### 5.1 Architecture Patterns for L2 Footprints
+
+There are two primary ways an L2 provider delivers footprints to OrderCraft:
+
+1. **Native Footprint API (e.g. DataBridge):** The external server aggregates ticks into footprint bars and supplies `/history` and `footprint_bar` WebSocket events directly.
+2. **On-the-Fly Tick Aggregation (`datafeed.DeltaAggregator`):** Your adapter subscribes to raw market trade ticks (`SubscribeTicks`) and feeds them into OrderCraft's built-in `DeltaAggregator`. The aggregator quantizes prices to tick boundaries, classifies aggressor buy/sell volume, calculates continuous POC/VAH/VAL, and emits `FootprintBar` updates in real-time.
+
+### 5.2 Step-by-Step L2 Provider Implementation
+
+Create your adapter in `internal/datafeed/providers/<name>.go`:
 
 ```go
 package providers
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
-	"testing"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/ordercraft-hq/terminal/internal/datafeed"
 )
 
-func TestMyExchangeProvider_Basics(t *testing.T) {
-	p := NewMyExchangeProvider()
-	if p.Name() != "MYEXCHANGE" {
-		t.Fatalf("Expected MYEXCHANGE, got %s", p.Name())
-	}
-	if len(p.SupportedResolutions()) == 0 {
-		t.Fatalf("Expected non-empty supported resolutions")
+type MyL2Provider struct {
+	*MyExchangeProvider // Embed base L1 implementation
+
+	wsMu                sync.Mutex
+	activeTickSubs      map[string]map[uint64]func(t datafeed.TickData)
+	activeDepthSubs     map[string]map[uint64]func(d datafeed.OrderBookDepth)
+	activeFootprintSubs map[string]map[uint64]func(f datafeed.FootprintBar)
+	aggregators         map[string]*datafeed.DeltaAggregator
+	nextSubID           uint64
+}
+
+func NewMyL2Provider() *MyL2Provider {
+	base := NewMyExchangeProvider()
+	return &MyL2Provider{
+		MyExchangeProvider:  base,
+		activeTickSubs:      make(map[string]map[uint64]func(t datafeed.TickData)),
+		activeDepthSubs:     make(map[string]map[uint64]func(d datafeed.OrderBookDepth)),
+		activeFootprintSubs: make(map[string]map[uint64]func(f datafeed.FootprintBar)),
+		aggregators:         make(map[string]*datafeed.DeltaAggregator),
 	}
 }
 
-func TestMyExchangeProvider_GetHistory_Mock(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		// [[time, open, high, low, close, volume]]
-		w.Write([]byte(`[[1700000000, 100.0, 105.0, 99.0, 104.0, 50.0]]`))
-	}))
-	defer ts.Close()
+// 1. Declare DataTier L2
+func (p *MyL2Provider) GetDataTier() datafeed.DataTier {
+	return datafeed.DataTierL2
+}
 
-	p := NewMyExchangeProvider()
-	p.baseURL = ts.URL
+// 2. Subscribe to execution ticks
+func (p *MyL2Provider) SubscribeTicks(ctx context.Context, symbol string, onTick func(t datafeed.TickData)) error {
+	sym := p.normalizeSymbol(symbol)
+	p.wsMu.Lock()
+	defer p.wsMu.Unlock()
 
-	candles, err := p.GetHistory(context.Background(), "BTC-USD", "15m", 0, 0, 10)
-	if err != nil {
-		t.Fatalf("GetHistory failed: %v", err)
+	p.nextSubID++
+	subID := p.nextSubID
+
+	listeners, exists := p.activeTickSubs[sym]
+	if !exists {
+		listeners = make(map[uint64]func(t datafeed.TickData))
+		p.activeTickSubs[sym] = listeners
+		// Send wire subscription for live trade ticks (e.g. WebSocket trade stream)
 	}
-	if len(candles) != 1 {
-		t.Fatalf("Expected 1 candle, got %d", len(candles))
+	listeners[subID] = onTick
+	return nil
+}
+
+func (p *MyL2Provider) UnsubscribeTicks(symbol string) error {
+	sym := p.normalizeSymbol(symbol)
+	p.wsMu.Lock()
+	defer p.wsMu.Unlock()
+
+	delete(p.activeTickSubs, sym)
+	// Send wire unsubscribe command
+	return nil
+}
+
+// 3. Subscribe to Order Book Market Depth
+func (p *MyL2Provider) SubscribeDepth(ctx context.Context, symbol string, onDepth func(d datafeed.OrderBookDepth)) error {
+	sym := p.normalizeSymbol(symbol)
+	p.wsMu.Lock()
+	defer p.wsMu.Unlock()
+
+	p.nextSubID++
+	subID := p.nextSubID
+
+	listeners, exists := p.activeDepthSubs[sym]
+	if !exists {
+		listeners = make(map[uint64]func(d datafeed.OrderBookDepth))
+		p.activeDepthSubs[sym] = listeners
+		// Send wire subscription for orderbook depth
 	}
-	if candles[0].Close != 104.0 {
-		t.Errorf("Expected close 104.0, got %f", candles[0].Close)
+	listeners[subID] = onDepth
+	return nil
+}
+
+func (p *MyL2Provider) UnsubscribeDepth(symbol string) error {
+	sym := p.normalizeSymbol(symbol)
+	p.wsMu.Lock()
+	defer p.wsMu.Unlock()
+
+	delete(p.activeDepthSubs, sym)
+	return nil
+}
+
+// 4. Fetch Historical Footprints
+func (p *MyL2Provider) GetFootprintHistory(ctx context.Context, symbol, resolution string, from, to int64, count int) ([]datafeed.FootprintBar, error) {
+	// Query historical footprint bars from REST endpoint or synthesize from historical ticks
+	return []datafeed.FootprintBar{}, nil
+}
+
+// 5. Real-Time Footprint Streaming via DeltaAggregator
+func (p *MyL2Provider) SubscribeFootprint(ctx context.Context, symbol, resolution string, onFootprint func(f datafeed.FootprintBar)) error {
+	sym := p.normalizeSymbol(symbol)
+	key := fmt.Sprintf("%s::%s", sym, resolution)
+
+	p.wsMu.Lock()
+	defer p.wsMu.Unlock()
+
+	p.nextSubID++
+	subID := p.nextSubID
+
+	listeners, exists := p.activeFootprintSubs[key]
+	if !exists {
+		listeners = make(map[uint64]func(f datafeed.FootprintBar))
+		p.activeFootprintSubs[key] = listeners
+
+		// Create a DeltaAggregator if none exists for this symbol/timeframe
+		if _, hasAgg := p.aggregators[key]; !hasAgg {
+			tickSize := 0.25 // Quantization step (e.g. 0.25 for ES/NQ, 0.01 for Crypto)
+			agg := datafeed.NewDeltaAggregator(resolution, tickSize)
+			p.aggregators[key] = agg
+
+			// Hook raw ticks into the DeltaAggregator
+			p.SubscribeTicks(ctx, sym, func(tick datafeed.TickData) {
+				formingBar := agg.AddTick(tick)
+				if formingBar != nil {
+					p.wsMu.Lock()
+					activeListeners := p.activeFootprintSubs[key]
+					p.wsMu.Unlock()
+
+					for _, cb := range activeListeners {
+						cb(*formingBar)
+					}
+				}
+			})
+		}
 	}
+	listeners[subID] = onFootprint
+	return nil
+}
+
+func (p *MyL2Provider) UnsubscribeFootprint(symbol, resolution string) error {
+	sym := p.normalizeSymbol(symbol)
+	key := fmt.Sprintf("%s::%s", sym, resolution)
+
+	p.wsMu.Lock()
+	defer p.wsMu.Unlock()
+
+	delete(p.activeFootprintSubs, key)
+	delete(p.aggregators, key)
+	return nil
 }
 ```
 
 ---
 
-### Step 3: Register in Server (`internal/server/server.go`)
+## 6. Server & StreamHub Registration
+
+Once your provider is implemented:
+
+### 6.1 Register in `internal/server/server.go`
 
 Open [`internal/server/server.go`](internal/server/server.go):
 
-1. **Register in `NewServer()`**:
+1. **Register Provider with the Coordinator:**
 ```go
 func NewServer(s *storage.Storage) *Server {
     coord := datafeed.NewCoordinator()
     coord.RegisterProvider(providers.NewBinanceProvider())
-    coord.RegisterProvider(providers.NewBybitProvider())
-    coord.RegisterProvider(providers.NewCoinbaseProvider())
-    coord.RegisterProvider(providers.NewMyExchangeProvider()) // <-- REGISTER NEW PROVIDER
-    coord.RegisterAlias("MYEX", "MYEXCHANGE")                 // Optional alias
-    coord.RegisterProvider(providers.NewOandaProvider())
-    ...
+    coord.RegisterProvider(providers.NewMyL2Provider()) // <-- REGISTER HERE
+    coord.RegisterAlias("MYEX", "MYL2")                 // Optional alias
 ```
 
-2. **Update Provider Status in `handleProvidersStatus()`**:
+2. **Configure Provider Status API (`handleProvidersStatus`):**
 ```go
-    case "MYEXCHANGE":
-        info["name"] = "MyExchange Pro Market Data"
-        info["type"] = "crypto"
-        info["latencyMs"] = 38
+    case "MYL2":
+        info["name"] = "MyExchange Level 2 Market Engine"
+        info["type"] = "crypto_l2"
+        info["latencyMs"] = 15
+        info["dataTier"] = "L2" // <-- Explicitly mark L2
+        provList = append(provList, info)
 ```
 
-3. **Update UI Sorting Order**:
+### 6.2 Automatic StreamHub Routing (`internal/server/hub.go`)
+
+OrderCraft's WebSocket `StreamHub` automatically detects `L2DataProvider` instances when a client subscribes to a topic. You do not need to write custom multiplexing logic:
+
 ```go
-    order := map[string]int{
-        "BINANCE": 1,
-        "BYBIT": 2,
-        "COINBASE": 3,
-        "MYEXCHANGE": 4, // <-- DEFINE DESIRED DISPLAY ORDER
-        "OANDA": 5,
-    }
+// hub.go: When a client subscribes, StreamHub detects L2 capability:
+if l2p, ok := provider.(datafeed.L2DataProvider); ok {
+    go func() {
+        _ = l2p.SubscribeFootprint(context.Background(), cleanSym, resCapture, func(fp datafeed.FootprintBar) {
+            h.BroadcastFootprint(symCapture, resCapture, fp)
+        })
+    }()
+}
 ```
 
-4. **Update `availableIntegrations`**:
-If `MYEXCHANGE` was previously listed in `availableIntegrations`, remove it from that slice since it is now registered under active connected feeds.
+The server broadcasts live footprint bars under the WS message type `"footprint"`.
 
 ---
 
-### Step 4: Update Server Integration Test (`internal/server/providers_test.go`)
+## 7. Frontend Integration Checklist
 
-Open [`internal/server/providers_test.go`](internal/server/providers_test.go) and update assertions:
-```go
-if resp.Count < 6 { // Increment expected provider count
-    t.Fatalf("Expected at least 6 providers, got %d", resp.Count)
-}
+To enable full UI support (toolbar intervals, symbol search routing, and unlocking Footprint mode in the chart selector):
 
-foundMyEx := false
-for _, p := range resp.Providers {
-    if p["id"] == "MYEXCHANGE" {
-        foundMyEx = true
-        break
-    }
-}
-if !foundMyEx {
-    t.Errorf("MYEXCHANGE not found in providers status response")
-}
-```
-
----
-
-### Step 5: Register Frontend Timeframes (`frontend/src/utils/timeframeSupport.ts`)
+### 7.1 Register Timeframe Support (`frontend/src/utils/timeframeSupport.ts`)
 
 Open [`frontend/src/utils/timeframeSupport.ts`](frontend/src/utils/timeframeSupport.ts):
 
-1. **Add to `PROVIDER_SUPPORTED_TIMEFRAMES`**:
 ```ts
 export const PROVIDER_SUPPORTED_TIMEFRAMES: Record<string, string[]> = {
   ...
-  MYEXCHANGE: [
-    '1m', '5m', '15m',
-    '1h', '4h',
-    '1D', '1d',
+  MYL2: [
+    '1s', '5s', '15s', '30s',
+    '1m', '5m', '15m', '30m',
+    '1h', '4h', '1D', '1d',
   ],
 };
-```
 
-2. **Update Symbol Parsing (`getProviderFromSymbol`)**:
-```ts
-if (prefix === 'MYEXCHANGE' || prefix === 'MYEX') {
-  return 'MYEXCHANGE';
+export function getProviderFromSymbol(symbol: string): string {
+  ...
+  if (prefix === 'MYL2' || prefix === 'MYEX') {
+    return 'MYL2';
+  }
 }
 ```
 
-3. **Update Display Name (`getProviderDisplayName`)**:
+### 7.2 Unlock Footprint & Orderflow (`frontend/src/utils/chartTypeSupport.ts`)
+
+Open [`frontend/src/utils/chartTypeSupport.ts`](frontend/src/utils/chartTypeSupport.ts) and add your provider identifier to `L2_CAPABLE_PROVIDERS`:
+
 ```ts
-case 'MYEXCHANGE':
-case 'MYEX':
-  return 'MyExchange';
+const L2_CAPABLE_PROVIDERS = new Set<string>([
+  'DATABRIDGE',
+  'BRIDGE',
+  'L2FEED',
+  'MYL2', // <-- UNLOCKS FOOTPRINT CHART & ORDERFLOW PANEL
+]);
 ```
 
----
+> [!IMPORTANT]
+> If a provider is not registered in `L2_CAPABLE_PROVIDERS`, the chart type dropdown will gracefully disable the **Footprint** chart option, and the Orderflow sidebar panel will display an informational banner: *"OrderFlow Features not Supported for this provider"*. Adding your provider here unlocks all Footprint, Delta, and Volume Profile features.
 
-### Step 6: Update Sidebar Panel (`frontend/src/components/RightSidebar/panels/ProvidersPanel.tsx`)
+### 7.3 Update UI Providers Panel (`frontend/src/components/RightSidebar/panels/ProvidersPanel.tsx`)
 
-Open [`frontend/src/components/RightSidebar/panels/ProvidersPanel.tsx`](frontend/src/components/RightSidebar/panels/ProvidersPanel.tsx):
+Add your provider definition with the `dataTier: 'L2'` tag:
 
-1. **Add initial state entry in `providers` array**:
 ```ts
 {
-  id: 'MYEXCHANGE',
-  name: 'MyExchange Pro Market Data',
+  id: 'MYL2',
+  name: 'MyExchange Level 2 Market Engine',
   status: 'connected',
-  type: 'crypto',
-  latencyMs: 38,
-  supportedIntervals: ['1m', '5m', '15m', '1h', '4h', '1d'],
+  type: 'crypto_l2',
+  dataTier: 'L2',
+  latencyMs: 15,
+  supportedIntervals: ['1s', '1m', '5m', '15m', '1h', '4h', '1d'],
 },
 ```
 
-2. **Remove `MYEXCHANGE` from initial `integrations` array** (if present).
-
 ---
 
-## 3. Real-World Reference Implementations
+## 8. Verification & Testing
 
-Inspect these production implementations in the repository to understand different provider patterns:
+### 8.1 Backend Unit & Integration Tests
 
-- **Crypto REST & WebSocket:** [`internal/datafeed/providers/coinbase.go`](internal/datafeed/providers/coinbase.go) and [`internal/datafeed/providers/bybit.go`](internal/datafeed/providers/bybit.go)
-- **High-Frequency Aggregation:** [`internal/datafeed/providers/binance.go`](internal/datafeed/providers/binance.go)
-- **Forex / CFD REST & Stream:** [`internal/datafeed/providers/oanda.go`](internal/datafeed/providers/oanda.go)
-- **US Equities & Crypto Broker:** [`internal/datafeed/providers/alpaca.go`](internal/datafeed/providers/alpaca.go)
+Create `internal/datafeed/providers/<name>_test.go`:
 
----
+```go
+package providers
 
-## 4. Verification & Testing
+import (
+	"context"
+	"testing"
+	"github.com/ordercraft-hq/terminal/internal/datafeed"
+)
 
-Run the test suite to verify your new provider meets Ordercraft's quality bar:
+func TestMyL2Provider_Contract(t *testing.T) {
+	p := NewMyL2Provider()
+	if p.Name() != "MYL2" {
+		t.Fatalf("Expected MYL2, got %s", p.Name())
+	}
+	if p.GetDataTier() != datafeed.DataTierL2 {
+		t.Fatalf("Expected DataTierL2, got %v", p.GetDataTier())
+	}
+}
 
-### 1. Run Backend Unit & Integration Tests
+func TestMyL2Provider_DeltaAggregator(t *testing.T) {
+	agg := datafeed.NewDeltaAggregator("1m", 0.25)
+	bar := agg.AddTick(datafeed.TickData{
+		Time:   1700000000,
+		Price:  100.25,
+		Volume: 10,
+		Side:   datafeed.TickSideBuy,
+	})
+	if bar == nil {
+		t.Fatalf("Expected forming bar output from tick")
+	}
+	if bar.TotalAsk != 10 {
+		t.Errorf("Expected TotalAsk 10, got %f", bar.TotalAsk)
+	}
+}
+```
+
+Run test suite:
 ```bash
 go test -v ./internal/server ./internal/datafeed/providers ./internal/datafeed
 ```
-*Expected: 100% PASS with zero race conditions.*
 
-### 2. Compile the Go Executable
-```bash
-go build -o ordercraft.exe main.go
-```
+### 8.2 Frontend Typecheck & Build
 
-### 3. Build & Typecheck Frontend
 ```bash
 cd frontend && npm run build
 ```
-*Expected: `✓ built` with 0 TypeScript/lint errors.*
+*Expected: `✓ built in X.XXs` with 0 TypeScript errors.*
 
-### 4. Run & Test Live
-Launch Ordercraft and verify:
-1. The radio tower icon in the right dock rail increments its badge count.
-2. Clicking the icon opens **Data Providers & Feeds** showing your provider with green **Connected** status and its exact timeframes.
-3. Open symbol search (`Ctrl+K`), search `MYEXCHANGE:BTC-USD`, and press Enter.
-4. Candlesticks load and render cleanly on the chart.
-5. Incompatible timeframes (e.g. 1s or 30s) are gracefully disabled/greyed out on the toolbar.
+### 8.3 Live Visual Verification
+
+1. Launch OrderCraft: `go run main.go -port 8080`.
+2. Open `http://localhost:8080`.
+3. Open **Data Providers & Feeds** in the right sidebar — confirm your provider displays the purple **L2 Level 2** badge with green **Connected** status.
+4. Press `Ctrl+K`, search `MYL2:BTC-USD`, and press Enter.
+5. In the top toolbar chart type selector, select **Footprint**.
+6. Verify footprint cluster candles render bid/ask volumes, POC bars, and Value Area shading at 60–144fps.
+7. Open the **Orderflow & Footprint** panel on the right dock rail — verify Imbalances, Stats, and Volume Profile toggles operate smoothly.
 
 ---
 
-## Important Invariants to Follow
+## 9. Important Invariants & Performance Rules
 
-1. **Strict Chronological Order (`time ASC`):** Candlestick charts require candles sorted strictly **oldest-first**. If an API returns newest-first (like Coinbase or Bybit), reverse the slice before returning.
-2. **Unix Seconds:** The `Time` field in `datafeed.Candle` MUST always be in **seconds UTC** (not milliseconds).
-3. **No Goroutine Leaks:** In `Subscribe()`, store the `context.CancelFunc` in a thread-safe map. In `Unsubscribe()`, call `cancel()` and cleanly close all connections.
-4. **Original Implementation Standards:** Author all code from first principles using standard Go libraries (`net/http`, `nhooyr.io/websocket`). Never include proprietary binaries or restricted SDKs.
+1. **Strict Chronological Ordering (`time ASC`):** All candle slices and footprint bar histories MUST be sorted oldest-first.
+2. **Unix Seconds UTC:** The `Time` property in `datafeed.Candle`, `datafeed.TickData`, and `datafeed.FootprintBar` MUST be in **seconds UTC** (not milliseconds).
+3. **Quantized Price Tiers:** In `FootprintPriceLevel`, prices must be quantized to consistent tick boundaries using `math.Round(price / tickSize) * tickSize` to prevent sub-penny level fragmentation.
+4. **No Goroutine or Channel Leaks:** Every `Subscribe` and `SubscribeTicks` must accept a `context.Context` and provide idempotent `Unsubscribe` cleanup.
+5. **Level-of-Detail (LOD) & GPU Rendering Safety:** All footprint rendering in OrderCraft uses adaptive LOD (`cellH >= 14 && clusterW >= 36` for text rasterization). Do not attempt to force canvas text rendering when cell heights are too small for glyph display.
+6. **Zero Proprietary Code:** Implement all adapters from first principles using standard open-source Go libraries (`net/http`, `nhooyr.io/websocket`). Never include proprietary third-party binaries or obfuscated client packages.

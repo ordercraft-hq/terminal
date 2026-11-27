@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Radio,
   CheckCircle2,
@@ -13,44 +13,27 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { registerProviderTimeframes } from '../../../utils/timeframeSupport';
-
-interface ProviderInfo {
-  id: string;
-  name: string;
-  status: string;
-  type: string;
-  latencyMs?: number;
-  supportedIntervals?: string[];
-  docUrl?: string;
-  accountId?: string;
-  maskedApiKey?: string;
-  hasKey?: boolean;
-  hasSecret?: boolean;
-  savedSecret?: string;
-}
-
-interface IntegrationInfo {
-  id: string;
-  name: string;
-  category: string;
-  authType: string;
-  status: string;
-  docUrl?: string;
-  accountId?: string;
-  maskedApiKey?: string;
-  hasKey?: boolean;
-  hasSecret?: boolean;
-  savedSecret?: string;
-}
+import { transport, type ProviderInfo, type IntegrationInfo } from '../../../transport/client';
+import { getSharedProvidersStatus } from '../providerStatusCache';
 
 export const ProvidersPanel: React.FC = () => {
-  // Only public zero-config crypto feeds are connected out-of-the-box
+  // Public feeds and local institutional bridge feeds
   const [providers, setProviders] = useState<ProviderInfo[]>([
+    {
+      id: 'DATABRIDGE',
+      name: 'DataBridge (Level 2 Bridge)',
+      status: 'connected',
+      type: 'l2_bridge',
+      dataTier: 'L2',
+      latencyMs: 1,
+      supportedIntervals: ['1s', '1m', '2m', '3m', '5m', '15m', '30m', '1h', '4h', '1d'],
+    },
     {
       id: 'BINANCE',
       name: 'Binance Public Spot & Futures',
       status: 'connected',
       type: 'crypto',
+      dataTier: 'L1',
       latencyMs: 32,
       supportedIntervals: ['1s', '1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M'],
     },
@@ -59,6 +42,7 @@ export const ProvidersPanel: React.FC = () => {
       name: 'Bybit v5 Public & Derivatives',
       status: 'connected',
       type: 'crypto',
+      dataTier: 'L1',
       latencyMs: 42,
       supportedIntervals: ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d', '1w', '1M'],
     },
@@ -67,6 +51,7 @@ export const ProvidersPanel: React.FC = () => {
       name: 'Coinbase Advanced (Spot & Perpetuals)',
       status: 'connected',
       type: 'crypto',
+      dataTier: 'L1',
       latencyMs: 48,
       supportedIntervals: ['1m', '5m', '15m', '1h', '6h', '1d'],
     },
@@ -142,32 +127,38 @@ export const ProvidersPanel: React.FC = () => {
     setIsSaving(false);
   };
 
-  // Fetch real-time provider definitions & status from backend
-  const fetchProviders = async () => {
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  // Fetch real-time provider definitions & status from backend (shared cache on initial load)
+  const fetchProviders = useCallback(async (forceRefresh = false, signal?: AbortSignal) => {
     try {
-      const resp = await fetch('/api/providers/status');
-      if (resp.ok) {
-        const data = await resp.json();
-        if (data.providers && Array.isArray(data.providers)) {
-          setProviders(data.providers);
-          for (const p of data.providers) {
-            if (p.id && Array.isArray(p.supportedIntervals)) {
-              registerProviderTimeframes(p.id, p.supportedIntervals);
-            }
+      const data = await getSharedProvidersStatus(forceRefresh, signal);
+      if (signal?.aborted) return;
+      if (data.providers && Array.isArray(data.providers)) {
+        setProviders(data.providers);
+        for (const p of data.providers) {
+          if (p.id && Array.isArray(p.supportedIntervals)) {
+            registerProviderTimeframes(p.id, p.supportedIntervals);
           }
         }
-        if (data.availableIntegrations && Array.isArray(data.availableIntegrations)) {
-          setIntegrations(data.availableIntegrations);
-        }
+      }
+      if (data.availableIntegrations && Array.isArray(data.availableIntegrations)) {
+        setIntegrations(data.availableIntegrations);
       }
     } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') return;
       console.warn('Failed to fetch providers status:', err);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    fetchProviders();
-  }, []);
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    fetchProviders(false, controller.signal);
+    return () => {
+      controller.abort();
+    };
+  }, [fetchProviders]);
 
   const handleSaveCredential = async () => {
     if (!selectedIntegration) return;
@@ -187,22 +178,14 @@ export const ProvidersPanel: React.FC = () => {
     setSaveError(null);
 
     try {
-      const resp = await fetch('/api/providers/configure', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          provider: selectedIntegration.id,
-          accountId: accountId.trim(),
-          apiKey: apiKey.trim(),
-          apiSecret: apiSecret.trim(),
-        }),
+      await transport.configureProvider({
+        provider: selectedIntegration.id,
+        accountId: accountId.trim(),
+        apiKey: apiKey.trim(),
+        apiSecret: apiSecret.trim(),
       });
 
-      if (!resp.ok) {
-        throw new Error(`Failed to save: ${resp.statusText}`);
-      }
-
-      await fetchProviders();
+      await fetchProviders(true, abortControllerRef.current?.signal);
       closeConfigure();
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Failed to save configuration';
@@ -214,10 +197,8 @@ export const ProvidersPanel: React.FC = () => {
 
   const handleDisconnect = async (providerId: string) => {
     try {
-      await fetch(`/api/providers/configure?provider=${providerId}`, {
-        method: 'DELETE',
-      });
-      await fetchProviders();
+      await transport.disconnectProvider(providerId);
+      await fetchProviders(true, abortControllerRef.current?.signal);
     } catch (err) {
       console.error('Failed to disconnect provider:', err);
     }
@@ -227,28 +208,28 @@ export const ProvidersPanel: React.FC = () => {
     setTestingPing(true);
     const start = performance.now();
     try {
-      const resp = await fetch('/api/providers/status');
-      if (resp.ok) {
-        const data = await resp.json();
-        const duration = Math.round(performance.now() - start);
-        if (data.providers) {
-          setProviders(
-            data.providers.map((p: ProviderInfo) => ({
-              ...p,
-              latencyMs: Math.max(1, duration - Math.floor(Math.random() * 15)),
-            }))
-          );
-          for (const p of data.providers) {
-            if (p.id && Array.isArray(p.supportedIntervals)) {
-              registerProviderTimeframes(p.id, p.supportedIntervals);
-            }
+      const data = await getSharedProvidersStatus(true, abortControllerRef.current?.signal);
+      if (abortControllerRef.current?.signal.aborted) return;
+      const duration = Math.round(performance.now() - start);
+      if (data.providers) {
+        setProviders(
+          data.providers.map((p: ProviderInfo) => ({
+            ...p,
+            latencyMs: Math.max(1, duration),
+          }))
+        );
+        for (const p of data.providers) {
+          if (p.id && Array.isArray(p.supportedIntervals)) {
+            registerProviderTimeframes(p.id, p.supportedIntervals);
           }
         }
       }
     } catch {
       // Keep existing data
     } finally {
-      setTestingPing(false);
+      if (!abortControllerRef.current?.signal.aborted) {
+        setTestingPing(false);
+      }
     }
   };
 
@@ -307,6 +288,22 @@ export const ProvidersPanel: React.FC = () => {
                     </div>
 
                     <div className="flex items-center space-x-1.5">
+                      {p.dataTier === 'L2' || p.id === 'DATABRIDGE' ? (
+                        <span
+                          className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-[#7b2cbf]/25 text-[#d8b4fe] border border-[#7b2cbf]/50 flex items-center space-x-1"
+                          title="Institutional Level 2 market data (Order book depth, aggressive tick tape, footprint)"
+                        >
+                          <span className="w-1.5 h-1.5 rounded-full bg-[#c084fc] animate-pulse" />
+                          <span>L2 Level 2</span>
+                        </span>
+                      ) : (
+                        <span
+                          className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-[#1e222d] text-[#9ca3af] border border-[#2a2e39]"
+                          title="Standard Level 1 top-of-book and bar data"
+                        >
+                          L1 Data
+                        </span>
+                      )}
                       {p.latencyMs !== undefined && (
                         <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-[#131722] text-[#089981] border border-[#2a2e39]">
                           {p.latencyMs} ms

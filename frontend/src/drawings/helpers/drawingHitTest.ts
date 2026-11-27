@@ -1,4 +1,4 @@
-import type { IChartApi, ISeriesApi } from 'lightweight-charts';
+import type { IChartApi, ISeriesApi, SeriesType } from 'lightweight-charts';
 import type { Candle } from '../../transport/client';
 import type { LogicalAnchor, UserDrawing } from '../../store/syncStore';
 import { drawingRegistry } from '../registry';
@@ -26,7 +26,7 @@ export interface HitTestOptions {
   visibleDrawings: UserDrawing[];
   selectedDrawingId: string | null;
   chart: IChartApi | null;
-  series: ISeriesApi<'Candlestick'> | null;
+  series: ISeriesApi<SeriesType> | null;
   candles: Candle[];
   plotSize: { width: number; height: number };
   priceDecimals: number;
@@ -93,91 +93,8 @@ export function hitTestDrawing(
       continue;
     }
 
-    // Geometric fallback tests for legacy / unregistered shapes
+    // Geometric fallback tests for unregistered shapes
     const pts = d.anchors.map((a) => anchorToCanvas(a));
-
-    if (
-      (d.type === 'long_position' || d.type === 'short_position') &&
-      pts.length >= 3 &&
-      pts[0] &&
-      pts[1] &&
-      pts[2]
-    ) {
-      const xLeft = Math.min(pts[0].x, pts[1].x);
-      const xRight = Math.max(pts[0].x, pts[1].x);
-      const xMid = (xLeft + xRight) / 2;
-      const yEntry = pts[0].y;
-      const yTarget = pts[1].y;
-      const yStop = pts[2].y;
-
-      // 1. Target handle or entire target line: handleIndex 1
-      if (
-        Math.hypot(px - xMid, py - yTarget) <= 14 ||
-        Math.hypot(px - xRight, py - yTarget) <= 14 ||
-        (px >= xLeft - 6 && px <= xRight + 6 && Math.abs(py - yTarget) <= 10)
-      ) {
-        return { drawingId: d.id, handleIndex: 1 };
-      }
-
-      // 2. Stop handle or entire stop line: handleIndex 2
-      if (
-        Math.hypot(px - xMid, py - yStop) <= 14 ||
-        Math.hypot(px - xRight, py - yStop) <= 14 ||
-        (px >= xLeft - 6 && px <= xRight + 6 && Math.abs(py - yStop) <= 10)
-      ) {
-        return { drawingId: d.id, handleIndex: 2 };
-      }
-
-      // 3. Width handle or right edge: handleIndex 3
-      const yMin = Math.min(yTarget, yStop, yEntry);
-      const yMax = Math.max(yTarget, yStop, yEntry);
-      if (
-        Math.hypot(px - xRight, py - yEntry) <= 14 ||
-        (Math.abs(px - xRight) <= 8 && py >= yMin - 6 && py <= yMax + 6)
-      ) {
-        return { drawingId: d.id, handleIndex: 3 };
-      }
-
-      // 4. Entry handle or entry line: handleIndex 0
-      if (
-        Math.hypot(px - xLeft, py - yEntry) <= 14 ||
-        Math.hypot(px - xMid, py - yEntry) <= 14 ||
-        (px >= xLeft - 6 && px <= xRight + 6 && Math.abs(py - yEntry) <= 8)
-      ) {
-        return { drawingId: d.id, handleIndex: 0 };
-      }
-
-      // 5. Body move: handleIndex -1
-      if (px >= xLeft - 6 && px <= xRight + 6 && py >= yMin - 6 && py <= yMax + 6) {
-        return { drawingId: d.id, handleIndex: -1 };
-      }
-      continue;
-    }
-
-    // For rectangle, test all 8 handles
-    if (d.type === 'rectangle' && pts.length >= 2 && pts[0] && pts[1]) {
-      const xMin = Math.min(pts[0].x, pts[1].x);
-      const xMax = Math.max(pts[0].x, pts[1].x);
-      const yMin = Math.min(pts[0].y, pts[1].y);
-      const yMax = Math.max(pts[0].y, pts[1].y);
-      const xMid = (xMin + xMax) / 2;
-      const yMid = (yMin + yMax) / 2;
-      const handles = [
-        { x: xMin, y: yMin, idx: 0 },
-        { x: xMax, y: yMin, idx: 1 },
-        { x: xMax, y: yMax, idx: 2 },
-        { x: xMin, y: yMax, idx: 3 },
-        { x: xMid, y: yMin, idx: 4 },
-        { x: xMax, y: yMid, idx: 5 },
-        { x: xMid, y: yMax, idx: 6 },
-        { x: xMin, y: yMid, idx: 7 },
-      ];
-      for (const h of handles) {
-        if (Math.hypot(px - h.x, py - h.y) <= 12) {
-          return { drawingId: d.id, handleIndex: h.idx };
-        }
-      }
-    }
 
     // Test anchor handles first (radius <= 12px)
     for (let h = 0; h < pts.length; h++) {
@@ -187,17 +104,8 @@ export function hitTestDrawing(
     }
 
     // Test geometry for selection / whole drawing move
-    if (d.type === 'horizontal_line' && pts[0]) {
-      if (Math.abs(py - pts[0].y) <= 8) return { drawingId: d.id, handleIndex: -1 };
-    } else if (d.type === 'horizontal_ray' && pts[0]) {
-      if (px >= pts[0].x - 6 && Math.abs(py - pts[0].y) <= 8) return { drawingId: d.id, handleIndex: -1 };
-    } else if (d.type === 'vertical_line' && pts[0]) {
-      if (Math.abs(px - pts[0].x) <= 8) return { drawingId: d.id, handleIndex: -1 };
-    } else if (d.type === 'cross_line' && pts[0]) {
-      if (Math.abs(px - pts[0].x) <= 8 || Math.abs(py - pts[0].y) <= 8) return { drawingId: d.id, handleIndex: -1 };
-    } else if (
-      (d.type === 'rectangle' ||
-        d.type === 'price_range' ||
+    if (
+      (d.type === 'price_range' ||
         d.type === 'date_range' ||
         d.type === 'date_price_range') &&
       pts.length >= 2 &&
@@ -217,40 +125,13 @@ export function hitTestDrawing(
       if (Math.abs(dist - r) <= 8 || dist <= r) {
         return { drawingId: d.id, handleIndex: -1 };
       }
-    } else if (d.type === 'parallel_channel' && pts.length >= 3 && pts[0] && pts[1] && pts[2]) {
-      const x1 = pts[0].x,
-        y1 = pts[0].y;
-      const x2 = pts[1].x,
-        y2 = pts[1].y;
-      const dx = x2 - x1,
-        dy = y2 - y1;
-      const lenSq = dx * dx + dy * dy;
-      if (lenSq > 0) {
-        const x3 = pts[2].x,
-          y3 = pts[2].y;
-        const t = ((x3 - x1) * dx + (y3 - y1) * dy) / lenSq;
-        const ox = x3 - (x1 + t * dx);
-        const oy = y3 - (y1 + t * dy);
-        if (
-          distToSegment(px, py, x1, y1, x2, y2) <= 8 ||
-          distToSegment(px, py, x1 + ox, y1 + oy, x2 + ox, y2 + oy) <= 8 ||
-          distToSegment(px, py, x1 + ox / 2, y1 + oy / 2, x2 + ox / 2, y2 + oy / 2) <= 8
-        ) {
+    } else if (pts.length >= 2) {
+      for (let seg = 0; seg < pts.length - 1; seg++) {
+        const a = pts[seg];
+        const b = pts[seg + 1];
+        if (a && b && distToSegment(px, py, a.x, a.y, b.x, b.y) <= 8) {
           return { drawingId: d.id, handleIndex: -1 };
         }
-      }
-    } else if ((d.type === 'fib_retracement' || d.type === 'fib_extension') && pts.length >= 2 && pts[0] && pts[1]) {
-      const xMin = Math.min(pts[0].x, pts[1].x);
-      const xMax = Math.max(pts[0].x, pts[1].x) + 300;
-      const validPts = pts.filter(Boolean);
-      const yMin = Math.min(...validPts.map((p) => p!.y)) - 50;
-      const yMax = Math.max(...validPts.map((p) => p!.y)) + 50;
-      if (px >= xMin - 8 && px <= xMax && py >= yMin && py <= yMax) {
-        return { drawingId: d.id, handleIndex: -1 };
-      }
-    } else if (pts.length >= 2 && pts[0] && pts[1]) {
-      if (distToSegment(px, py, pts[0].x, pts[0].y, pts[1].x, pts[1].y) <= 8) {
-        return { drawingId: d.id, handleIndex: -1 };
       }
     }
   }

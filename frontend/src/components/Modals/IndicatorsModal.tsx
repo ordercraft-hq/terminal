@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { useSyncStore } from '../../store/syncStore';
 import {
   getAllIndicators,
@@ -39,20 +40,30 @@ type TabType =
   | 'active';
 
 const ITEM_HEIGHT = 64;
+const EMPTY_INDICATORS: never[] = [];
 
 export const IndicatorsModal: React.FC<IndicatorsModalProps> = ({ isOpen, onClose }) => {
   const activePaneId = useSyncStore((s) => s.activePaneId);
-  const panes = useSyncStore((s) => s.panes);
-  const activePane = panes[activePaneId] || Object.values(panes)[0];
-  const indicatorsMap = useSyncStore((s) => s.indicators);
-  const activeIndicators = indicatorsMap[activePaneId] || [];
+  const activePane = useSyncStore((s) => s.panes[s.activePaneId] || Object.values(s.panes)[0]);
+  const activeIndicators = useSyncStore((s) => s.indicators[s.activePaneId] || EMPTY_INDICATORS);
 
-  const favoriteIndicators = useSyncStore((s) => s.favoriteIndicators);
-  const toggleFavoriteIndicator = useSyncStore((s) => s.toggleFavoriteIndicator);
-  const addIndicatorToPane = useSyncStore((s) => s.addIndicatorToPane);
-  const removeIndicatorFromPane = useSyncStore((s) => s.removeIndicatorFromPane);
-  const toggleIndicatorVisibility = useSyncStore((s) => s.toggleIndicatorVisibility);
-  const openIndicatorSettings = useSyncStore((s) => s.openIndicatorSettings);
+  const {
+    favoriteIndicators,
+    toggleFavoriteIndicator,
+    addIndicatorToPane,
+    removeIndicatorFromPane,
+    toggleIndicatorVisibility,
+    openIndicatorSettings,
+  } = useSyncStore(
+    useShallow((s) => ({
+      favoriteIndicators: s.favoriteIndicators,
+      toggleFavoriteIndicator: s.toggleFavoriteIndicator,
+      addIndicatorToPane: s.addIndicatorToPane,
+      removeIndicatorFromPane: s.removeIndicatorFromPane,
+      toggleIndicatorVisibility: s.toggleIndicatorVisibility,
+      openIndicatorSettings: s.openIndicatorSettings,
+    }))
+  );
 
   const [catalogVersion, setCatalogVersion] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
@@ -62,14 +73,33 @@ export const IndicatorsModal: React.FC<IndicatorsModalProps> = ({ isOpen, onClos
 
   const searchInputRef = useRef<HTMLInputElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const focusTimerRef = useRef<number | null>(null);
+  const addedTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (focusTimerRef.current !== null) window.clearTimeout(focusTimerRef.current);
+      if (addedTimerRef.current !== null) window.clearTimeout(addedTimerRef.current);
+    };
+  }, []);
 
   // Fetch catalog on modal open and subscribe to updates
   useEffect(() => {
     if (isOpen) {
       fetchCatalog();
       const unsub = subscribeCatalog(() => setCatalogVersion((v) => v + 1));
-      setTimeout(() => searchInputRef.current?.focus(), 50);
-      return unsub;
+      if (focusTimerRef.current !== null) window.clearTimeout(focusTimerRef.current);
+      focusTimerRef.current = window.setTimeout(() => {
+        searchInputRef.current?.focus();
+        focusTimerRef.current = null;
+      }, 50);
+      return () => {
+        unsub();
+        if (focusTimerRef.current !== null) {
+          window.clearTimeout(focusTimerRef.current);
+          focusTimerRef.current = null;
+        }
+      };
     } else {
       setSearchQuery('');
       setScrollTop(0);
@@ -167,8 +197,10 @@ export const IndicatorsModal: React.FC<IndicatorsModalProps> = ({ isOpen, onClos
   const handleAddIndicator = (def: IndicatorDefinition) => {
     addIndicatorToPane(activePaneId, def.id as IndicatorType);
     setRecentlyAddedId(def.id);
-    setTimeout(() => {
+    if (addedTimerRef.current !== null) window.clearTimeout(addedTimerRef.current);
+    addedTimerRef.current = window.setTimeout(() => {
       setRecentlyAddedId(null);
+      addedTimerRef.current = null;
     }, 1200);
   };
 
@@ -547,7 +579,7 @@ export const IndicatorsModal: React.FC<IndicatorsModalProps> = ({ isOpen, onClos
 
         {/* Footer */}
         <div className="flex items-center justify-between px-5 py-3 border-t border-[#2a2e39] bg-[#171a22] text-xs text-[#787b86]">
-          <span>Wickra Indicator Suite (500+ Streaming Indicators)</span>
+          <span>OrderCraft Indicator Suite (500+ Streaming Indicators)</span>
           <button
             onClick={onClose}
             className="px-4 py-1.5 rounded-lg bg-[#2a2e39] text-white hover:bg-[#363a45] transition-colors font-medium"

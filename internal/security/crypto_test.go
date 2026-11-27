@@ -144,3 +144,20 @@ func TestResolveMasterKey_EnvVar(t *testing.T) {
 	}
 }
 
+func TestResolveMasterKey_RejectsPlaceholderAndEmptyKeyfile(t *testing.T) {
+	t.Setenv("ORDERCRAFT_ENCRYPTION_KEY", "your_32_byte_hex_key_here")
+	if _, err := ResolveMasterKey(":memory:"); err == nil {
+		t.Fatalf("Expected ResolveMasterKey to reject placeholder key from env")
+	}
+
+	t.Setenv("ORDERCRAFT_ENCRYPTION_KEY", "")
+	tmpDir := t.TempDir()
+	emptyKeyPath := filepath.Join(tmpDir, ".ordercraft.key")
+	if err := os.WriteFile(emptyKeyPath, []byte("   \n"), 0600); err != nil {
+		t.Fatalf("Failed to create empty key file: %v", err)
+	}
+	if _, err := ResolveMasterKey(emptyKeyPath); err == nil {
+		t.Fatalf("Expected ResolveMasterKey to reject empty key file")
+	}
+}
+

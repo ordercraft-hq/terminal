@@ -15,6 +15,7 @@ type Coordinator struct {
 	mu        sync.RWMutex
 	providers map[string]DataProvider
 	cache     *CandleCache
+	flight    SingleFlight[[]Candle]
 }
 
 // NewCoordinator creates a new empty Coordinator with high-speed in-memory caching.
@@ -158,6 +159,13 @@ func (c *Coordinator) GetCandles(
 	from, to int64,
 	count int,
 ) ([]Candle, error) {
+	if count <= 0 {
+		count = 200
+	}
+	if count > 5000 {
+		count = 5000
+	}
+
 	// Build cache key and check in-memory cache for instant return
 	cacheKey := fmt.Sprintf("%s:%s:%d:%d:%d", fullSymbol, resolution, from, to, count)
 	if c.cache != nil {
@@ -166,112 +174,126 @@ func (c *Coordinator) GetCandles(
 		}
 	}
 
-	provider, sym, err := c.ResolveProvider(fullSymbol)
-	if err != nil {
-		return nil, err
-	}
-
-	if count <= 0 {
-		count = 200
-	}
-	if count > 5000 {
-		count = 5000
-	}
-
-	targetStepSec := ResolutionToSeconds(resolution)
-
-	// Check if resolution requires custom project-level aggregation
-	needsAggregation := !isNativeResolutionForProvider(provider, resolution)
-
-	fetchResolution := resolution
-	fetchCount := count
-	if needsAggregation {
-		if targetStepSec < 60 && targetStepSec > 1 {
-			// Sub-minute timeframe (e.g. 5s, 15s, 30s): Fetch 1s base candles and aggregate
-			fetchResolution = "1s"
-			ratio := targetStepSec
-			if ratio <= 0 {
-				ratio = 1
-			}
-			fetchCount = count * int(ratio)
-			if fetchCount > 5000 {
-				fetchCount = 5000
-			}
-		} else if targetStepSec >= 60 {
-			// Multi-minute timeframe (e.g. 2m, 45m, 2h): Fetch 1m base candles and aggregate
-			fetchResolution = "1m"
-			ratio := targetStepSec / 60
-			if ratio <= 0 {
-				ratio = 1
-			}
-			fetchCount = count * int(ratio)
-			if fetchCount > 5000 {
-				fetchCount = 5000
+	res, err := c.flight.Do(ctx, cacheKey, func(fetchCtx context.Context) ([]Candle, error) {
+		if c.cache != nil {
+			if cached, ok := c.cache.Get(cacheKey); ok && len(cached) > 0 {
+				return cached, nil
 			}
 		}
-	}
 
-	// Project-level backfill / pagination loop:
-	// If provider returns fewer than requested and caller requested a time window or count,
-	// coordinator can paginate backwards in chunks to collect the required history.
-	var allCandles []Candle
-	currentTo := to
-	remaining := fetchCount
-
-	// Fetch in chunks of up to 1000 candles
-	for remaining > 0 {
-		chunkLimit := remaining
-		if chunkLimit > 1000 {
-			chunkLimit = 1000
-		}
-
-		chunk, err := provider.GetHistory(ctx, sym, fetchResolution, from, currentTo, chunkLimit)
+		provider, sym, err := c.ResolveProvider(fullSymbol)
 		if err != nil {
-			if len(allCandles) > 0 {
-				break // Return what we gathered so far
-			}
 			return nil, err
 		}
 
-		if len(chunk) == 0 {
-			break
+		targetStepSec := ResolutionToSeconds(resolution)
+
+		// Check if resolution requires custom project-level aggregation
+		needsAggregation := !isNativeResolutionForProvider(provider, resolution)
+
+		fetchResolution := resolution
+		fetchCount := count
+		if needsAggregation {
+			if targetStepSec < 60 && targetStepSec > 1 {
+				// Sub-minute timeframe (e.g. 5s, 15s, 30s): Fetch 1s base candles and aggregate
+				fetchResolution = "1s"
+				ratio := targetStepSec
+				if ratio <= 0 {
+					ratio = 1
+				}
+				fetchCount = count * int(ratio)
+				if fetchCount > 5000 {
+					fetchCount = 5000
+				}
+			} else if targetStepSec >= 60 {
+				// Multi-minute timeframe (e.g. 2m, 45m, 2h): Fetch 1m base candles and aggregate
+				fetchResolution = "1m"
+				ratio := targetStepSec / 60
+				if ratio <= 0 {
+					ratio = 1
+				}
+				fetchCount = count * int(ratio)
+				if fetchCount > 5000 {
+					fetchCount = 5000
+				}
+			}
 		}
 
-		allCandles = append(chunk, allCandles...)
-		remaining -= len(chunk)
+		// Project-level backfill / pagination loop:
+		// If provider returns fewer than requested and caller requested a time window or count,
+		// coordinator can paginate backwards in chunks to collect the required history.
+		var allCandles []Candle
+		currentTo := to
+		remaining := fetchCount
 
-		// Move currentTo before the earliest candle in this chunk
-		earliestTime := chunk[0].Time
-		if from > 0 && earliestTime <= from {
-			break // Reached requested start
+		// Fetch in chunks of up to 1000 candles
+		for remaining > 0 {
+			chunkLimit := remaining
+			if chunkLimit > 1000 {
+				chunkLimit = 1000
+			}
+
+			chunk, err := provider.GetHistory(fetchCtx, sym, fetchResolution, from, currentTo, chunkLimit)
+			if err != nil {
+				if len(allCandles) > 0 {
+					break // Return what we gathered so far
+				}
+				return nil, err
+			}
+
+			if len(chunk) == 0 {
+				break
+			}
+
+			allCandles = append(chunk, allCandles...)
+			remaining -= len(chunk)
+
+			// Move currentTo before the earliest candle in this chunk
+			earliestTime := chunk[0].Time
+			if from > 0 && earliestTime <= from {
+				break // Reached requested start
+			}
+			currentTo = earliestTime - 1
+
+			// If the chunk returned fewer than requested chunkLimit, provider has no more older data
+			if len(chunk) < chunkLimit {
+				break
+			}
 		}
-		currentTo = earliestTime - 1
 
-		// If the chunk returned fewer than requested chunkLimit, provider has no more older data
-		if len(chunk) < chunkLimit {
-			break
+		// Deduplicate by timestamp and sort ascending
+		allCandles = deduplicateAndSort(allCandles)
+
+		// Aggregate if needed at project level
+		if needsAggregation {
+			allCandles = AggregateCandles(allCandles, targetStepSec)
 		}
+
+		// If we have more than count, keep the most recent `count` bars
+		if len(allCandles) > count {
+			allCandles = allCandles[len(allCandles)-count:]
+		}
+
+		// Cache successful query result (short TTL for live queries where to <= 0)
+		if c.cache != nil && len(allCandles) > 0 {
+			if to <= 0 {
+				c.cache.SetWithTTL(cacheKey, allCandles, 1500*time.Millisecond)
+			} else {
+				c.cache.Set(cacheKey, allCandles)
+			}
+		}
+
+		return allCandles, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	// Deduplicate by timestamp and sort ascending
-	allCandles = deduplicateAndSort(allCandles)
-
-	// Aggregate if needed at project level
-	if needsAggregation {
-		allCandles = AggregateCandles(allCandles, targetStepSec)
+	if len(res) == 0 {
+		return res, nil
 	}
-
-	// If we have more than count, keep the most recent `count` bars
-	if len(allCandles) > count {
-		allCandles = allCandles[len(allCandles)-count:]
-	}
-
-	// Cache successful query result
-	if c.cache != nil && len(allCandles) > 0 {
-		c.cache.Set(cacheKey, allCandles)
-	}
-
-	return allCandles, nil
+	out := make([]Candle, len(res))
+	copy(out, res)
+	return out, nil
 }
 
 // SearchSymbols queries all registered providers concurrently and merges results.
@@ -287,7 +309,7 @@ func (c *Coordinator) SearchSymbols(ctx context.Context, query string) ([]Symbol
 	}
 	c.mu.RUnlock()
 
-	searchCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	searchCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
 	defer cancel()
 
 	var wg sync.WaitGroup
@@ -351,8 +373,45 @@ func (c *Coordinator) SearchSymbols(ctx context.Context, query string) ([]Symbol
 	return all, nil
 }
 
+// GetFootprint queries historical Footprint candle clusters from an L2-capable provider.
+func (c *Coordinator) GetFootprint(ctx context.Context, fullSymbol, resolution string, from, to int64, count int) ([]FootprintBar, error) {
+	prov, sym, err := c.ResolveProvider(fullSymbol)
+	if err != nil {
+		return nil, err
+	}
+
+	if l2Prov, ok := prov.(L2DataProvider); ok {
+		return l2Prov.GetFootprintHistory(ctx, sym, resolution, from, to, count)
+	}
+
+	return nil, fmt.Errorf("provider %s does not support Level 2 footprint data", prov.Name())
+}
+
+// GetProviderDataTier returns whether the resolved provider for the symbol is L1 or L2.
+func (c *Coordinator) GetProviderDataTier(fullSymbol string) DataTier {
+	prov, _, err := c.ResolveProvider(fullSymbol)
+	if err != nil {
+		return DataTierL1
+	}
+	if l2Prov, ok := prov.(L2DataProvider); ok {
+		return l2Prov.GetDataTier()
+	}
+	return DataTierL1
+}
+
 func deduplicateAndSort(candles []Candle) []Candle {
 	if len(candles) <= 1 {
+		return candles
+	}
+
+	alreadySortedUnique := true
+	for i := 1; i < len(candles); i++ {
+		if candles[i].Time <= candles[i-1].Time {
+			alreadySortedUnique = false
+			break
+		}
+	}
+	if alreadySortedUnique {
 		return candles
 	}
 

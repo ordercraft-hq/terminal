@@ -4,7 +4,7 @@ import { RightSidebarDrawer } from './RightSidebarDrawer';
 
 export const RightSidebar: React.FC = () => {
   return (
-    <div className="flex h-full select-none shrink-0 z-40">
+    <div className="flex h-full select-none shrink-0 z-20">
       <RightSidebarDrawer />
       <RightDockRail />
     </div>

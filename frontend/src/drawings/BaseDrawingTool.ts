@@ -207,6 +207,35 @@ export abstract class BaseDrawingTool<TOptions = Record<string, any>> {
   }
 
   /**
+   * Draws a rounded rectangle path with safe fallback for environments lacking ctx.roundRect.
+   */
+  public static drawRoundedRect(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    r: number
+  ): void {
+    const radius = Math.max(0, Math.min(r, Math.abs(w) / 2, Math.abs(h) / 2));
+    ctx.beginPath();
+    if (typeof ctx.roundRect === 'function') {
+      ctx.roundRect(x, y, w, h, radius);
+    } else {
+      ctx.moveTo(x + radius, y);
+      ctx.lineTo(x + w - radius, y);
+      ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+      ctx.lineTo(x + w, y + h - radius);
+      ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+      ctx.lineTo(x + radius, y + h);
+      ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+      ctx.lineTo(x, y + radius);
+      ctx.quadraticCurveTo(x, y, x + radius, y);
+      ctx.closePath();
+    }
+  }
+
+  /**
    * Draws a stats or price pill badge with rounded corners.
    */
   public static drawPill(
@@ -236,8 +265,7 @@ export abstract class BaseDrawingTool<TOptions = Record<string, any>> {
     ctx.strokeStyle = borderColor;
     ctx.lineWidth = 1;
 
-    ctx.beginPath();
-    ctx.roundRect(rx, ry, width, height, radius);
+    BaseDrawingTool.drawRoundedRect(ctx, rx, ry, width, height, radius);
     ctx.fill();
     ctx.stroke();
 
@@ -305,8 +333,7 @@ export abstract class BaseDrawingTool<TOptions = Record<string, any>> {
     const ry = Math.round(y - height / 2);
 
     ctx.fillStyle = bgColor;
-    ctx.beginPath();
-    ctx.roundRect(rx, ry, width, height, radius);
+    BaseDrawingTool.drawRoundedRect(ctx, rx, ry, width, height, radius);
     ctx.fill();
 
     ctx.fillStyle = textColor;

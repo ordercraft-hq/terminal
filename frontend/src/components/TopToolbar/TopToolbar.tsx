@@ -14,10 +14,12 @@ import {
   Redo2,
   Code,
 } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import { useSyncStore, getTimeframeSeconds } from '../../store/syncStore';
 import { transport } from '../../transport/client';
 import { LayoutSelectorPopover } from './LayoutSelectorPopover';
 import { isTimeframeSupported } from '../../utils/timeframeSupport';
+import { isChartTypeSupported } from '../../utils/chartTypeSupport';
 import { captureChartSnapshot } from '../../utils/snapshot';
 import { BarTypeIcon, BAR_TYPE_CATEGORIES } from './BarTypeIcons';
 import { WorkspaceLayoutMenu } from './WorkspaceLayoutMenu';
@@ -91,7 +93,27 @@ export const TopToolbar: React.FC = () => {
     togglePinChartType,
     isFullscreen,
     setIsFullscreen,
-  } = useSyncStore();
+    saveCurrentLayout,
+  } = useSyncStore(
+    useShallow((s) => ({
+      symbol: s.symbol,
+      timeframe: s.timeframe,
+      setTimeframe: s.setTimeframe,
+      setChartType: s.setChartType,
+      openCommandPalette: s.openCommandPalette,
+      layoutName: s.layoutName,
+      layoutType: s.layoutType,
+      openLayoutModal: s.openLayoutModal,
+      openChartSettings: s.openChartSettings,
+      pinnedTimeframes: s.pinnedTimeframes,
+      togglePinTimeframe: s.togglePinTimeframe,
+      pinnedChartTypes: s.pinnedChartTypes,
+      togglePinChartType: s.togglePinChartType,
+      isFullscreen: s.isFullscreen,
+      setIsFullscreen: s.setIsFullscreen,
+      saveCurrentLayout: s.saveCurrentLayout,
+    }))
+  );
 
   const [isTfDropdownOpen, setIsTfDropdownOpen] = useState(false);
   const [isBarTypeDropdownOpen, setIsBarTypeDropdownOpen] = useState(false);
@@ -105,6 +127,15 @@ export const TopToolbar: React.FC = () => {
   const [snapshotFeedback, setSnapshotFeedback] = useState<string | null>(null);
   const [layoutFeedback, setLayoutFeedback] = useState<string | null>(null);
   const snapshotBtnRef = useRef<HTMLButtonElement | null>(null);
+  const snapshotTimerRef = useRef<number | null>(null);
+  const layoutTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (snapshotTimerRef.current !== null) window.clearTimeout(snapshotTimerRef.current);
+      if (layoutTimerRef.current !== null) window.clearTimeout(layoutTimerRef.current);
+    };
+  }, []);
 
   const currentSymbol = useSyncStore((s) => (s.activePaneId && s.panes[s.activePaneId]?.symbol) || s.symbol);
   const currentTimeframe = useSyncStore((s) => (s.activePaneId && s.panes[s.activePaneId]?.timeframe) || s.timeframe);
@@ -139,34 +170,43 @@ export const TopToolbar: React.FC = () => {
     }
   };
 
+  const showSnapshotToast = useCallback((msg: string) => {
+    setSnapshotFeedback(msg);
+    if (snapshotTimerRef.current !== null) window.clearTimeout(snapshotTimerRef.current);
+    snapshotTimerRef.current = window.setTimeout(() => {
+      setSnapshotFeedback(null);
+      snapshotTimerRef.current = null;
+    }, 2500);
+  }, []);
+
   const handleDownloadSnapshot = useCallback(async () => {
     setIsSnapshotMenuOpen(false);
     const success = await captureChartSnapshot(currentSymbol, currentTimeframe, 'download');
     if (success) {
-      setSnapshotFeedback('Image downloaded!');
-      setTimeout(() => setSnapshotFeedback(null), 2500);
+      showSnapshotToast('Image downloaded!');
     }
-  }, [currentSymbol, currentTimeframe]);
+  }, [currentSymbol, currentTimeframe, showSnapshotToast]);
 
   const handleCopySnapshot = useCallback(async () => {
     setIsSnapshotMenuOpen(false);
     const success = await captureChartSnapshot(currentSymbol, currentTimeframe, 'copy');
     if (success) {
-      setSnapshotFeedback('Image copied to clipboard!');
-      setTimeout(() => setSnapshotFeedback(null), 2500);
+      showSnapshotToast('Image copied to clipboard!');
     } else {
-      setSnapshotFeedback('Failed to copy');
-      setTimeout(() => setSnapshotFeedback(null), 2500);
+      showSnapshotToast('Failed to copy');
     }
-  }, [currentSymbol, currentTimeframe]);
+  }, [currentSymbol, currentTimeframe, showSnapshotToast]);
 
   const tfBtnRef = useRef<HTMLButtonElement | null>(null);
   const gridBtnRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     const handleFsChange = () => {
-      const doc = document as any;
-      setIsFullscreen(!!(doc.fullscreenElement || doc.webkitFullscreenElement || doc.mozFullScreenElement));
+      const doc = document as Document & {
+        webkitFullscreenElement?: Element | null;
+        mozFullScreenElement?: Element | null;
+      };
+      setIsFullscreen(Boolean(doc.fullscreenElement || doc.webkitFullscreenElement || doc.mozFullScreenElement));
     };
     document.addEventListener('fullscreenchange', handleFsChange);
     document.addEventListener('webkitfullscreenchange', handleFsChange);
@@ -176,19 +216,24 @@ export const TopToolbar: React.FC = () => {
     };
   }, [setIsFullscreen]);
 
-  const saveCurrentLayout = useSyncStore((s) => s.saveCurrentLayout);
+  const showLayoutToast = useCallback((msg: string, durationMs: number) => {
+    setLayoutFeedback(msg);
+    if (layoutTimerRef.current !== null) window.clearTimeout(layoutTimerRef.current);
+    layoutTimerRef.current = window.setTimeout(() => {
+      setLayoutFeedback(null);
+      layoutTimerRef.current = null;
+    }, durationMs);
+  }, []);
 
   const handleSave = useCallback(async () => {
     try {
       await saveCurrentLayout();
-      setLayoutFeedback(`Layout "${layoutName || 'Workspace'}" saved!`);
-      setTimeout(() => setLayoutFeedback(null), 2500);
+      showLayoutToast(`Layout "${layoutName || 'Workspace'}" saved!`, 2500);
     } catch (e) {
       console.error('Failed to save layout:', e);
-      setLayoutFeedback('Failed to save layout');
-      setTimeout(() => setLayoutFeedback(null), 3000);
+      showLayoutToast('Failed to save layout', 3000);
     }
-  }, [saveCurrentLayout, layoutName]);
+  }, [saveCurrentLayout, layoutName, showLayoutToast]);
 
   // Global Keyboard Shortcuts (Capture Phase)
   // Ctrl+S (Save layout), Ctrl+O (Open layout modal), Ctrl+Alt+S (Download snapshot), Ctrl+Shift+S (Copy snapshot)
@@ -272,7 +317,7 @@ export const TopToolbar: React.FC = () => {
   displayedTimeframes.sort((a, b) => getTimeframeSeconds(a) - getTimeframeSeconds(b));
 
   return (
-    <div className="relative z-40 h-10 w-full bg-[#131722] border-b border-[#2a2e39] flex items-center justify-between px-2 text-xs text-[#d1d4dc] select-none">
+    <div className="relative z-[60] h-10 w-full bg-[#131722] border-b border-[#2a2e39] flex items-center justify-between px-2 text-xs text-[#d1d4dc] select-none">
       {/* Left section: Symbol & Timeframe */}
       <div className="flex items-center space-x-1.5">
         {/* Fullscreen Brand Logo */}
@@ -467,16 +512,22 @@ export const TopToolbar: React.FC = () => {
           {/* Pinned Favorite Bar Types */}
           {pinnedChartTypes.map((type) => {
             const isActive = currentChartType === type;
+            const support = isChartTypeSupported(symbol, type);
             return (
               <button
                 key={type}
-                onClick={() => setChartType(type)}
-                className={`p-1 rounded transition-colors cursor-pointer ${
-                  isActive
-                    ? 'bg-[#2a2e39] text-white shadow-sm font-semibold'
-                    : 'text-[#787b86] hover:text-[#d1d4dc] hover:bg-[#1e222d]'
+                disabled={!support.supported}
+                onClick={() => {
+                  if (support.supported) setChartType(type);
+                }}
+                className={`p-1 rounded transition-colors ${
+                  !support.supported
+                    ? 'opacity-30 cursor-not-allowed select-none text-[#787b86]'
+                    : isActive
+                    ? 'bg-[#2a2e39] text-white shadow-sm font-semibold cursor-pointer'
+                    : 'text-[#787b86] hover:text-[#d1d4dc] hover:bg-[#1e222d] cursor-pointer'
                 }`}
-                title={type.replace('_', ' ')}
+                title={support.supported ? type.replace('_', ' ') : support.reason}
               >
                 <BarTypeIcon type={type} size={15} strokeWidth={isActive ? 2 : 1.6} />
               </button>
@@ -526,34 +577,49 @@ export const TopToolbar: React.FC = () => {
                       {cat.items.map((item) => {
                         const isActive = currentChartType === item.id;
                         const isPinned = pinnedChartTypes.includes(item.id);
+                        const support = isChartTypeSupported(symbol, item.id);
 
                         return (
                           <div
                             key={item.id}
                             onClick={() => {
+                              if (!support.supported) return;
                               setChartType(item.id);
                               setIsBarTypeDropdownOpen(false);
                             }}
-                            className={`group relative flex items-center justify-between px-3 py-1.5 mx-1 rounded-[4px] cursor-pointer transition-colors ${
-                              isActive
-                                ? 'bg-white text-black font-semibold'
-                                : 'text-[#d1d4dc] hover:bg-[#2a2e39]'
+                            title={support.supported ? undefined : support.reason}
+                            className={`group relative flex items-center justify-between px-3 py-1.5 mx-1 rounded-[4px] transition-colors ${
+                              !support.supported
+                                ? 'opacity-40 cursor-not-allowed select-none text-[#787b86]'
+                                : isActive
+                                ? 'bg-white text-black font-semibold cursor-pointer'
+                                : 'text-[#d1d4dc] hover:bg-[#2a2e39] cursor-pointer'
                             }`}
                           >
                             <div className="flex items-center space-x-2.5">
-                              <span className={isActive ? 'text-black' : 'text-[#787b86] group-hover:text-white'}>
+                              <span className={isActive ? 'text-black' : !support.supported ? 'text-[#787b86]' : 'text-[#787b86] group-hover:text-white'}>
                                 <BarTypeIcon type={item.id} size={16} strokeWidth={isActive ? 2 : 1.6} />
                               </span>
                               <span className="text-[12px]">{item.label}</span>
+                              {!support.supported && (
+                                <span className="ml-1 text-[9px] font-bold px-1 py-0.2 rounded bg-[#7b2cbf]/30 text-[#c77dff] border border-[#7b2cbf]/50">
+                                  L2
+                                </span>
+                              )}
                             </div>
 
                             <button
+                              disabled={!support.supported}
                               onClick={(e) => {
                                 e.stopPropagation();
-                                togglePinChartType(item.id);
+                                if (support.supported) {
+                                  togglePinChartType(item.id);
+                                }
                               }}
                               className={`p-1 rounded transition-colors ${
-                                isPinned
+                                !support.supported
+                                  ? 'opacity-20 cursor-not-allowed'
+                                  : isPinned
                                   ? 'text-[#ff9800]'
                                   : 'text-[#787b86]/40 hover:text-[#ff9800] opacity-0 group-hover:opacity-100'
                               }`}

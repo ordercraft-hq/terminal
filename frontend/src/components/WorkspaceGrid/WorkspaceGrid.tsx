@@ -27,13 +27,22 @@ export const WorkspaceGrid: React.FC = () => {
   const resetLayoutRatios = useSyncStore((s) => s.resetLayoutRatios);
 
   const [dragState, setDragState] = useState<DragState | null>(null);
+  const [dragRatios, setDragRatios] = useState<LayoutRatios | null>(null);
+  const dragRatiosRef = useRef<LayoutRatios | null>(null);
 
   const paneIds = getPanesForLayout(layoutType);
   const isMultiPane = paneIds.length > 1;
 
 
   const defaultR = DEFAULT_LAYOUT_RATIOS[layoutType] || { cols: [1], rows: [1] };
-  const currentR: LayoutRatios = layoutRatios[layoutType] || defaultR;
+  const storeR: LayoutRatios = layoutRatios[layoutType] || defaultR;
+  const currentR: LayoutRatios = dragRatios ?? storeR;
+
+  useEffect(() => {
+    dragRatiosRef.current = null;
+    setDragRatios(null);
+    setDragState(null);
+  }, [layoutType]);
 
   // Ensure valid ratio arrays match column and row counts
   const colRatios = currentR.cols?.length === defaultR.cols.length ? currentR.cols : defaultR.cols;
@@ -148,14 +157,22 @@ export const WorkspaceGrid: React.FC = () => {
         }
       }
 
-      setLayoutRatios(layoutType, { cols: nextCols, rows: nextRows });
+      const nextRatios: LayoutRatios = { cols: nextCols, rows: nextRows };
+      dragRatiosRef.current = nextRatios;
+      setDragRatios(nextRatios);
     },
-    [dragState, layoutType, setLayoutRatios]
+    [dragState]
   );
 
   const handlePointerUp = useCallback(() => {
+    const finalRatios = dragRatiosRef.current;
+    dragRatiosRef.current = null;
+    setDragRatios(null);
     setDragState(null);
-  }, []);
+    if (finalRatios) {
+      setLayoutRatios(layoutType, finalRatios);
+    }
+  }, [layoutType, setLayoutRatios]);
 
   useEffect(() => {
     if (!dragState) return;
@@ -230,7 +247,7 @@ export const WorkspaceGrid: React.FC = () => {
           <div
             key={paneId}
             onClick={() => setActivePaneId(paneId)}
-            className={`workspace-grid-cell relative h-full w-full overflow-hidden bg-[#131722] ${getCellClass(idx)} ${
+            className={`workspace-grid-cell relative h-full w-full overflow-hidden flex flex-col bg-[#131722] ${getCellClass(idx)} ${
               isActive
                 ? 'ring-1 ring-[#2962ff] ring-inset'
                 : 'hover:ring-1 hover:ring-[#2a2e39] hover:ring-inset'

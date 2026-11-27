@@ -81,7 +81,7 @@ func TestDeltaAggregatorOrderflow(t *testing.T) {
 	// Ingest ticks: 2 buys of 5 vol at 100.0, 1 sell of 4 vol at 99.0
 	agg.UpdateTick(TickData{Time: 1000, Price: 100.0, Volume: 5, Side: TickSideBuy})
 	agg.UpdateTick(TickData{Time: 1010, Price: 100.0, Volume: 5, Side: TickSideBuy})
-	dBar := agg.UpdateTick(TickData{Time: 1015, Price: 99.0, Volume: 4, Side: TickSideSell})
+	dBar, _ := agg.UpdateTick(TickData{Time: 1015, Price: 99.0, Volume: 4, Side: TickSideSell})
 
 	if dBar.AskVolume != 10 || dBar.BidVolume != 4 {
 		t.Fatalf("Expected Ask 10, Bid 4, got Ask %f, Bid %f", dBar.AskVolume, dBar.BidVolume)
@@ -99,5 +99,28 @@ func TestDeltaAggregatorOrderflow(t *testing.T) {
 	}
 	if len(fp.Levels) != 2 {
 		t.Fatalf("Expected 2 price levels (99, 100), got %d", len(fp.Levels))
+	}
+}
+
+func TestSynthesizeSpreadCandlesUnsortedAndForwardFill(t *testing.T) {
+	a := []Candle{
+		{Time: 300, Open: 30, High: 32, Low: 29, Close: 31, Volume: 10},
+		{Time: 100, Open: 10, High: 12, Low: 9, Close: 11, Volume: 10},
+	}
+	b := []Candle{
+		{Time: 200, Open: 5, High: 6, Low: 4, Close: 5, Volume: 5},
+		{Time: 100, Open: 4, High: 5, Low: 3, Close: 4, Volume: 5},
+	}
+
+	res := SynthesizeSpreadCandles(a, b, SpreadOpSub, AlignForwardFill)
+	if len(res) != 3 {
+		t.Fatalf("expected 3 bars (100, 200, 300), got %d", len(res))
+	}
+	if res[0].Time != 100 || res[1].Time != 200 || res[2].Time != 300 {
+		t.Fatalf("expected ascending timestamps [100,200,300], got [%d,%d,%d]", res[0].Time, res[1].Time, res[2].Time)
+	}
+	// At t=200, a is forward-filled from a[100].Close (11)
+	if res[1].Open != 6 || res[1].Close != 6 {
+		t.Fatalf("expected t=200 Open=6 Close=6, got Open=%v Close=%v", res[1].Open, res[1].Close)
 	}
 }

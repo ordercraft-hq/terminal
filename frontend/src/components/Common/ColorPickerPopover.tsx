@@ -86,10 +86,9 @@ export const ColorPickerPopover: React.FC<ColorPickerPopoverProps> = ({
   // Position state for floating popover
   const [coords, setCoords] = useState<{ top: number; left: number }>({ top: 0, left: 0 });
 
-  // Custom colors list (user-added custom colors only, starts completely empty)
+  // Custom colors list (user-added custom colors only)
   const [customColors, setCustomColors] = useState<string[]>(() => {
     try {
-      localStorage.removeItem('ordercraft_custom_colors'); // Clean legacy test defaults
       const saved = localStorage.getItem('ordercraft_user_custom_colors');
       if (saved) {
         const parsed = JSON.parse(saved);
@@ -181,12 +180,10 @@ export const ColorPickerPopover: React.FC<ColorPickerPopoverProps> = ({
     };
 
     window.addEventListener('pointerdown', handleOutsideClick, true);
-    window.addEventListener('mousedown', handleOutsideClick, true);
     window.addEventListener('keydown', handleKeyDown, true);
 
     return () => {
       window.removeEventListener('pointerdown', handleOutsideClick, true);
-      window.removeEventListener('mousedown', handleOutsideClick, true);
       window.removeEventListener('keydown', handleKeyDown, true);
     };
   }, [isOpen]);

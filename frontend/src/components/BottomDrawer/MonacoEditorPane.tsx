@@ -23,6 +23,19 @@ export const MonacoEditorPane: React.FC<MonacoEditorPaneProps> = ({
 }) => {
   const editorRef = useRef<EditorInstance | null>(null);
   const monacoRef = useRef<Monaco | null>(null);
+  const completionDisposableRef = useRef<{ dispose: () => void } | null>(null);
+  const onRunRef = useRef(onRun);
+
+  useEffect(() => {
+    onRunRef.current = onRun;
+  }, [onRun]);
+
+  useEffect(() => {
+    return () => {
+      completionDisposableRef.current?.dispose();
+      completionDisposableRef.current = null;
+    };
+  }, []);
 
   const handleEditorDidMount: OnMount = (editor, monaco) => {
     editorRef.current = editor;
@@ -57,8 +70,9 @@ export const MonacoEditorPane: React.FC<MonacoEditorPaneProps> = ({
 
     monaco.editor.setTheme('ordercraft-dark');
 
-    // Register OrderScript autocompletion provider for Python language
-    monaco.languages.registerCompletionItemProvider('python', {
+    // Dispose any prior registration before registering OrderScript autocompletion
+    completionDisposableRef.current?.dispose();
+    completionDisposableRef.current = monaco.languages.registerCompletionItemProvider('python', {
       triggerCharacters: ['.', '('],
       provideCompletionItems: (model: ITextModel, position: IPosition) => {
         const lineContent = model.getLineContent(position.lineNumber);
@@ -301,7 +315,7 @@ export const MonacoEditorPane: React.FC<MonacoEditorPaneProps> = ({
 
     // Add Ctrl+Enter shortcut to Run script
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
-      onRun?.();
+      onRunRef.current?.();
     });
   };
 

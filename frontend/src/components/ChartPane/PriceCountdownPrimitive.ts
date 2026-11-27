@@ -146,7 +146,35 @@ export class PriceCountdownPrimitive implements ISeriesPrimitive<Time> {
   }
 
   updateData(data: Partial<PriceCountdownData>) {
-    this._data = { ...this._data, ...data };
+    const nextPrice = data.price !== undefined ? data.price : this._data.price;
+    const nextCountdown = data.countdown !== undefined ? data.countdown : this._data.countdown;
+    const nextShowCountdown = data.showCountdown !== undefined ? data.showCountdown : this._data.showCountdown;
+    const nextVisible = data.visible !== undefined ? data.visible : this._data.visible;
+    const nextPrecision = data.pricePrecision !== undefined ? data.pricePrecision : this._data.pricePrecision;
+    const nextPriceFormatted = data.priceFormatted !== undefined ? data.priceFormatted : this._data.priceFormatted;
+    const nextBadgeBgColor = data.badgeBgColor !== undefined ? data.badgeBgColor : this._data.badgeBgColor;
+
+    if (
+      nextPrice === this._data.price &&
+      nextCountdown === this._data.countdown &&
+      nextShowCountdown === this._data.showCountdown &&
+      nextVisible === this._data.visible &&
+      nextPrecision === this._data.pricePrecision &&
+      nextPriceFormatted === this._data.priceFormatted &&
+      nextBadgeBgColor === this._data.badgeBgColor
+    ) {
+      return;
+    }
+
+    this._data = {
+      price: nextPrice,
+      countdown: nextCountdown,
+      showCountdown: nextShowCountdown,
+      visible: nextVisible,
+      pricePrecision: nextPrecision,
+      priceFormatted: nextPriceFormatted,
+      badgeBgColor: nextBadgeBgColor,
+    };
     this._paneView.updateData(this._data, this._attachedParam?.series ?? null);
     this._attachedParam?.requestUpdate();
   }

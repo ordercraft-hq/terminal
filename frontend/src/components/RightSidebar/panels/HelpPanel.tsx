@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { APP_VERSION, REPO_HOMEPAGE_URL } from '../../../version';
 import { useSyncStore } from '../../../store/syncStore';
+import { safeExternalHref } from '../../../utils/url';
 
 export { APP_VERSION, REPO_HOMEPAGE_URL };
 
@@ -22,16 +23,23 @@ export const HelpPanel: React.FC = () => {
 
   const shortcuts = [
     { key: 'Ctrl + K', desc: 'Open Command Palette' },
-    { key: 'Alt + F', desc: 'Toggle Fullscreen Mode' },
+    { key: 'Ctrl + S', desc: 'Save Workspace Layout' },
+    { key: 'Ctrl + O', desc: 'Open Workspace Layouts' },
+    { key: 'Ctrl + Alt + S', desc: 'Download Chart Snapshot' },
+    { key: 'Ctrl + Shift + S', desc: 'Copy Chart Snapshot' },
+    { key: 'Ctrl + Z / Ctrl + Y', desc: 'Undo / Redo Action' },
     { key: 'Delete / Backspace', desc: 'Delete Selected Drawing' },
     { key: 'Ctrl + Drag', desc: 'Clone / Duplicate Drawing' },
     { key: 'Shift + Drag', desc: 'Snap Line to 45° Degrees' },
+    { key: 'Alt + R', desc: 'Reset Chart View' },
+    { key: 'Alt + Shift + →', desc: 'Scroll to Most Recent Bar' },
     { key: 'Alt + T', desc: 'Select Trendline Tool' },
     { key: 'Alt + H', desc: 'Select Horizontal Line' },
-    { key: 'Alt + R', desc: 'Select Rectangle Tool' },
+    { key: 'Alt + J', desc: 'Select Horizontal Ray' },
+    { key: 'Alt + V', desc: 'Select Vertical Line' },
+    { key: 'Alt + C', desc: 'Select Cross Line' },
     { key: 'Alt + F', desc: 'Select Fib Retracement' },
-    { key: 'Alt + Shift + →', desc: 'Scroll to Most Recent Bar' },
-    { key: 'Ctrl + Shift + S', desc: 'Save Workspace Layout' },
+    { key: 'Alt + Shift + R', desc: 'Select Rectangle Tool' },
   ];
 
   return (
@@ -76,19 +84,6 @@ export const HelpPanel: React.FC = () => {
             100% open-source financial workstation built with Go, React, TypeScript, and lightweight-charts v5.
           </p>
 
-          <div className="pt-2 border-t border-[#2a2e39]/60 text-[10px] text-[#787b86] leading-relaxed">
-            Chart rendering powered by{' '}
-            <a
-              href="https://www.tradingview.com/"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-[#2962ff] hover:underline font-medium"
-            >
-              TradingView Lightweight Charts™
-            </a>{' '}
-            (Apache-2.0, Copyright © 2025 TradingView, Inc.).
-          </div>
-
           <a
             href={REPO_HOMEPAGE_URL}
             target="_blank"
@@ -119,7 +114,7 @@ export const HelpPanel: React.FC = () => {
                   </span>
                 </div>
                 <a
-                  href={updateCheckResult.releaseUrl || `${REPO_HOMEPAGE_URL}/releases/latest`}
+                  href={safeExternalHref(updateCheckResult.releaseUrl, `${REPO_HOMEPAGE_URL}/releases/latest`)}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="flex items-center justify-center space-x-2 w-full py-1.5 px-3 rounded bg-[#2962ff] hover:bg-[#1e53e5] text-white font-medium text-xs transition-colors shadow-sm cursor-pointer group"

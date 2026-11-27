@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { useSyncStore } from '../../store/syncStore';
 import { transport } from '../../transport/client';
 import type { LayoutMetadata } from '../../transport/client';
@@ -35,20 +36,74 @@ export const WorkspaceLayoutMenu: React.FC = () => {
     panes,
     indicators,
     chartSettings,
-  } = useSyncStore();
+    orderflowSettings,
+    isSavingLayout,
+    lastSavedTimestamp,
+  } = useSyncStore(
+    useShallow((s) => ({
+      layoutId: s.layoutId,
+      layoutName: s.layoutName,
+      layoutAutosave: s.layoutAutosave,
+      saveCurrentLayout: s.saveCurrentLayout,
+      loadLayoutById: s.loadLayoutById,
+      createNewLayout: s.createNewLayout,
+      cloneCurrentLayout: s.cloneCurrentLayout,
+      renameCurrentLayout: s.renameCurrentLayout,
+      toggleLayoutAutosave: s.toggleLayoutAutosave,
+      openLayoutModal: s.openLayoutModal,
+      symbol: s.symbol,
+      timeframe: s.timeframe,
+      chartType: s.chartType,
+      layoutType: s.layoutType,
+      panes: s.panes,
+      indicators: s.indicators,
+      chartSettings: s.chartSettings,
+      orderflowSettings: s.orderflowSettings,
+      isSavingLayout: s.isSavingLayout,
+      lastSavedTimestamp: s.lastSavedTimestamp,
+    }))
+  );
 
   const [isOpen, setIsOpen] = useState(false);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
   const [recentLayouts, setRecentLayouts] = useState<LayoutMetadata[]>([]);
   const [modalMode, setModalMode] = useState<'none' | 'new' | 'copy' | 'rename'>('none');
   const [inputText, setInputText] = useState('');
-
-  const isSavingLayout = useSyncStore((s) => s.isSavingLayout);
-  const lastSavedTimestamp = useSyncStore((s) => s.lastSavedTimestamp);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const menuRef = useRef<HTMLDivElement>(null);
   const isInitialMount = useRef(true);
   const autosaveTimerRef = useRef<number | null>(null);
+  const statusResetTimerRef = useRef<number | null>(null);
+
+  const clearStatusTimer = useCallback(() => {
+    if (statusResetTimerRef.current !== null) {
+      window.clearTimeout(statusResetTimerRef.current);
+      statusResetTimerRef.current = null;
+    }
+  }, []);
+
+  const scheduleStatusIdle = useCallback(() => {
+    clearStatusTimer();
+    statusResetTimerRef.current = window.setTimeout(() => {
+      setSaveStatus('idle');
+      statusResetTimerRef.current = null;
+    }, 2000);
+  }, [clearStatusTimer]);
+
+  const clearAutosaveTimer = useCallback(() => {
+    if (autosaveTimerRef.current !== null) {
+      window.clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      clearAutosaveTimer();
+      clearStatusTimer();
+    };
+  }, [clearAutosaveTimer, clearStatusTimer]);
 
   // Fetch recent layouts when dropdown opens
   const fetchRecentLayouts = useCallback(async () => {
@@ -63,20 +118,18 @@ export const WorkspaceLayoutMenu: React.FC = () => {
   // Synchronize visual save status with global store saves (including Ctrl+S shortcuts)
   useEffect(() => {
     if (isSavingLayout) {
+      clearStatusTimer();
       setSaveStatus('saving');
     }
-  }, [isSavingLayout]);
+  }, [isSavingLayout, clearStatusTimer]);
 
   useEffect(() => {
     if (lastSavedTimestamp) {
       setSaveStatus('saved');
+      scheduleStatusIdle();
       fetchRecentLayouts();
-      const timer = window.setTimeout(() => {
-        setSaveStatus('idle');
-      }, 2000);
-      return () => window.clearTimeout(timer);
     }
-  }, [lastSavedTimestamp, fetchRecentLayouts]);
+  }, [lastSavedTimestamp, fetchRecentLayouts, scheduleStatusIdle]);
 
   useEffect(() => {
     if (isOpen) {
@@ -90,6 +143,7 @@ export const WorkspaceLayoutMenu: React.FC = () => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setIsOpen(false);
         setModalMode('none');
+        setActionError(null);
       }
     };
     if (isOpen) {
@@ -106,18 +160,21 @@ export const WorkspaceLayoutMenu: React.FC = () => {
       isInitialMount.current = false;
       return;
     }
-    if (!layoutAutosave) return;
-
-    if (autosaveTimerRef.current) {
-      window.clearTimeout(autosaveTimerRef.current);
+    if (!layoutAutosave) {
+      clearAutosaveTimer();
+      return;
     }
 
+    clearAutosaveTimer();
     autosaveTimerRef.current = window.setTimeout(async () => {
+      autosaveTimerRef.current = null;
+      if (useSyncStore.getState().isSavingLayout) return;
       try {
+        clearStatusTimer();
         setSaveStatus('saving');
         await saveCurrentLayout();
         setSaveStatus('saved');
-        window.setTimeout(() => setSaveStatus('idle'), 2000);
+        scheduleStatusIdle();
       } catch (err) {
         console.warn('Autosave error:', err);
         setSaveStatus('idle');
@@ -125,9 +182,7 @@ export const WorkspaceLayoutMenu: React.FC = () => {
     }, 2500);
 
     return () => {
-      if (autosaveTimerRef.current) {
-        window.clearTimeout(autosaveTimerRef.current);
-      }
+      clearAutosaveTimer();
     };
   }, [
     layoutAutosave,
@@ -139,15 +194,21 @@ export const WorkspaceLayoutMenu: React.FC = () => {
     panes,
     indicators,
     chartSettings,
+    orderflowSettings,
     saveCurrentLayout,
+    clearAutosaveTimer,
+    clearStatusTimer,
+    scheduleStatusIdle,
   ]);
 
   const handleManualSave = async () => {
+    clearAutosaveTimer();
+    clearStatusTimer();
     try {
       setSaveStatus('saving');
       await saveCurrentLayout();
       setSaveStatus('saved');
-      setTimeout(() => setSaveStatus('idle'), 2000);
+      scheduleStatusIdle();
       fetchRecentLayouts();
     } catch (err) {
       console.error('Failed to save layout:', err);
@@ -160,6 +221,9 @@ export const WorkspaceLayoutMenu: React.FC = () => {
     const clean = inputText.trim();
     if (!clean) return;
 
+    clearAutosaveTimer();
+    clearStatusTimer();
+    setActionError(null);
     try {
       setSaveStatus('saving');
       if (modalMode === 'new') {
@@ -170,14 +234,14 @@ export const WorkspaceLayoutMenu: React.FC = () => {
         await renameCurrentLayout(clean);
       }
       setSaveStatus('saved');
-      setTimeout(() => setSaveStatus('idle'), 2000);
+      scheduleStatusIdle();
       setModalMode('none');
       setInputText('');
       setIsOpen(false);
       fetchRecentLayouts();
     } catch (err) {
       console.error('Layout action error:', err);
-      alert('Failed to execute layout action');
+      setActionError(err instanceof Error ? err.message : 'Failed to execute layout action');
       setSaveStatus('idle');
     }
   };
@@ -252,7 +316,15 @@ export const WorkspaceLayoutMenu: React.FC = () => {
 
       {/* Dropdown Popover */}
       {isOpen && (
-        <div className="absolute left-0 top-full mt-1 w-64 bg-[#1e222d] border border-[#2a2e39] rounded-lg shadow-2xl py-1.5 z-50 text-xs text-[#d1d4dc] font-sans backdrop-blur-md animate-in fade-in zoom-in-95 duration-100">
+        <>
+          <div
+            className="fixed inset-0 z-40"
+            onClick={() => {
+              setIsOpen(false);
+              setModalMode('none');
+            }}
+          />
+          <div className="absolute right-0 top-full mt-1 w-64 bg-[#1e222d] border border-[#2a2e39] rounded-lg shadow-2xl py-1.5 z-50 text-xs text-[#d1d4dc] font-sans backdrop-blur-md animate-in fade-in zoom-in-95 duration-100">
           {/* Sub-form for inline modal inputs (New / Copy / Rename) */}
           {modalMode !== 'none' ? (
             <form onSubmit={handleConfirmAction} className="p-3">
@@ -276,10 +348,16 @@ export const WorkspaceLayoutMenu: React.FC = () => {
                 type="text"
                 autoFocus
                 value={inputText}
-                onChange={(e) => setInputText(e.target.value)}
+                onChange={(e) => {
+                  setInputText(e.target.value);
+                  if (actionError) setActionError(null);
+                }}
                 placeholder="Enter layout name..."
-                className="w-full bg-[#131722] border border-[#2a2e39] focus:border-[#2962ff] rounded px-2.5 py-1.5 text-xs text-[#d1d4dc] outline-none mb-2.5"
+                className="w-full bg-[#131722] border border-[#2a2e39] focus:border-[#2962ff] rounded px-2.5 py-1.5 text-xs text-[#d1d4dc] outline-none mb-2"
               />
+              {actionError && (
+                <div className="mb-2 text-[11px] text-[#f23645]">{actionError}</div>
+              )}
               <div className="flex items-center justify-end space-x-1.5">
                 <button
                   type="button"
@@ -452,6 +530,7 @@ export const WorkspaceLayoutMenu: React.FC = () => {
             </>
           )}
         </div>
+        </>
       )}
     </div>
   );

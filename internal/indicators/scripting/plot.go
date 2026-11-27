@@ -34,27 +34,42 @@ func createPlotModule() *starlarkstruct.Struct {
 	})
 }
 
+func starlarkValueToFloat(item starlark.Value) float64 {
+	switch v := item.(type) {
+	case starlark.Float:
+		return float64(v)
+	case starlark.Int:
+		n, _ := v.Int64()
+		return float64(n)
+	default:
+		return math.NaN()
+	}
+}
+
 func extractFloatSlice(val starlark.Value) ([]float64, error) {
+	if idx, ok := val.(starlark.Indexable); ok {
+		n := idx.Len()
+		result := make([]float64, n)
+		for i := 0; i < n; i++ {
+			result[i] = starlarkValueToFloat(idx.Index(i))
+		}
+		return result, nil
+	}
+
 	iter := starlark.Iterate(val)
 	if iter == nil {
 		return nil, fmt.Errorf("expected iterable for series, got %s", val.Type())
 	}
 	defer iter.Done()
 
-	var result []float64
+	var capHint int
+	if seq, ok := val.(starlark.Sequence); ok {
+		capHint = seq.Len()
+	}
+	result := make([]float64, 0, capHint)
 	var item starlark.Value
 	for iter.Next(&item) {
-		switch v := item.(type) {
-		case starlark.Float:
-			result = append(result, float64(v))
-		case starlark.Int:
-			n, _ := v.Int64()
-			result = append(result, float64(n))
-		case starlark.NoneType:
-			result = append(result, math.NaN())
-		default:
-			result = append(result, math.NaN())
-		}
+		result = append(result, starlarkValueToFloat(item))
 	}
 	return result, nil
 }
@@ -80,8 +95,8 @@ func builtinPlotLine(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 		return nil, err
 	}
 
-	if _, err := extractFloatSlice(seriesVal); err != nil {
-		return nil, fmt.Errorf("%s: %w", fn.Name(), err)
+	if _, ok := seriesVal.(starlark.Iterable); !ok {
+		return nil, fmt.Errorf("%s: expected iterable for series, got %s", fn.Name(), seriesVal.Type())
 	}
 
 	dict := starlark.StringDict{

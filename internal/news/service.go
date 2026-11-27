@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"html"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ordercraft-hq/terminal/internal/datafeed"
 )
 
 type NewsArticle struct {
@@ -50,22 +53,25 @@ type cachedArticles struct {
 	fetchedAt time.Time
 }
 
+const defaultMaxNewsCacheEntries = 200
+
 type Service struct {
-	mu       sync.RWMutex
-	client   *http.Client
-	cache    map[string]cachedArticles
-	cacheTTL time.Duration
-	baseURL  string
+	mu              sync.RWMutex
+	client          *http.Client
+	cache           map[string]cachedArticles
+	maxCacheEntries int
+	cacheTTL        time.Duration
+	baseURL         string
+	flight          datafeed.SingleFlight[[]NewsArticle]
 }
 
 func NewService() *Service {
 	return &Service{
-		client: &http.Client{
-			Timeout: 10 * time.Second,
-		},
-		cache:    make(map[string]cachedArticles),
-		cacheTTL: 5 * time.Minute,
-		baseURL:  "https://news.google.com/rss/search",
+		client:          datafeed.NewHTTPClient(10 * time.Second),
+		cache:           make(map[string]cachedArticles),
+		maxCacheEntries: defaultMaxNewsCacheEntries,
+		cacheTTL:        5 * time.Minute,
+		baseURL:         "https://news.google.com/rss/search",
 	}
 }
 
@@ -110,6 +116,32 @@ func (s *Service) GetNews(ctx context.Context, query string) ([]NewsArticle, err
 	return s.GetNewsWithOpts(ctx, query, false)
 }
 
+func (s *Service) evictCacheLocked(now time.Time) {
+	for k, v := range s.cache {
+		if now.Sub(v.fetchedAt) >= s.cacheTTL {
+			delete(s.cache, k)
+		}
+	}
+	maxEntries := s.maxCacheEntries
+	if maxEntries <= 0 {
+		maxEntries = defaultMaxNewsCacheEntries
+	}
+	for len(s.cache) >= maxEntries {
+		var oldestKey string
+		var oldestTime time.Time
+		for k, v := range s.cache {
+			if oldestKey == "" || v.fetchedAt.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = v.fetchedAt
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(s.cache, oldestKey)
+	}
+}
+
 func (s *Service) GetNewsWithOpts(ctx context.Context, query string, force bool) ([]NewsArticle, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
@@ -128,25 +160,45 @@ func (s *Service) GetNewsWithOpts(ctx context.Context, query string, force bool)
 		}
 	}
 
-	articles, err := s.fetchNews(ctx, query)
-	if err != nil {
-		s.mu.RLock()
-		item, ok := s.cache[cacheKey]
-		s.mu.RUnlock()
-		if ok && len(item.articles) > 0 {
-			return item.articles, nil
+	flightKey := cacheKey
+	if force {
+		flightKey = "force:" + cacheKey
+	}
+
+	return s.flight.Do(ctx, flightKey, func(fetchCtx context.Context) ([]NewsArticle, error) {
+		if !force {
+			s.mu.RLock()
+			item, ok := s.cache[cacheKey]
+			s.mu.RUnlock()
+			if ok && time.Since(item.fetchedAt) < s.cacheTTL {
+				return item.articles, nil
+			}
 		}
-		return getFallbackNews(query), nil
-	}
 
-	s.mu.Lock()
-	s.cache[cacheKey] = cachedArticles{
-		articles:  articles,
-		fetchedAt: time.Now(),
-	}
-	s.mu.Unlock()
+		articles, err := s.fetchNews(fetchCtx, query)
+		if err != nil {
+			s.mu.RLock()
+			item, ok := s.cache[cacheKey]
+			s.mu.RUnlock()
+			if ok && len(item.articles) > 0 {
+				return item.articles, nil
+			}
+			return getFallbackNews(query), nil
+		}
 
-	return articles, nil
+		now := time.Now()
+		s.mu.Lock()
+		if _, exists := s.cache[cacheKey]; !exists {
+			s.evictCacheLocked(now)
+		}
+		s.cache[cacheKey] = cachedArticles{
+			articles:  articles,
+			fetchedAt: now,
+		}
+		s.mu.Unlock()
+
+		return articles, nil
+	})
 }
 
 func (s *Service) fetchNews(ctx context.Context, query string) ([]NewsArticle, error) {
@@ -245,7 +297,7 @@ func (s *Service) doFetchFeed(ctx context.Context, base, query string) ([]NewsAr
 	}
 
 	var rss rssResponse
-	if err := xml.NewDecoder(resp.Body).Decode(&rss); err != nil {
+	if err := xml.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&rss); err != nil {
 		return nil, err
 	}
 
@@ -278,7 +330,7 @@ func (s *Service) doFetchFeed(ctx context.Context, base, query string) ([]NewsAr
 
 		result = append(result, NewsArticle{
 			Title:       title,
-			Link:        it.Link,
+			Link:        sanitizeArticleLink(it.Link),
 			PubDate:     it.PubDate,
 			Source:      source,
 			Description: desc,
@@ -287,6 +339,22 @@ func (s *Service) doFetchFeed(ctx context.Context, base, query string) ([]NewsAr
 	}
 
 	return result, nil
+}
+
+func sanitizeArticleLink(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return ""
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if (scheme == "http" || scheme == "https") && u.Host != "" {
+		return u.String()
+	}
+	return ""
 }
 
 func getFallbackNews(query string) []NewsArticle {

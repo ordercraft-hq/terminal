@@ -372,8 +372,8 @@ func TestAdversarial_HeapObjectLeakAnalysis(t *testing.T) {
 	defer engine.Close(ctx)
 
 	// Access worker directly to inspect SessionHostContext internals
-	worker := engine.workerPool.Get().(*Worker)
-	defer engine.workerPool.Put(worker)
+	worker := engine.acquireWorker()
+	defer engine.releaseWorker(worker)
 
 	bbDesc, _ := engine.GetDescriptor("wickra.bollinger_bands")
 	bbInst, err := worker.NewIndicator(ctx, &bbDesc, map[string]interface{}{"period": 5, "multiplier": 2.0})

@@ -3,7 +3,10 @@ package datafeed
 import (
 	"context"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // mockProvider implements DataProvider for testing the Coordinator.
@@ -169,5 +172,134 @@ func TestCoordinatorSearchUnconfiguredProviderSkipped(t *testing.T) {
 	}
 	if results[0].Symbol != "TEST" {
 		t.Errorf("Expected symbol TEST, got %s", results[0].Symbol)
+	}
+}
+
+type slowHistoryMockProvider struct {
+	mockProvider
+	calls atomic.Int32
+	delay time.Duration
+}
+
+func (s *slowHistoryMockProvider) GetHistory(ctx context.Context, symbol, resolution string, from, to int64, count int) ([]Candle, error) {
+	s.calls.Add(1)
+	select {
+	case <-time.After(s.delay):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return s.mockProvider.GetHistory(ctx, symbol, resolution, from, to, count)
+}
+
+func (s *slowHistoryMockProvider) Search(ctx context.Context, query string) ([]SymbolInfo, error) {
+	select {
+	case <-time.After(s.delay):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return s.mockProvider.Search(ctx, query)
+}
+
+func TestCoordinatorGetCandlesSingleFlight(t *testing.T) {
+	coord := NewCoordinator()
+	prov := &slowHistoryMockProvider{
+		mockProvider: mockProvider{
+			name: "SLOW",
+			candles: []Candle{
+				{Time: 100, Open: 10, High: 12, Low: 9, Close: 11, Volume: 5},
+				{Time: 160, Open: 11, High: 13, Low: 10, Close: 12, Volume: 6},
+			},
+		},
+		delay: 40 * time.Millisecond,
+	}
+	coord.RegisterProvider(prov)
+
+	const goroutines = 12
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			bars, err := coord.GetCandles(context.Background(), "SLOW:TEST", "1m", 0, 0, 2)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if len(bars) != 2 {
+				errs <- context.DeadlineExceeded
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("concurrent GetCandles failed: %v", err)
+	}
+	if got := prov.calls.Load(); got != 1 {
+		t.Fatalf("expected 1 coalesced GetHistory call via singleflight, got %d", got)
+	}
+}
+
+func TestCoordinatorSearchColdRemoteNotDropped(t *testing.T) {
+	coord := NewCoordinator()
+	prov := &slowHistoryMockProvider{
+		mockProvider: mockProvider{name: "REMOTE"},
+		delay:        300 * time.Millisecond,
+	}
+	coord.RegisterProvider(prov)
+
+	results, err := coord.SearchSymbols(context.Background(), "TEST")
+	if err != nil {
+		t.Fatalf("SearchSymbols failed: %v", err)
+	}
+	if len(results) != 1 || results[0].FullSymbol != "REMOTE:TEST" {
+		t.Fatalf("expected remote result despite 300ms cold delay, got %+v", results)
+	}
+}
+
+func TestCoordinatorLiveCacheTTLIsShort(t *testing.T) {
+	coord := NewCoordinator()
+	prov := &slowHistoryMockProvider{
+		mockProvider: mockProvider{
+			name:    "LIVE",
+			candles: []Candle{{Time: 100, Open: 1, High: 2, Low: 1, Close: 2, Volume: 1}},
+		},
+	}
+	coord.RegisterProvider(prov)
+
+	// Live query (to == 0) should be cached briefly (~1.5s) and not serve 10s-stale data
+	if _, err := coord.GetCandles(context.Background(), "LIVE:TEST", "1m", 0, 0, 1); err != nil {
+		t.Fatalf("first live GetCandles failed: %v", err)
+	}
+	if _, err := coord.GetCandles(context.Background(), "LIVE:TEST", "1m", 0, 0, 1); err != nil {
+		t.Fatalf("second live GetCandles failed: %v", err)
+	}
+	if got := prov.calls.Load(); got != 1 {
+		t.Fatalf("expected immediate repeat live query to hit short cache, calls=%d", got)
+	}
+
+	time.Sleep(1600 * time.Millisecond)
+
+	if _, err := coord.GetCandles(context.Background(), "LIVE:TEST", "1m", 0, 0, 1); err != nil {
+		t.Fatalf("post-expiry live GetCandles failed: %v", err)
+	}
+	if got := prov.calls.Load(); got != 2 {
+		t.Fatalf("expected live cache entry to expire within ~1.5s, calls=%d", got)
+	}
+}
+
+func TestDeduplicateAndSort(t *testing.T) {
+	sorted := []Candle{{Time: 10, Close: 1}, {Time: 20, Close: 2}, {Time: 30, Close: 3}}
+	gotSorted := deduplicateAndSort(sorted)
+	if len(gotSorted) != 3 || gotSorted[0].Time != 10 || gotSorted[2].Time != 30 {
+		t.Fatalf("unexpected sorted result: %+v", gotSorted)
+	}
+
+	unsortedDup := []Candle{{Time: 30, Close: 3}, {Time: 10, Close: 1}, {Time: 20, Close: 2}, {Time: 20, Close: 22}}
+	got := deduplicateAndSort(unsortedDup)
+	if len(got) != 3 || got[0].Time != 10 || got[1].Time != 20 || got[2].Time != 30 {
+		t.Fatalf("unexpected deduplicateAndSort result: %+v", got)
 	}
 }

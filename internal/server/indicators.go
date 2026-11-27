@@ -131,11 +131,32 @@ func (s *Server) handleIndicatorsEval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	const (
+		maxEvalIndicators = 64
+		maxEvalCandles    = 100000
+	)
+
 	if len(req.Indicators) == 0 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error": "no indicators specified in request",
+		})
+		return
+	}
+	if len(req.Indicators) > maxEvalIndicators {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("too many indicators requested (max %d)", maxEvalIndicators),
+		})
+		return
+	}
+	if len(req.Candles) > maxEvalCandles {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("too many candles supplied (max %d)", maxEvalCandles),
 		})
 		return
 	}

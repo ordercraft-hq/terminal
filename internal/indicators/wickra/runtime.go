@@ -3,6 +3,7 @@ package wickra
 import (
 	"context"
 	_ "embed"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"strings"
@@ -20,12 +21,11 @@ type sessionContextKey struct{}
 
 // SessionHostContext captures dynamic return values and heap objects from wasm-bindgen host callbacks.
 type SessionHostContext struct {
-	objects     map[uint32]any
-	nextHandle  uint32
-	LastMap     map[string]float64
-	BatchOutPtr uint32
-	BatchOutLen uint32
-	LastError   error
+	objects    map[uint32]any
+	nextHandle uint32
+	LastMap    map[string]float64
+	BatchOut   []float64
+	LastError  error
 }
 
 func NewSessionHostContext() *SessionHostContext {
@@ -71,8 +71,7 @@ func (s *SessionHostContext) Reset() {
 		}
 	}
 	s.LastMap = nil
-	s.BatchOutPtr = 0
-	s.BatchOutLen = 0
+	s.BatchOut = s.BatchOut[:0]
 	s.LastError = nil
 }
 
@@ -305,11 +304,27 @@ func RegisterHostModule(ctx context.Context, r wazero.Runtime) error {
 		}).Export("__wbg_obj9_61e2b26f6c3f82f6")
 
 	// 6. Batch output slice capture: new Float64Array(ptr, len)
+	// Read linear memory synchronously inside the callback before Rust drops its Vec<f64>.
 	builder.NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, m api.Module, ptr, length uint32) uint32 {
 			if s := GetSessionHost(ctx); s != nil {
-				s.BatchOutPtr = ptr
-				s.BatchOutLen = length
+				if length == 0 {
+					s.BatchOut = s.BatchOut[:0]
+					return 3001
+				}
+				if length <= (1<<28) && ptr != 0 {
+					if raw, ok := m.Memory().Read(ptr, length*8); ok {
+						n := int(length)
+						if cap(s.BatchOut) < n {
+							s.BatchOut = make([]float64, n)
+						} else {
+							s.BatchOut = s.BatchOut[:n]
+						}
+						for i := 0; i < n; i++ {
+							s.BatchOut[i] = math.Float64frombits(binary.LittleEndian.Uint64(raw[i*8 : (i+1)*8]))
+						}
+					}
+				}
 			}
 			return 3001
 		}).Export("__wbg_new_from_slice_3b4c7f1456059f80")
@@ -384,28 +399,34 @@ func RegisterHostModule(ctx context.Context, r wazero.Runtime) error {
 	return err
 }
 
+const maxPooledWorkers = 32
+
 // Engine wraps the WebAssembly runtime, compiled module, worker pool, and catalog.
 type Engine struct {
 	runtime     wazero.Runtime
 	compiledMod wazero.CompiledModule
-	workerPool  sync.Pool
+	idleWorkers chan *Worker
+	closed      atomic.Bool
 	sessionSeq  uint64
 	catalog     *Catalog
 }
 
 // Worker wraps an instantiated WebAssembly module with linear memory access and functions.
 type Worker struct {
-	Mod     api.Module
-	Session *SessionHostContext
-	Malloc  api.Function
-	Free    api.Function
-	AddSP   api.Function
+	Mod            api.Module
+	Session        *SessionHostContext
+	Malloc         api.Function
+	Free           api.Function
+	AddSP          api.Function
+	batchScratchIn []byte
+	Tainted        bool
 }
 
 // NewEngine compiles wickra.wasm and initializes the worker pool.
 func NewEngine(ctx context.Context) (*Engine, error) {
 	config := wazero.NewRuntimeConfigCompiler().
-		WithMemoryLimitPages(2048) // 128 MB max sandbox
+		WithMemoryLimitPages(2048). // 128 MB max sandbox
+		WithCloseOnContextDone(true)
 
 	r := wazero.NewRuntimeWithConfig(ctx, config)
 	if err := RegisterHostModule(ctx, r); err != nil {
@@ -423,15 +444,8 @@ func NewEngine(ctx context.Context) (*Engine, error) {
 	engine := &Engine{
 		runtime:     r,
 		compiledMod: compiled,
+		idleWorkers: make(chan *Worker, maxPooledWorkers),
 		catalog:     cat,
-	}
-
-	engine.workerPool.New = func() any {
-		w, err := engine.spawnWorker(context.Background())
-		if err != nil {
-			panic(fmt.Sprintf("failed to spawn wasm worker: %v", err))
-		}
-		return w
 	}
 
 	return engine, nil
@@ -454,9 +468,53 @@ func (e *Engine) spawnWorker(ctx context.Context) (*Worker, error) {
 	}, nil
 }
 
+func (e *Engine) acquireWorker() *Worker {
+	for {
+		select {
+		case w := <-e.idleWorkers:
+			if w != nil && w.Mod != nil && !w.Mod.IsClosed() && !w.Tainted {
+				return w
+			}
+		default:
+			w, err := e.spawnWorker(context.Background())
+			if err != nil {
+				panic(fmt.Sprintf("failed to spawn wasm worker: %v", err))
+			}
+			return w
+		}
+	}
+}
+
+func (e *Engine) releaseWorker(w *Worker) {
+	if w == nil || w.Mod == nil || w.Mod.IsClosed() {
+		return
+	}
+	if w.Tainted || e.closed.Load() {
+		// Discard modules that trapped, leaked guest allocations, errored, or outlived the engine.
+		_ = w.Mod.Close(context.Background())
+		return
+	}
+	w.Session.Reset()
+	select {
+	case e.idleWorkers <- w:
+	default:
+		_ = w.Mod.Close(context.Background())
+	}
+}
+
 // Close closes the underlying Wazero runtime.
 func (e *Engine) Close(ctx context.Context) error {
-	return e.runtime.Close(ctx)
+	e.closed.Store(true)
+	for {
+		select {
+		case w := <-e.idleWorkers:
+			if w != nil && w.Mod != nil {
+				_ = w.Mod.Close(ctx)
+			}
+		default:
+			return e.runtime.Close(ctx)
+		}
+	}
 }
 
 // Catalog returns the 515 indicator catalog.
@@ -466,30 +524,7 @@ func (e *Engine) Catalog() *Catalog {
 
 // GetCatalog returns descriptors filtered by category or search query.
 func (e *Engine) GetCatalog(category, query string) []IndicatorDescriptor {
-	all := e.catalog.GetAll()
-	catLower := strings.ToLower(strings.TrimSpace(category))
-	qLower := strings.ToLower(strings.TrimSpace(query))
-
-	var filtered []IndicatorDescriptor
-	for _, d := range all {
-		if d.ID == "wickra.vwap_std_dev_bands" {
-			continue // Exclude deprecated standalone indicator consolidated into canonical wickra.vwap
-		}
-		if catLower != "" && strings.ToLower(d.Category) != catLower && strings.ToLower(d.Family) != catLower {
-			continue
-		}
-		if qLower != "" {
-			match := strings.Contains(strings.ToLower(d.ID), qLower) ||
-				strings.Contains(strings.ToLower(d.Name), qLower) ||
-				strings.Contains(strings.ToLower(d.ShortName), qLower) ||
-				strings.Contains(strings.ToLower(d.WasmClass), qLower)
-			if !match {
-				continue
-			}
-		}
-		filtered = append(filtered, d)
-	}
-	return filtered
+	return e.catalog.Filter(category, query)
 }
 
 // GetDescriptor looks up an indicator descriptor by catalog ID or WASM class name.
@@ -531,21 +566,132 @@ func isSlopeIndicator(id string) bool {
 	}
 }
 
+type sourceKind uint8
+
+const (
+	sourceClose sourceKind = iota
+	sourceOpen
+	sourceHigh
+	sourceLow
+	sourceHL2
+	sourceHLC3
+	sourceOHLC4
+)
+
+func parseSourceKind(source string) sourceKind {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "open":
+		return sourceOpen
+	case "high":
+		return sourceHigh
+	case "low":
+		return sourceLow
+	case "hl2":
+		return sourceHL2
+	case "hlc3":
+		return sourceHLC3
+	case "ohlc4":
+		return sourceOHLC4
+	default:
+		return sourceClose
+	}
+}
+
+func extractSourceValue(kind sourceKind, c CandleData) float64 {
+	switch kind {
+	case sourceOpen:
+		return c.Open
+	case sourceHigh:
+		return c.High
+	case sourceLow:
+		return c.Low
+	case sourceHL2:
+		return (c.High + c.Low) / 2.0
+	case sourceHLC3:
+		return (c.High + c.Low + c.Close) / 3.0
+	case sourceOHLC4:
+		return (c.Open + c.High + c.Low + c.Close) / 4.0
+	default:
+		return c.Close
+	}
+}
+
+type inputLayoutKind uint8
+
+const (
+	layoutSource1 inputLayoutKind = iota
+	layoutVolume1
+	layoutSourceVolume2
+	layoutHighLow2
+	layoutHighLowVolume3
+	layoutHighLowClose3
+	layoutHighLowCloseVolume4
+	layoutOHLC4
+	layoutOHLCV5
+)
+
+func resolveInputLayout(desc *IndicatorDescriptor, numInputs int) inputLayoutKind {
+	if desc != nil {
+		switch desc.WasmClass {
+		case "VolumeOscillator":
+			if numInputs == 1 {
+				return layoutVolume1
+			}
+		case "OBV", "ForceIndex", "TSV", "TradeVolumeIndex", "VZO", "VolumePriceTrend",
+			"VolumeRsi", "VolumeWeightedMacd", "EVWMA", "VWMA", "NVI", "PVI":
+			if numInputs == 2 {
+				return layoutSourceVolume2
+			}
+		case "EaseOfMovement", "MarketFacilitationIndex", "VolumeWeightedSr":
+			if numInputs == 3 {
+				return layoutHighLowVolume3
+			}
+		case "VWAP", "AnchoredVWAP", "RollingVWAP", "ADL", "ChaikinMoneyFlow",
+			"ChaikinOscillator", "DemandIndex", "IntradayIntensity", "TwiggsMoneyFlow":
+			if numInputs == 4 {
+				return layoutHighLowCloseVolume4
+			}
+		}
+	}
+
+	switch numInputs {
+	case 1:
+		return layoutSource1
+	case 2:
+		return layoutHighLow2
+	case 3:
+		return layoutHighLowClose3
+	case 4:
+		return layoutOHLC4
+	case 5:
+		return layoutOHLCV5
+	default:
+		return layoutSource1
+	}
+}
+
 // IndicatorInstance wraps an allocated Rust indicator struct in WASM linear memory.
 type IndicatorInstance struct {
 	worker       *Worker
 	ptr          uint32
 	isMulti      bool
 	hasRetptr    bool
+	isDirStop    bool
+	isSlope      bool
 	numInputs    int
 	source       string
+	sourceKind   sourceKind
+	layoutKind   inputLayoutKind
 	updateFn     api.Function
+	batchFn      api.Function
 	freeFn       api.Function
 	warmupPeriod uint32
 	desc         *IndicatorDescriptor
 	prevSlopeVal float64
 	hasPrevSlope bool
 	slopeRegime  int
+	inputBuf     [5]float64
+	callArgsBuf  [7]uint64
 	customUpdate func(ctx context.Context, candle CandleData) (float64, map[string]float64, bool, error)
 	customFree   func(ctx context.Context)
 }
@@ -630,6 +776,7 @@ func (w *Worker) NewIndicator(ctx context.Context, desc *IndicatorDescriptor, in
 				} else {
 					val = schema.Default
 				}
+				val = clampSchemaInput(schema, val)
 			}
 
 			if targetType == api.ValueTypeI32 {
@@ -647,9 +794,11 @@ func (w *Worker) NewIndicator(ctx context.Context, desc *IndicatorDescriptor, in
 
 		res, err := newFn.Call(ctx, callArgs...)
 		if err != nil {
+			w.Tainted = true
 			return nil, fmt.Errorf("constructor call error for %q: %w", desc.ID, err)
 		}
 		if len(res) == 0 || res[0] == 0 || w.Session.LastError != nil {
+			w.Tainted = true
 			return nil, fmt.Errorf("constructor failed for %q (lastErr=%v)", desc.ID, w.Session.LastError)
 		}
 		instPtr = uint32(res[0])
@@ -657,6 +806,7 @@ func (w *Worker) NewIndicator(ctx context.Context, desc *IndicatorDescriptor, in
 		// Allocate stack frame for constructor return pointer (16 bytes)
 		spRes, err := w.AddSP.Call(ctx, stackAlloc16)
 		if err != nil {
+			w.Tainted = true
 			return nil, err
 		}
 		retptr := uint32(spRes[0])
@@ -679,6 +829,7 @@ func (w *Worker) NewIndicator(ctx context.Context, desc *IndicatorDescriptor, in
 				} else {
 					val = schema.Default
 				}
+				val = clampSchemaInput(schema, val)
 			}
 
 			if targetType == api.ValueTypeI32 {
@@ -695,12 +846,14 @@ func (w *Worker) NewIndicator(ctx context.Context, desc *IndicatorDescriptor, in
 		}
 
 		if _, err := newFn.Call(ctx, callArgs...); err != nil {
+			w.Tainted = true
 			return nil, fmt.Errorf("constructor call error for %q: %w", desc.ID, err)
 		}
 
 		instPtr, _ = w.Mod.Memory().ReadUint32Le(retptr)
 		errFlag, _ := w.Mod.Memory().ReadUint32Le(retptr + 8)
 		if errFlag != 0 || instPtr == 0 || w.Session.LastError != nil {
+			w.Tainted = true
 			return nil, fmt.Errorf("constructor failed for %q (errFlag=%d, lastErr=%v)", desc.ID, errFlag, w.Session.LastError)
 		}
 	}
@@ -712,9 +865,11 @@ func (w *Worker) NewIndicator(ctx context.Context, desc *IndicatorDescriptor, in
 	freeFn := w.Mod.ExportedFunction("__wbg_" + prefix + "_free")
 
 	hasRetptr := len(updateFn.Definition().ResultTypes()) == 0
+	isSlope := isSlopeIndicator(desc.ID)
+	isDirStop := isDirectionalStopIndicator(desc.ID)
 	// Prevent slope-dependent single-output indicators from being flagged as multi-output
 	// when catalog.go declares additional plot directives for "up" and "down".
-	isMulti := (len(desc.Plots) > 1 || !hasRetptr) && !isSlopeIndicator(desc.ID)
+	isMulti := (len(desc.Plots) > 1 || !hasRetptr) && !isSlope
 	var numInputs int
 	if hasRetptr {
 		numInputs = len(updateFn.Definition().ParamTypes()) - 2
@@ -723,6 +878,18 @@ func (w *Worker) NewIndicator(ctx context.Context, desc *IndicatorDescriptor, in
 	}
 	if numInputs < 1 {
 		numInputs = 1
+	}
+
+	var batchFn api.Function
+	if !isMulti && numInputs == 1 {
+		if bf := w.Mod.ExportedFunction(prefix + "_batch"); bf != nil {
+			def := bf.Definition()
+			pt := def.ParamTypes()
+			rt := def.ResultTypes()
+			if len(pt) == 3 && len(rt) == 1 && pt[0] == api.ValueTypeI32 && pt[1] == api.ValueTypeI32 && pt[2] == api.ValueTypeI32 && rt[0] == api.ValueTypeI32 {
+				batchFn = bf
+			}
+		}
 	}
 
 	var warmup uint32
@@ -742,71 +909,73 @@ func (w *Worker) NewIndicator(ctx context.Context, desc *IndicatorDescriptor, in
 		ptr:          instPtr,
 		isMulti:      isMulti,
 		hasRetptr:    hasRetptr,
+		isDirStop:    isDirStop,
+		isSlope:      isSlope,
 		numInputs:    numInputs,
 		source:       sourceField,
+		sourceKind:   parseSourceKind(sourceField),
+		layoutKind:   resolveInputLayout(desc, numInputs),
 		updateFn:     updateFn,
+		batchFn:      batchFn,
 		freeFn:       freeFn,
 		warmupPeriod: warmup,
 		desc:         desc,
 	}, nil
 }
 
-func extractInputs(desc *IndicatorDescriptor, c CandleData, source string, numInputs int) []float64 {
-	var srcVal float64
-	switch strings.ToLower(source) {
-	case "open":
-		srcVal = c.Open
-	case "high":
-		srcVal = c.High
-	case "low":
-		srcVal = c.Low
-	case "hl2":
-		srcVal = (c.High + c.Low) / 2.0
-	case "hlc3":
-		srcVal = (c.High + c.Low + c.Close) / 3.0
-	case "ohlc4":
-		srcVal = (c.Open + c.High + c.Low + c.Close) / 4.0
+func (inst *IndicatorInstance) fillInputs(c CandleData) []float64 {
+	switch inst.layoutKind {
+	case layoutVolume1:
+		inst.inputBuf[0] = c.Volume
+		return inst.inputBuf[:1]
+	case layoutSourceVolume2:
+		inst.inputBuf[0] = extractSourceValue(inst.sourceKind, c)
+		inst.inputBuf[1] = c.Volume
+		return inst.inputBuf[:2]
+	case layoutHighLow2:
+		inst.inputBuf[0] = c.High
+		inst.inputBuf[1] = c.Low
+		return inst.inputBuf[:2]
+	case layoutHighLowVolume3:
+		inst.inputBuf[0] = c.High
+		inst.inputBuf[1] = c.Low
+		inst.inputBuf[2] = c.Volume
+		return inst.inputBuf[:3]
+	case layoutHighLowClose3:
+		inst.inputBuf[0] = c.High
+		inst.inputBuf[1] = c.Low
+		inst.inputBuf[2] = c.Close
+		return inst.inputBuf[:3]
+	case layoutHighLowCloseVolume4:
+		inst.inputBuf[0] = c.High
+		inst.inputBuf[1] = c.Low
+		inst.inputBuf[2] = c.Close
+		inst.inputBuf[3] = c.Volume
+		return inst.inputBuf[:4]
+	case layoutOHLC4:
+		inst.inputBuf[0] = c.Open
+		inst.inputBuf[1] = c.High
+		inst.inputBuf[2] = c.Low
+		inst.inputBuf[3] = c.Close
+		return inst.inputBuf[:4]
+	case layoutOHLCV5:
+		inst.inputBuf[0] = c.Open
+		inst.inputBuf[1] = c.High
+		inst.inputBuf[2] = c.Low
+		inst.inputBuf[3] = c.Close
+		inst.inputBuf[4] = c.Volume
+		return inst.inputBuf[:5]
 	default:
-		srcVal = c.Close
+		inst.inputBuf[0] = extractSourceValue(inst.sourceKind, c)
+		return inst.inputBuf[:1]
 	}
+}
 
-	if desc != nil {
-		switch desc.WasmClass {
-		case "VolumeOscillator":
-			if numInputs == 1 {
-				return []float64{c.Volume}
-			}
-		case "OBV", "ForceIndex", "TSV", "TradeVolumeIndex", "VZO", "VolumePriceTrend",
-			"VolumeRsi", "VolumeWeightedMacd", "EVWMA", "VWMA", "NVI", "PVI":
-			if numInputs == 2 {
-				return []float64{srcVal, c.Volume}
-			}
-		case "EaseOfMovement", "MarketFacilitationIndex", "VolumeWeightedSr":
-			if numInputs == 3 {
-				return []float64{c.High, c.Low, c.Volume}
-			}
-		case "VWAP", "AnchoredVWAP", "RollingVWAP", "ADL", "ChaikinMoneyFlow",
-			"ChaikinOscillator", "DemandIndex", "IntradayIntensity", "TwiggsMoneyFlow":
-			if numInputs == 4 {
-				return []float64{c.High, c.Low, c.Close, c.Volume}
-			}
-		}
+func ensureSessionHost(ctx context.Context, session *SessionHostContext) context.Context {
+	if GetSessionHost(ctx) == session {
+		return ctx
 	}
-
-	switch numInputs {
-	case 1:
-		return []float64{srcVal}
-	case 2:
-		return []float64{c.High, c.Low}
-	case 3:
-		return []float64{c.High, c.Low, c.Close}
-	case 4:
-		return []float64{c.Open, c.High, c.Low, c.Close}
-	case 5:
-		return []float64{c.Open, c.High, c.Low, c.Close, c.Volume}
-	default:
-		return []float64{srcVal}
-	}
+	return WithSessionHost(ctx, session)
 }
 
 // Update performs an O(1) streaming step. Returns (singleVal, multiVal, isReady, error).
@@ -814,49 +983,69 @@ func (inst *IndicatorInstance) Update(ctx context.Context, candle CandleData) (f
 	if inst.customUpdate != nil {
 		return inst.customUpdate(ctx, candle)
 	}
+	ctx = ensureSessionHost(ctx, inst.worker.Session)
+	return inst.updateWithRetptr(ctx, candle, 0)
+}
 
-	ctx = WithSessionHost(ctx, inst.worker.Session)
+// updateWithRetptr executes a single bar step, optionally reusing a caller-allocated WASM stack retptr.
+func (inst *IndicatorInstance) updateWithRetptr(ctx context.Context, candle CandleData, sharedRetptr uint32) (float64, map[string]float64, bool, error) {
+	if inst.customUpdate != nil {
+		return inst.customUpdate(ctx, candle)
+	}
+
 	w := inst.worker
-
-	inputVals := extractInputs(inst.desc, candle, inst.source, inst.numInputs)
+	inputVals := inst.fillInputs(candle)
 
 	if inst.isMulti {
 		if inst.hasRetptr {
-			spRes, err := w.AddSP.Call(ctx, stackAlloc64)
+			retptr := sharedRetptr
+			var allocatedStack bool
+			if retptr == 0 {
+				spRes, err := w.AddSP.Call(ctx, stackAlloc64)
+				if err != nil {
+					return 0, nil, false, err
+				}
+				retptr = uint32(spRes[0])
+				allocatedStack = true
+			}
+
+			inst.callArgsBuf[0] = uint64(retptr)
+			inst.callArgsBuf[1] = uint64(inst.ptr)
+			for i, v := range inputVals {
+				inst.callArgsBuf[2+i] = api.EncodeF64(v)
+			}
+			callArgs := inst.callArgsBuf[:2+len(inputVals)]
+
+			_, err := inst.updateFn.Call(ctx, callArgs...)
 			if err != nil {
-				return 0, nil, false, err
-			}
-			retptr := uint32(spRes[0])
-			defer w.AddSP.Call(ctx, uint64(int32(64)))
-
-			callArgs := []uint64{uint64(retptr), uint64(inst.ptr)}
-			for _, v := range inputVals {
-				callArgs = append(callArgs, api.EncodeF64(v))
-			}
-
-			if _, err := inst.updateFn.Call(ctx, callArgs...); err != nil {
+				if allocatedStack {
+					_, _ = w.AddSP.Call(ctx, uint64(int32(64)))
+				}
 				return 0, nil, false, err
 			}
 
 			status, _ := w.Mod.Memory().ReadUint32Le(retptr)
+			if allocatedStack {
+				_, _ = w.AddSP.Call(ctx, uint64(int32(64)))
+			}
 			if status == 0 {
 				return math.NaN(), nil, false, nil // Warming up
 			}
 
-			outMap := make(map[string]float64, len(w.Session.LastMap))
-			for k, v := range w.Session.LastMap {
-				outMap[k] = v
-			}
+			// Take ownership of the freshly allocated LastMap instead of copying it.
+			outMap := w.Session.LastMap
 			w.Session.dropHeapObject(status)
 			w.Session.LastMap = nil
 
 			return 0, outMap, true, nil
 		}
 
-		callArgs := []uint64{uint64(inst.ptr)}
-		for _, v := range inputVals {
-			callArgs = append(callArgs, api.EncodeF64(v))
+		inst.callArgsBuf[0] = uint64(inst.ptr)
+		for i, v := range inputVals {
+			inst.callArgsBuf[1+i] = api.EncodeF64(v)
 		}
+		callArgs := inst.callArgsBuf[:1+len(inputVals)]
+
 		res, err := inst.updateFn.Call(ctx, callArgs...)
 		if err != nil {
 			return 0, nil, false, err
@@ -865,11 +1054,8 @@ func (inst *IndicatorInstance) Update(ctx context.Context, candle CandleData) (f
 			return math.NaN(), nil, false, nil // Warming up
 		}
 
-		outMap := make(map[string]float64, len(w.Session.LastMap))
-		for k, v := range w.Session.LastMap {
-			outMap[k] = v
-		}
-		// Clean up transient heap object handle allocated by __wbg_objN
+		// Take ownership of the freshly allocated LastMap instead of copying it.
+		outMap := w.Session.LastMap
 		w.Session.dropHeapObject(uint32(res[0]))
 		w.Session.LastMap = nil
 
@@ -877,29 +1063,131 @@ func (inst *IndicatorInstance) Update(ctx context.Context, candle CandleData) (f
 	}
 
 	// Single output
-	spRes, err := w.AddSP.Call(ctx, stackAlloc16)
+	retptr := sharedRetptr
+	var allocatedStack bool
+	if retptr == 0 {
+		spRes, err := w.AddSP.Call(ctx, stackAlloc16)
+		if err != nil {
+			return 0, nil, false, err
+		}
+		retptr = uint32(spRes[0])
+		allocatedStack = true
+	}
+
+	inst.callArgsBuf[0] = uint64(retptr)
+	inst.callArgsBuf[1] = uint64(inst.ptr)
+	for i, v := range inputVals {
+		inst.callArgsBuf[2+i] = api.EncodeF64(v)
+	}
+	callArgs := inst.callArgsBuf[:2+len(inputVals)]
+
+	_, err := inst.updateFn.Call(ctx, callArgs...)
 	if err != nil {
-		return 0, nil, false, err
-	}
-	retptr := uint32(spRes[0])
-	defer w.AddSP.Call(ctx, uint64(int32(16)))
-
-	callArgs := []uint64{uint64(retptr), uint64(inst.ptr)}
-	for _, v := range inputVals {
-		callArgs = append(callArgs, api.EncodeF64(v))
-	}
-
-	if _, err := inst.updateFn.Call(ctx, callArgs...); err != nil {
+		if allocatedStack {
+			_, _ = w.AddSP.Call(ctx, uint64(int32(16)))
+		}
 		return 0, nil, false, err
 	}
 
 	status, _ := w.Mod.Memory().ReadUint32Le(retptr)
+	var valBits uint64
+	if status != 0 {
+		valBits, _ = w.Mod.Memory().ReadUint64Le(retptr + 8)
+	}
+	if allocatedStack {
+		_, _ = w.AddSP.Call(ctx, uint64(int32(16)))
+	}
 	if status == 0 {
 		return math.NaN(), nil, false, nil // Warming up
 	}
 
-	valBits, _ := w.Mod.Memory().ReadUint64Le(retptr + 8)
 	return api.DecodeF64(valBits), nil, true, nil
+}
+
+// clampSchemaInput enforces catalog Min/Max bounds and rejects NaN/Inf for numeric constructor inputs.
+func clampSchemaInput(schema InputSchema, raw any) any {
+	switch schema.Type {
+	case InputTypeInteger:
+		v := toInt(raw)
+		if schema.Min != nil && float64(v) < *schema.Min {
+			v = int32(*schema.Min)
+		}
+		if schema.Max != nil && float64(v) > *schema.Max {
+			v = int32(*schema.Max)
+		}
+		return v
+	case InputTypeFloat:
+		v := toFloat(raw)
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			v = toFloat(schema.Default)
+		}
+		if schema.Min != nil && v < *schema.Min {
+			v = *schema.Min
+		}
+		if schema.Max != nil && v > *schema.Max {
+			v = *schema.Max
+		}
+		return v
+	default:
+		return raw
+	}
+}
+
+// evalBatchSingleOutput runs `<prefix>_batch` using WASM linear memory and the `__wbg_new_from_slice` intrinsic.
+func (inst *IndicatorInstance) evalBatchSingleOutput(ctx context.Context, candles []CandleData) ([]float64, bool, error) {
+	if inst.batchFn == nil || inst.worker.Malloc == nil || inst.worker.Free == nil || len(candles) == 0 {
+		return nil, false, nil
+	}
+	w := inst.worker
+	n := len(candles)
+	if n > (1 << 27) {
+		return nil, false, fmt.Errorf("batch candle length %d exceeds linear memory limit", n)
+	}
+	byteLen := uint32(n * 8)
+
+	if cap(w.batchScratchIn) < int(byteLen) {
+		w.batchScratchIn = make([]byte, byteLen)
+	}
+	buf := w.batchScratchIn[:byteLen]
+	for i, c := range candles {
+		v := extractSourceValue(inst.sourceKind, c)
+		binary.LittleEndian.PutUint64(buf[i*8:(i+1)*8], math.Float64bits(v))
+	}
+
+	mallocRes, err := w.Malloc.Call(ctx, uint64(byteLen), 8)
+	if err != nil || len(mallocRes) == 0 || mallocRes[0] == 0 {
+		if err != nil {
+			w.Tainted = true
+		}
+		return nil, false, nil
+	}
+	inPtr := uint32(mallocRes[0])
+	if !w.Mod.Memory().Write(inPtr, buf) {
+		_, _ = w.Free.Call(ctx, uint64(inPtr), uint64(byteLen), 8)
+		return nil, false, nil
+	}
+
+	w.Session.BatchOut = w.Session.BatchOut[:0]
+	w.Session.LastError = nil
+
+	// wasm-bindgen takes ownership of inPtr via FromWasmAbi and drops the output Vec<f64>
+	// after invoking __wbg_new_from_slice; do not call w.Free again after batchFn returns.
+	res, err := inst.batchFn.Call(ctx, uint64(inst.ptr), uint64(inPtr), uint64(n))
+	if err != nil || w.Session.LastError != nil || len(w.Session.BatchOut) == 0 {
+		if err != nil || w.Session.LastError != nil {
+			w.Tainted = true
+		}
+		if len(res) > 0 && res[0] != 0 {
+			w.Session.dropHeapObject(uint32(res[0]))
+		}
+		w.Session.BatchOut = w.Session.BatchOut[:0]
+		return nil, false, err
+	}
+
+	if len(res) > 0 && res[0] != 0 {
+		w.Session.dropHeapObject(uint32(res[0]))
+	}
+	return w.Session.BatchOut, true, nil
 }
 
 // Free cleans up the allocated Rust indicator in WASM linear memory.
@@ -909,9 +1197,98 @@ func (inst *IndicatorInstance) Free(ctx context.Context) {
 		inst.customFree = nil
 	}
 	if inst.freeFn != nil && inst.ptr != 0 {
-		inst.freeFn.Call(ctx, uint64(inst.ptr), 0)
+		if inst.worker != nil && inst.worker.Mod != nil && !inst.worker.Mod.IsClosed() {
+			_, _ = inst.freeFn.Call(ctx, uint64(inst.ptr), 0)
+		}
 		inst.ptr = 0
 	}
+}
+
+func appendSingleEvalPoint(
+	res *EvalResult,
+	desc *IndicatorDescriptor,
+	offsets map[string]int64,
+	interval int64,
+	candleTime int64,
+	singleVal float64,
+	isSlope bool,
+	prevSlopePoint *SeriesPoint,
+	hasPrevSlopePoint *bool,
+	prevRegime *int,
+) {
+	if math.IsNaN(singleVal) || math.IsInf(singleVal, 0) {
+		return
+	}
+
+	if isSlope {
+		ptTime := candleTime
+		if off, ok := offsets["plot"]; ok && off != 0 {
+			ptTime += off * interval
+		} else if off, ok := offsets["value"]; ok && off != 0 {
+			ptTime += off * interval
+		} else if off, ok := offsets["up"]; ok && off != 0 {
+			ptTime += off * interval
+		}
+
+		currPt := SeriesPoint{Time: ptTime, Value: singleVal}
+
+		// Retain continuous lines
+		res.Plots["plot"] = append(res.Plots["plot"], currPt)
+		res.Plots["value"] = append(res.Plots["value"], currPt)
+
+		if !*hasPrevSlopePoint {
+			*prevSlopePoint = currPt
+			*hasPrevSlopePoint = true
+		} else {
+			slope := currPt.Value - prevSlopePoint.Value
+			if slope > 0 {
+				if *prevRegime != 1 {
+					// Inflection from Down to Up: include transition anchor bar in Up
+					res.Plots["up"] = append(res.Plots["up"], *prevSlopePoint)
+					*prevRegime = 1
+				}
+				res.Plots["up"] = append(res.Plots["up"], currPt)
+			} else if slope < 0 {
+				if *prevRegime != -1 {
+					// Inflection from Up to Down: include transition anchor bar in Down
+					res.Plots["down"] = append(res.Plots["down"], *prevSlopePoint)
+					*prevRegime = -1
+				}
+				res.Plots["down"] = append(res.Plots["down"], currPt)
+			} else {
+				// Flat slope: persist current regime (default to Up if unset)
+				if *prevRegime == -1 {
+					res.Plots["down"] = append(res.Plots["down"], currPt)
+				} else {
+					if *prevRegime == 0 {
+						res.Plots["up"] = append(res.Plots["up"], *prevSlopePoint)
+						*prevRegime = 1
+					}
+					res.Plots["up"] = append(res.Plots["up"], currPt)
+				}
+			}
+			*prevSlopePoint = currPt
+		}
+		var dirVal float64 = 1.0
+		if *prevRegime == -1 {
+			dirVal = -1.0
+		}
+		res.Plots["direction"] = append(res.Plots["direction"], SeriesPoint{Time: ptTime, Value: dirVal})
+		return
+	}
+
+	plotID := "plot"
+	if len(desc.Plots) > 0 {
+		plotID = desc.Plots[0].ID
+	}
+	ptTime := candleTime
+	if off, ok := offsets[plotID]; ok && off != 0 {
+		ptTime += off * interval
+	}
+	res.Plots[plotID] = append(res.Plots[plotID], SeriesPoint{
+		Time:  ptTime,
+		Value: singleVal,
+	})
 }
 
 // Evaluate computes historical indicator plots for a batch of candles across multiple indicators.
@@ -920,15 +1297,25 @@ func (e *Engine) Evaluate(ctx context.Context, candles []CandleData, configs []E
 		return []EvalResult{}, nil
 	}
 
-	worker := e.workerPool.Get().(*Worker)
-	defer func() {
-		worker.Session.Reset()
-		e.workerPool.Put(worker)
-	}()
+	worker := e.acquireWorker()
+	defer e.releaseWorker(worker)
 
-	var results []EvalResult
+	hostCtx := ensureSessionHost(ctx, worker.Session)
+	results := make([]EvalResult, 0, len(configs))
+
+	var interval int64 = 60
+	if len(candles) >= 2 {
+		interval = candles[len(candles)-1].Time - candles[len(candles)-2].Time
+		if interval <= 0 {
+			interval = 60
+		}
+	}
 
 	for _, cfg := range configs {
+		if err := ctx.Err(); err != nil {
+			worker.Tainted = true
+			return nil, err
+		}
 		indID := cfg.IndicatorID
 		if indID == "wickra.vwap_std_dev_bands" || indID == "VwapStdDevBands" {
 			indID = "wickra.vwap"
@@ -941,7 +1328,7 @@ func (e *Engine) Evaluate(ctx context.Context, candles []CandleData, configs []E
 			}
 		}
 
-		inst, err := worker.NewIndicator(ctx, desc, cfg.Inputs)
+		inst, err := worker.NewIndicator(hostCtx, desc, cfg.Inputs)
 		if err != nil {
 			return nil, fmt.Errorf("instantiate indicator %q: %w", cfg.IndicatorID, err)
 		}
@@ -954,32 +1341,33 @@ func (e *Engine) Evaluate(ctx context.Context, candles []CandleData, configs []E
 
 		// Ensure split plot slices are initialized to non-nil empty slices
 		// to guarantee JSON serialization emits "[]" instead of "null".
-		if isDirectionalStopIndicator(desc.ID) {
+		if inst.isDirStop {
 			res.Plots["up"] = make([]SeriesPoint, 0, len(candles))
 			res.Plots["down"] = make([]SeriesPoint, 0, len(candles))
 			res.Plots["value"] = make([]SeriesPoint, 0, len(candles))
 			res.Plots["direction"] = make([]SeriesPoint, 0, len(candles))
-		} else if isSlopeIndicator(desc.ID) {
+		} else if inst.isSlope {
 			res.Plots["up"] = make([]SeriesPoint, 0, len(candles))
 			res.Plots["down"] = make([]SeriesPoint, 0, len(candles))
 			res.Plots["plot"] = make([]SeriesPoint, 0, len(candles))
 			res.Plots["value"] = make([]SeriesPoint, 0, len(candles))
 			res.Plots["direction"] = make([]SeriesPoint, 0, len(candles))
-		}
-
-		var interval int64 = 60
-		if len(candles) >= 2 {
-			interval = candles[len(candles)-1].Time - candles[len(candles)-2].Time
-			if interval <= 0 {
-				interval = 60
+		} else if !inst.isMulti && len(candles) > 0 {
+			plotID := "plot"
+			if len(desc.Plots) > 0 {
+				plotID = desc.Plots[0].ID
 			}
+			res.Plots[plotID] = make([]SeriesPoint, 0, len(candles))
 		}
 
 		// Check for plot offsets in cfg.Inputs (e.g. jawOffset, teethOffset, lipsOffset, or general offset)
-		offsets := make(map[string]int64)
+		var offsets map[string]int64
 		for k, v := range cfg.Inputs {
 			lk := strings.ToLower(k)
 			if lk == "offset" {
+				if offsets == nil {
+					offsets = make(map[string]int64)
+				}
 				val := int64(toInt(v))
 				for _, p := range desc.Plots {
 					offsets[p.ID] = val
@@ -993,6 +1381,9 @@ func (e *Engine) Evaluate(ctx context.Context, candles []CandleData, configs []E
 				plotPrefix := strings.TrimSuffix(lk, "offset")
 				for _, p := range desc.Plots {
 					if strings.EqualFold(p.ID, plotPrefix) {
+						if offsets == nil {
+							offsets = make(map[string]int64)
+						}
 						offsets[p.ID] = int64(toInt(v))
 					}
 				}
@@ -1003,10 +1394,48 @@ func (e *Engine) Evaluate(ctx context.Context, candles []CandleData, configs []E
 		var hasPrevSlopePoint bool
 		var prevRegime int // +1 for Up, -1 for Down, 0 for Unset
 
+		// Fast WASM batch path for single-input, single-output indicators
+		if len(candles) >= 32 && inst.batchFn != nil && !inst.isMulti && inst.numInputs == 1 && inst.customUpdate == nil {
+			batchVals, usedBatch, batchErr := inst.evalBatchSingleOutput(hostCtx, candles)
+			if batchErr != nil {
+				worker.Tainted = true
+				inst.Free(hostCtx)
+				return nil, fmt.Errorf("batch eval error on %q: %w", desc.ID, batchErr)
+			}
+			if usedBatch && len(batchVals) == len(candles) {
+				for i, v := range batchVals {
+					appendSingleEvalPoint(&res, desc, offsets, interval, candles[i].Time, v, inst.isSlope, &prevSlopePoint, &hasPrevSlopePoint, &prevRegime)
+				}
+				inst.Free(hostCtx)
+				results = append(results, res)
+				continue
+			}
+		}
+
+		// Allocate a single reusable WASM stack retptr across the entire bar loop.
+		var sharedRetptr uint32
+		if inst.customUpdate == nil && (inst.hasRetptr || !inst.isMulti) {
+			if spRes, spErr := worker.AddSP.Call(hostCtx, stackAlloc64); spErr == nil && len(spRes) > 0 {
+				sharedRetptr = uint32(spRes[0])
+			}
+		}
+
 		for _, c := range candles {
-			singleVal, multiVal, isReady, err := inst.Update(ctx, c)
+			if err := ctx.Err(); err != nil {
+				worker.Tainted = true
+				if sharedRetptr != 0 {
+					_, _ = worker.AddSP.Call(context.Background(), uint64(int32(64)))
+				}
+				inst.Free(context.Background())
+				return nil, err
+			}
+			singleVal, multiVal, isReady, err := inst.updateWithRetptr(hostCtx, c, sharedRetptr)
 			if err != nil {
-				inst.Free(ctx)
+				worker.Tainted = true
+				if sharedRetptr != 0 {
+					_, _ = worker.AddSP.Call(hostCtx, uint64(int32(64)))
+				}
+				inst.Free(hostCtx)
 				return nil, fmt.Errorf("eval error on %q: %w", desc.ID, err)
 			}
 			if !isReady {
@@ -1014,7 +1443,7 @@ func (e *Engine) Evaluate(ctx context.Context, candles []CandleData, configs []E
 			}
 
 			if inst.isMulti {
-				if isDirectionalStopIndicator(desc.ID) {
+				if inst.isDirStop {
 					val, valOk := multiVal["value"]
 					dir, dirOk := multiVal["direction"]
 					if !valOk || math.IsNaN(val) || math.IsInf(val, 0) {
@@ -1058,82 +1487,14 @@ func (e *Engine) Evaluate(ctx context.Context, candles []CandleData, configs []E
 					}
 				}
 			} else {
-				if math.IsNaN(singleVal) || math.IsInf(singleVal, 0) {
-					continue
-				}
-
-				if isSlopeIndicator(desc.ID) {
-					ptTime := c.Time
-					if off, ok := offsets["plot"]; ok && off != 0 {
-						ptTime += off * interval
-					} else if off, ok := offsets["value"]; ok && off != 0 {
-						ptTime += off * interval
-					} else if off, ok := offsets["up"]; ok && off != 0 {
-						ptTime += off * interval
-					}
-
-					currPt := SeriesPoint{Time: ptTime, Value: singleVal}
-
-					// Retain continuous lines
-					res.Plots["plot"] = append(res.Plots["plot"], currPt)
-					res.Plots["value"] = append(res.Plots["value"], currPt)
-
-					if !hasPrevSlopePoint {
-						prevSlopePoint = currPt
-						hasPrevSlopePoint = true
-					} else {
-						slope := currPt.Value - prevSlopePoint.Value
-						if slope > 0 {
-							if prevRegime != 1 {
-								// Inflection from Down to Up: include transition anchor bar in Up
-								res.Plots["up"] = append(res.Plots["up"], prevSlopePoint)
-								prevRegime = 1
-							}
-							res.Plots["up"] = append(res.Plots["up"], currPt)
-						} else if slope < 0 {
-							if prevRegime != -1 {
-								// Inflection from Up to Down: include transition anchor bar in Down
-								res.Plots["down"] = append(res.Plots["down"], prevSlopePoint)
-								prevRegime = -1
-							}
-							res.Plots["down"] = append(res.Plots["down"], currPt)
-						} else {
-							// Flat slope: persist current regime (default to Up if unset)
-							if prevRegime == -1 {
-								res.Plots["down"] = append(res.Plots["down"], currPt)
-							} else {
-								if prevRegime == 0 {
-									res.Plots["up"] = append(res.Plots["up"], prevSlopePoint)
-									prevRegime = 1
-								}
-								res.Plots["up"] = append(res.Plots["up"], currPt)
-							}
-						}
-						prevSlopePoint = currPt
-					}
-					var dirVal float64 = 1.0
-					if prevRegime == -1 {
-						dirVal = -1.0
-					}
-					res.Plots["direction"] = append(res.Plots["direction"], SeriesPoint{Time: ptTime, Value: dirVal})
-				} else {
-					plotID := "plot"
-					if len(desc.Plots) > 0 {
-						plotID = desc.Plots[0].ID
-					}
-					ptTime := c.Time
-					if off, ok := offsets[plotID]; ok && off != 0 {
-						ptTime += off * interval
-					}
-					res.Plots[plotID] = append(res.Plots[plotID], SeriesPoint{
-						Time:  ptTime,
-						Value: singleVal,
-					})
-				}
+				appendSingleEvalPoint(&res, desc, offsets, interval, c.Time, singleVal, inst.isSlope, &prevSlopePoint, &hasPrevSlopePoint, &prevRegime)
 			}
 		}
 
-		inst.Free(ctx)
+		if sharedRetptr != 0 {
+			_, _ = worker.AddSP.Call(hostCtx, uint64(int32(64)))
+		}
+		inst.Free(hostCtx)
 		results = append(results, res)
 	}
 
@@ -1152,15 +1513,18 @@ type StreamingSession struct {
 	closed     bool
 }
 
-// CreateSession creates a dedicated streaming session for the given symbol, resolution, and indicator configs.
+// CreateSession creates a streaming session for the given symbol, resolution, and indicator configs,
+// reusing pooled Wazero worker instances.
 func (e *Engine) CreateSession(ctx context.Context, symbol, resolution string, configs []EvalIndicatorInstance) (IndicatorSession, error) {
-	worker, err := e.spawnWorker(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("spawn streaming worker: %w", err)
-	}
+	worker := e.acquireWorker()
+	hostCtx := ensureSessionHost(ctx, worker.Session)
 
 	instances := make([]*IndicatorInstance, 0, len(configs))
 	for _, cfg := range configs {
+		if err := ctx.Err(); err != nil {
+			worker.Tainted = true
+			return nil, err
+		}
 		indID := cfg.IndicatorID
 		if indID == "wickra.vwap_std_dev_bands" || indID == "VwapStdDevBands" {
 			indID = "wickra.vwap"
@@ -1169,17 +1533,20 @@ func (e *Engine) CreateSession(ctx context.Context, symbol, resolution string, c
 		if !ok {
 			desc, ok = e.catalog.GetByWasmClass(indID)
 			if !ok {
-				worker.Mod.Close(ctx)
+				for _, prev := range instances {
+					prev.Free(hostCtx)
+				}
+				e.releaseWorker(worker)
 				return nil, fmt.Errorf("indicator %q not found", cfg.IndicatorID)
 			}
 		}
 
-		inst, err := worker.NewIndicator(ctx, desc, cfg.Inputs)
+		inst, err := worker.NewIndicator(hostCtx, desc, cfg.Inputs)
 		if err != nil {
 			for _, prev := range instances {
-				prev.Free(ctx)
+				prev.Free(hostCtx)
 			}
-			worker.Mod.Close(ctx)
+			e.releaseWorker(worker)
 			return nil, fmt.Errorf("instantiate %q: %w", cfg.IndicatorID, err)
 		}
 		instances = append(instances, inst)
@@ -1195,6 +1562,52 @@ func (e *Engine) CreateSession(ctx context.Context, symbol, resolution string, c
 	}, nil
 }
 
+// Seed warms up the streaming session with historical candles without building intermediate plot maps.
+func (s *StreamingSession) Seed(ctx context.Context, candles []CandleData) error {
+	if len(candles) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return fmt.Errorf("session is closed")
+	}
+
+	hostCtx := ensureSessionHost(ctx, s.worker.Session)
+	var sharedRetptr uint32
+	if spRes, err := s.worker.AddSP.Call(hostCtx, stackAlloc64); err == nil && len(spRes) > 0 {
+		sharedRetptr = uint32(spRes[0])
+		defer s.worker.AddSP.Call(hostCtx, uint64(int32(64)))
+	}
+
+	for _, c := range candles {
+		for _, inst := range s.instances {
+			singleVal, _, isReady, err := inst.updateWithRetptr(hostCtx, c, sharedRetptr)
+			if err != nil {
+				s.worker.Tainted = true
+				return err
+			}
+			if !isReady || inst.isMulti || !inst.isSlope || math.IsNaN(singleVal) || math.IsInf(singleVal, 0) {
+				continue
+			}
+			if !inst.hasPrevSlope {
+				inst.prevSlopeVal = singleVal
+				inst.hasPrevSlope = true
+			} else {
+				slope := singleVal - inst.prevSlopeVal
+				if slope > 0 {
+					inst.slopeRegime = 1
+				} else if slope < 0 {
+					inst.slopeRegime = -1
+				}
+				inst.prevSlopeVal = singleVal
+			}
+		}
+	}
+	return nil
+}
+
 // Update processes a new candle and returns the updated plot values keyed by instanceId -> plotId -> value.
 func (s *StreamingSession) Update(ctx context.Context, c CandleData) (map[string]map[string]float64, error) {
 	s.mu.Lock()
@@ -1204,12 +1617,22 @@ func (s *StreamingSession) Update(ctx context.Context, c CandleData) (map[string
 		return nil, fmt.Errorf("session is closed")
 	}
 
-	plots := make(map[string]map[string]float64)
+	hostCtx := ensureSessionHost(ctx, s.worker.Session)
+	plots := make(map[string]map[string]float64, len(s.instances))
+
+	var sharedRetptr uint32
+	if len(s.instances) > 0 {
+		if spRes, err := s.worker.AddSP.Call(hostCtx, stackAlloc64); err == nil && len(spRes) > 0 {
+			sharedRetptr = uint32(spRes[0])
+			defer s.worker.AddSP.Call(hostCtx, uint64(int32(64)))
+		}
+	}
 
 	for i, inst := range s.instances {
 		cfg := s.configs[i]
-		singleVal, multiVal, isReady, err := inst.Update(ctx, c)
+		singleVal, multiVal, isReady, err := inst.updateWithRetptr(hostCtx, c, sharedRetptr)
 		if err != nil {
+			s.worker.Tainted = true
 			return nil, err
 		}
 		if !isReady {
@@ -1217,30 +1640,30 @@ func (s *StreamingSession) Update(ctx context.Context, c CandleData) (map[string
 		}
 
 		if inst.isMulti {
-			cleanMap := make(map[string]float64, len(multiVal)+2)
 			for k, v := range multiVal {
-				if !math.IsNaN(v) && !math.IsInf(v, 0) {
-					cleanMap[k] = v
+				if math.IsNaN(v) || math.IsInf(v, 0) {
+					delete(multiVal, k)
 				}
 			}
-			if isDirectionalStopIndicator(inst.desc.ID) {
-				val, valOk := cleanMap["value"]
-				dir, dirOk := cleanMap["direction"]
+			if inst.isDirStop {
+				val, valOk := multiVal["value"]
+				dir, dirOk := multiVal["direction"]
 				if valOk && dirOk {
 					if dir > 0 {
-						cleanMap["up"] = val
+						multiVal["up"] = val
 					} else if dir < 0 {
-						cleanMap["down"] = val
+						multiVal["down"] = val
 					}
 				}
 			}
-			if len(cleanMap) > 0 {
-				plots[cfg.InstanceID] = cleanMap
+			if len(multiVal) > 0 {
+				plots[cfg.InstanceID] = multiVal
 			}
 		} else {
 			if !math.IsNaN(singleVal) && !math.IsInf(singleVal, 0) {
-				cleanMap := make(map[string]float64)
-				if isSlopeIndicator(inst.desc.ID) {
+				var cleanMap map[string]float64
+				if inst.isSlope {
+					cleanMap = make(map[string]float64, 4)
 					cleanMap["plot"] = singleVal
 					cleanMap["value"] = singleVal
 					if !inst.hasPrevSlope {
@@ -1274,7 +1697,7 @@ func (s *StreamingSession) Update(ctx context.Context, c CandleData) (map[string
 					if len(inst.desc.Plots) > 0 {
 						plotID = inst.desc.Plots[0].ID
 					}
-					cleanMap[plotID] = singleVal
+					cleanMap = map[string]float64{plotID: singleVal}
 				}
 				plots[cfg.InstanceID] = cleanMap
 			}
@@ -1284,7 +1707,7 @@ func (s *StreamingSession) Update(ctx context.Context, c CandleData) (map[string
 	return plots, nil
 }
 
-// Close releases all indicator instances and closes the dedicated worker module.
+// Close releases all indicator instances and returns the pooled worker module to Engine.
 func (s *StreamingSession) Close(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1294,8 +1717,21 @@ func (s *StreamingSession) Close(ctx context.Context) error {
 	}
 	s.closed = true
 
-	for _, inst := range s.instances {
-		inst.Free(ctx)
+	if s.worker != nil {
+		hostCtx := ensureSessionHost(ctx, s.worker.Session)
+		for _, inst := range s.instances {
+			inst.Free(hostCtx)
+		}
 	}
-	return s.worker.Mod.Close(ctx)
+	s.instances = nil
+
+	if s.engine != nil && s.worker != nil {
+		s.engine.releaseWorker(s.worker)
+		s.worker = nil
+	} else if s.worker != nil && s.worker.Mod != nil && !s.worker.Mod.IsClosed() {
+		err := s.worker.Mod.Close(ctx)
+		s.worker = nil
+		return err
+	}
+	return nil
 }

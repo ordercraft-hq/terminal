@@ -185,6 +185,7 @@ func (s *Server) handleUserIndicators(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(ind)
 
 	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB max user indicator payload
 		var ind storage.UserIndicator
 		if err := json.NewDecoder(r.Body).Decode(&ind); err != nil {
 			http.Error(w, fmt.Sprintf("invalid json: %v", err), http.StatusBadRequest)
@@ -194,9 +195,16 @@ func (s *Server) handleUserIndicators(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "indicator name is required", http.StatusBadRequest)
 			return
 		}
+		if len(ind.Code) > scripting.MaxScriptSizeBytes {
+			http.Error(w, fmt.Sprintf("script code exceeds %d-byte limit", scripting.MaxScriptSizeBytes), http.StatusBadRequest)
+			return
+		}
 		if err := s.storage.SaveUserIndicator(r.Context(), &ind); err != nil {
 			http.Error(w, fmt.Sprintf("failed to save indicator: %v", err), http.StatusInternalServerError)
 			return
+		}
+		if u, ok := s.indicatorEngine.(*UnifiedIndicatorEngine); ok {
+			u.InvalidateScriptCache(ind.ID)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -210,6 +218,9 @@ func (s *Server) handleUserIndicators(w http.ResponseWriter, r *http.Request) {
 		if err := s.storage.DeleteUserIndicator(r.Context(), path); err != nil {
 			http.Error(w, fmt.Sprintf("failed to delete indicator: %v", err), http.StatusInternalServerError)
 			return
+		}
+		if u, ok := s.indicatorEngine.(*UnifiedIndicatorEngine); ok {
+			u.InvalidateScriptCache(path)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{

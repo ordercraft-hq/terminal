@@ -148,7 +148,7 @@ export const FavoriteDrawingsBar: React.FC = () => {
       }}
       onMouseDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
-      className="floating-drawing-toolbar absolute z-30 pointer-events-auto flex items-center h-9 px-1.5 rounded-lg bg-[#1e222d] border border-[#2a2e39] shadow-2xl text-[#d1d4dc] backdrop-blur-md select-none animate-in fade-in zoom-in-95 duration-100"
+      className="floating-drawing-toolbar absolute z-30 pointer-events-auto flex items-center h-9 px-1.5 rounded-lg bg-[#1e222d]/95 border border-[#2a2e39] shadow-2xl text-[#d1d4dc] select-none animate-in fade-in zoom-in-95 duration-100"
     >
       {/* 1. Drag Handle (6 dots) */}
       <div

@@ -1,4 +1,4 @@
-import type { IChartApi, ISeriesApi } from 'lightweight-charts';
+import type { IChartApi, ISeriesApi, SeriesType } from 'lightweight-charts';
 import type { Candle } from '../transport/client';
 import type { LogicalAnchor, DrawingToolType, UserDrawing } from '../store/syncStore';
 
@@ -232,7 +232,7 @@ export interface AVPOptions {
 export interface DrawingRenderContext {
   ctx: CanvasRenderingContext2D;
   chart: IChartApi;
-  series: ISeriesApi<'Candlestick'>;
+  series: ISeriesApi<SeriesType>;
   candles: Candle[];
   width: number;
   height: number;

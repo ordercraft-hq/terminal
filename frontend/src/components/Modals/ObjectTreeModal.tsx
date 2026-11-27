@@ -9,6 +9,7 @@ import {
   EyeOff,
   Copy,
 } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import { useSyncStore } from '../../store/syncStore';
 import type { DrawingToolType } from '../../store/syncStore';
 import { transport } from '../../transport/client';
@@ -22,6 +23,9 @@ export interface ObjectTreeModalProps {
 export const ObjectTreeModal: React.FC<ObjectTreeModalProps> = ({ isOpen, onClose }) => {
   const [search, setSearch] = useState('');
 
+  const currentPaneId = useSyncStore((s) => s.activePaneId || 'pane-1');
+  const paneSymbol = useSyncStore((s) => s.panes[currentPaneId]?.symbol);
+
   const {
     drawings,
     deleteDrawing,
@@ -32,15 +36,25 @@ export const ObjectTreeModal: React.FC<ObjectTreeModalProps> = ({ isOpen, onClos
     selectedDrawingId,
     setSelectedDrawingId,
     symbol,
-    activePaneId,
-    panes,
     syncDrawingsAcrossCharts,
-  } = useSyncStore();
+  } = useSyncStore(
+    useShallow((s) => ({
+      drawings: s.drawings,
+      deleteDrawing: s.deleteDrawing,
+      duplicateDrawing: s.duplicateDrawing,
+      toggleDrawingLock: s.toggleDrawingLock,
+      toggleDrawingVisibility: s.toggleDrawingVisibility,
+      clearDrawings: s.clearDrawings,
+      selectedDrawingId: s.selectedDrawingId,
+      setSelectedDrawingId: s.setSelectedDrawingId,
+      symbol: s.symbol,
+      syncDrawingsAcrossCharts: s.syncDrawingsAcrossCharts,
+    }))
+  );
 
   if (!isOpen) return null;
 
-  const currentPaneId = activePaneId || 'pane-1';
-  const activeSymbol = panes[currentPaneId]?.symbol || symbol;
+  const activeSymbol = paneSymbol || symbol;
 
   // Filter drawings specifically belonging to the active chart
   const currentChartDrawings = drawings.filter((d) => {

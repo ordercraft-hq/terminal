@@ -303,12 +303,7 @@ export class RectangleTool extends BaseDrawingTool<RectangleOptions> {
         c2d.fillStyle = '#1e222d';
         c2d.strokeStyle = '#2962ff';
         c2d.lineWidth = 2;
-        c2d.beginPath();
-        if (typeof c2d.roundRect === 'function') {
-          c2d.roundRect(m.x - 4.5, m.y - 4.5, 9, 9, 2.5);
-        } else {
-          c2d.rect(m.x - 4.5, m.y - 4.5, 9, 9);
-        }
+        BaseDrawingTool.drawRoundedRect(c2d, m.x - 4.5, m.y - 4.5, 9, 9, 2.5);
         c2d.fill();
         c2d.stroke();
         c2d.restore();

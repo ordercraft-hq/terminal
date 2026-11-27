@@ -1,5 +1,4 @@
 @import "tailwindcss";
-@import "dockview/dist/styles/dockview.css";
 
 @layer base {
   :root {

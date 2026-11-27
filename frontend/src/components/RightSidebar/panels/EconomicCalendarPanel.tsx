@@ -1,21 +1,12 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
   Calendar as CalendarIcon,
   RefreshCw,
   Signal,
 } from 'lucide-react';
 import { useSyncStore } from '../../../store/syncStore';
-import { getTimezoneOffsetSeconds } from '../../ChartPane/ChartPane';
-
-interface CalendarEvent {
-  title: string;
-  country: string;
-  date: string;
-  impact: string;
-  forecast: string;
-  previous: string;
-  actual?: string;
-}
+import { getTimezoneOffsetSeconds } from '../../../utils/timezones';
+import { transport, type CalendarEvent } from '../../../transport/client';
 
 const STORAGE_KEY = 'ordercraft_economic_calendar_prefs';
 
@@ -25,11 +16,22 @@ export const EconomicCalendarPanel: React.FC = () => {
   const [isRefreshing, setIsRefreshing] = useState(false);
 
   // Active chart timezone
-  const activePaneId = useSyncStore((s) => s.activePaneId);
-  const panes = useSyncStore((s) => s.panes);
+  const activePaneTimezone = useSyncStore((s) => s.panes[s.activePaneId]?.timezone);
   const globalTimezone = useSyncStore((s) => s.timezone);
-  const activeTimezone = panes[activePaneId]?.timezone || globalTimezone || 'UTC-4';
+  const activeTimezone = activePaneTimezone || globalTimezone || 'UTC-4';
   const tzOffsetSec = useMemo(() => getTimezoneOffsetSeconds(activeTimezone), [activeTimezone]);
+
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const spinTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current?.abort();
+      if (spinTimerRef.current !== null) {
+        window.clearTimeout(spinTimerRef.current);
+      }
+    };
+  }, []);
 
   // Restore user choices (impact & currency) from localStorage
   const [selectedImpact, setSelectedImpact] = useState<string>(() => {
@@ -67,8 +69,17 @@ export const EconomicCalendarPanel: React.FC = () => {
     } catch {}
   }, [selectedImpact, selectedCountry]);
 
-  // Fetch calendar events
-  const fetchEvents = async (force = false) => {
+  // Fetch calendar events via transport
+  const fetchEvents = useCallback(async (force = false) => {
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    if (spinTimerRef.current !== null) {
+      window.clearTimeout(spinTimerRef.current);
+      spinTimerRef.current = null;
+    }
+
     if (force) {
       setIsRefreshing(true);
     } else {
@@ -77,27 +88,32 @@ export const EconomicCalendarPanel: React.FC = () => {
 
     const startTime = Date.now();
     try {
-      const url = `/api/calendar${force ? '?refresh=true&_t=' + Date.now() : ''}`;
-      const resp = await fetch(url);
-      if (resp.ok) {
-        const data = await resp.json();
-        setEvents(data.events || []);
+      const nextEvents = await transport.getEconomicCalendar({
+        refresh: force,
+        signal: controller.signal,
+      });
+      if (!controller.signal.aborted) {
+        setEvents(nextEvents);
       }
     } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') return;
       console.warn('Failed to fetch calendar from backend:', err);
     } finally {
-      const elapsed = Date.now() - startTime;
-      const minSpinDelay = force ? Math.max(0, 450 - elapsed) : 0;
-      setTimeout(() => {
-        setLoading(false);
-        setIsRefreshing(false);
-      }, minSpinDelay);
+      if (!controller.signal.aborted) {
+        const elapsed = Date.now() - startTime;
+        const minSpinDelay = force ? Math.max(0, 450 - elapsed) : 0;
+        spinTimerRef.current = window.setTimeout(() => {
+          setLoading(false);
+          setIsRefreshing(false);
+          spinTimerRef.current = null;
+        }, minSpinDelay);
+      }
     }
-  };
+  }, []);
 
   useEffect(() => {
     fetchEvents(false);
-  }, []);
+  }, [fetchEvents]);
 
   // Convert an event date to a shifted Date object whose UTC methods return wall-clock time in active chart timezone
   const getZonedDate = (dateStr: string) => {

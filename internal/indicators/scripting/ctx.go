@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/ordercraft-hq/terminal/internal/indicators/wickra"
@@ -11,6 +12,19 @@ import (
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
 )
+
+type cachedStarlarkLists struct {
+	time      *starlark.List
+	open      *starlark.List
+	high      *starlark.List
+	low       *starlark.List
+	close     *starlark.List
+	volume    *starlark.List
+	delta     *starlark.List
+	cumDelta  *starlark.List
+	bidVolume *starlark.List
+	askVolume *starlark.List
+}
 
 // ScriptContext holds market series and execution environment passed to OrderScript main(ctx).
 type ScriptContext struct {
@@ -26,6 +40,43 @@ type ScriptContext struct {
 	BidVolume  []float64
 	AskVolume  []float64
 	CumDelta   []float64
+
+	slMu         sync.Mutex
+	slTime       []starlark.Value
+	slOpen       []starlark.Value
+	slHigh       []starlark.Value
+	slLow        []starlark.Value
+	slClose      []starlark.Value
+	slVolume     []starlark.Value
+	slDelta      []starlark.Value
+	slBidVolume  []starlark.Value
+	slAskVolume  []starlark.Value
+	slCumDelta   []starlark.Value
+	cachedLists  *cachedStarlarkLists
+	listsDirty   bool
+	candlesCache []wickra.CandleData
+	candlesDirty bool
+}
+
+func computeSyntheticDelta(c wickra.CandleData) (delta, bid, ask float64) {
+	rng := c.High - c.Low
+	if rng > 1e-9 {
+		delta = c.Volume * (c.Close - c.Open) / rng
+	} else if c.Close >= c.Open {
+		delta = c.Volume * 0.5
+	} else {
+		delta = -c.Volume * 0.5
+	}
+
+	ask = (c.Volume + delta) * 0.5
+	bid = (c.Volume - delta) * 0.5
+	if ask < 0 {
+		ask = 0
+	}
+	if bid < 0 {
+		bid = 0
+	}
+	return delta, bid, ask
 }
 
 // NewScriptContextFromCandles builds a ScriptContext from candles and computes synthetic orderflow delta if needed.
@@ -55,28 +106,7 @@ func NewScriptContextFromCandles(symbol, resolution string, candles []wickra.Can
 		sc.Close[i] = c.Close
 		sc.Volume[i] = c.Volume
 
-		// Estimate synthetic orderflow delta
-		rng := c.High - c.Low
-		var delta float64
-		if rng > 1e-9 {
-			delta = c.Volume * (c.Close - c.Open) / rng
-		} else {
-			if c.Close >= c.Open {
-				delta = c.Volume * 0.5
-			} else {
-				delta = -c.Volume * 0.5
-			}
-		}
-
-		ask := (c.Volume + delta) * 0.5
-		bid := (c.Volume - delta) * 0.5
-		if ask < 0 {
-			ask = 0
-		}
-		if bid < 0 {
-			bid = 0
-		}
-
+		delta, bid, ask := computeSyntheticDelta(c)
 		runningCumDelta += delta
 		sc.Delta[i] = delta
 		sc.BidVolume[i] = bid
@@ -87,29 +117,252 @@ func NewScriptContextFromCandles(symbol, resolution string, candles []wickra.Can
 	return sc
 }
 
-func floatSliceToStarlarkList(vals []float64) *starlark.List {
+// UpdateCandle incrementally updates the tip bar (if matching Time) or appends a new bar,
+// updating cached Starlark value slices in O(1) instead of rebuilding all 10 lists per tick.
+func (sc *ScriptContext) UpdateCandle(c wickra.CandleData, maxHistory int) {
+	sc.slMu.Lock()
+	defer sc.slMu.Unlock()
+
+	delta, bid, ask := computeSyntheticDelta(c)
+	n := len(sc.Time)
+
+	if n > 0 && sc.Time[n-1] == c.Time {
+		last := n - 1
+		var prevCum float64
+		if last > 0 {
+			prevCum = sc.CumDelta[last-1]
+		}
+		cumDelta := prevCum + delta
+
+		sc.Time[last] = c.Time
+		sc.Open[last] = c.Open
+		sc.High[last] = c.High
+		sc.Low[last] = c.Low
+		sc.Close[last] = c.Close
+		sc.Volume[last] = c.Volume
+		sc.Delta[last] = delta
+		sc.BidVolume[last] = bid
+		sc.AskVolume[last] = ask
+		sc.CumDelta[last] = cumDelta
+
+		if len(sc.slTime) == n {
+			sc.slTime[last] = starlark.MakeInt64(c.Time)
+			sc.slOpen[last] = starlark.Float(c.Open)
+			sc.slHigh[last] = starlark.Float(c.High)
+			sc.slLow[last] = starlark.Float(c.Low)
+			sc.slClose[last] = starlark.Float(c.Close)
+			sc.slVolume[last] = starlark.Float(c.Volume)
+			sc.slDelta[last] = starlark.Float(delta)
+			sc.slBidVolume[last] = starlark.Float(bid)
+			sc.slAskVolume[last] = starlark.Float(ask)
+			sc.slCumDelta[last] = starlark.Float(cumDelta)
+		} else {
+			sc.slTime = nil
+		}
+
+		if len(sc.candlesCache) == n && !sc.candlesDirty {
+			sc.candlesCache[last] = c
+		} else {
+			sc.candlesDirty = true
+		}
+		sc.listsDirty = true
+		return
+	}
+
+	var prevCum float64
+	if n > 0 {
+		prevCum = sc.CumDelta[n-1]
+	}
+	cumDelta := prevCum + delta
+
+	sc.Time = append(sc.Time, c.Time)
+	sc.Open = append(sc.Open, c.Open)
+	sc.High = append(sc.High, c.High)
+	sc.Low = append(sc.Low, c.Low)
+	sc.Close = append(sc.Close, c.Close)
+	sc.Volume = append(sc.Volume, c.Volume)
+	sc.Delta = append(sc.Delta, delta)
+	sc.BidVolume = append(sc.BidVolume, bid)
+	sc.AskVolume = append(sc.AskVolume, ask)
+	sc.CumDelta = append(sc.CumDelta, cumDelta)
+
+	if len(sc.slTime) == n {
+		sc.slTime = append(sc.slTime, starlark.MakeInt64(c.Time))
+		sc.slOpen = append(sc.slOpen, starlark.Float(c.Open))
+		sc.slHigh = append(sc.slHigh, starlark.Float(c.High))
+		sc.slLow = append(sc.slLow, starlark.Float(c.Low))
+		sc.slClose = append(sc.slClose, starlark.Float(c.Close))
+		sc.slVolume = append(sc.slVolume, starlark.Float(c.Volume))
+		sc.slDelta = append(sc.slDelta, starlark.Float(delta))
+		sc.slBidVolume = append(sc.slBidVolume, starlark.Float(bid))
+		sc.slAskVolume = append(sc.slAskVolume, starlark.Float(ask))
+		sc.slCumDelta = append(sc.slCumDelta, starlark.Float(cumDelta))
+	} else {
+		sc.slTime = nil
+	}
+
+	if len(sc.candlesCache) == n && !sc.candlesDirty {
+		sc.candlesCache = append(sc.candlesCache, c)
+	} else {
+		sc.candlesDirty = true
+	}
+
+	if maxHistory > 0 && len(sc.Time) > maxHistory {
+		trim := len(sc.Time) - maxHistory
+		sc.Time = trimInt64Front(sc.Time, trim, maxHistory)
+		sc.Open = trimFloat64Front(sc.Open, trim, maxHistory)
+		sc.High = trimFloat64Front(sc.High, trim, maxHistory)
+		sc.Low = trimFloat64Front(sc.Low, trim, maxHistory)
+		sc.Close = trimFloat64Front(sc.Close, trim, maxHistory)
+		sc.Volume = trimFloat64Front(sc.Volume, trim, maxHistory)
+		sc.Delta = trimFloat64Front(sc.Delta, trim, maxHistory)
+		sc.BidVolume = trimFloat64Front(sc.BidVolume, trim, maxHistory)
+		sc.AskVolume = trimFloat64Front(sc.AskVolume, trim, maxHistory)
+		sc.CumDelta = trimFloat64Front(sc.CumDelta, trim, maxHistory)
+
+		if len(sc.slTime) == maxHistory+trim {
+			sc.slTime = trimStarlarkFront(sc.slTime, trim, maxHistory)
+			sc.slOpen = trimStarlarkFront(sc.slOpen, trim, maxHistory)
+			sc.slHigh = trimStarlarkFront(sc.slHigh, trim, maxHistory)
+			sc.slLow = trimStarlarkFront(sc.slLow, trim, maxHistory)
+			sc.slClose = trimStarlarkFront(sc.slClose, trim, maxHistory)
+			sc.slVolume = trimStarlarkFront(sc.slVolume, trim, maxHistory)
+			sc.slDelta = trimStarlarkFront(sc.slDelta, trim, maxHistory)
+			sc.slBidVolume = trimStarlarkFront(sc.slBidVolume, trim, maxHistory)
+			sc.slAskVolume = trimStarlarkFront(sc.slAskVolume, trim, maxHistory)
+			sc.slCumDelta = trimStarlarkFront(sc.slCumDelta, trim, maxHistory)
+		}
+		if len(sc.candlesCache) == maxHistory+trim && !sc.candlesDirty {
+			copy(sc.candlesCache, sc.candlesCache[trim:])
+			sc.candlesCache = sc.candlesCache[:maxHistory]
+		}
+	}
+
+	sc.listsDirty = true
+}
+
+func trimInt64Front(s []int64, trim, maxHistory int) []int64 {
+	copy(s, s[trim:])
+	return s[:maxHistory]
+}
+
+func trimFloat64Front(s []float64, trim, maxHistory int) []float64 {
+	copy(s, s[trim:])
+	return s[:maxHistory]
+}
+
+func trimStarlarkFront(s []starlark.Value, trim, maxHistory int) []starlark.Value {
+	copy(s, s[trim:])
+	clear(s[maxHistory:])
+	return s[:maxHistory]
+}
+
+// Candles returns a cached []wickra.CandleData slice for ta.call invocations.
+func (sc *ScriptContext) Candles() []wickra.CandleData {
+	sc.slMu.Lock()
+	defer sc.slMu.Unlock()
+
+	n := len(sc.Time)
+	if !sc.candlesDirty && len(sc.candlesCache) == n {
+		return sc.candlesCache
+	}
+	candles := make([]wickra.CandleData, n)
+	for i := 0; i < n; i++ {
+		candles[i] = wickra.CandleData{
+			Time:   sc.Time[i],
+			Open:   sc.Open[i],
+			High:   sc.High[i],
+			Low:    sc.Low[i],
+			Close:  sc.Close[i],
+			Volume: sc.Volume[i],
+		}
+	}
+	sc.candlesCache = candles
+	sc.candlesDirty = false
+	return candles
+}
+
+func floatSliceToStarlarkValues(vals []float64) []starlark.Value {
 	items := make([]starlark.Value, len(vals))
 	for i, v := range vals {
 		items[i] = starlark.Float(v)
 	}
-	return starlark.NewList(items)
+	return items
 }
 
-func int64SliceToStarlarkList(vals []int64) *starlark.List {
+func int64SliceToStarlarkValues(vals []int64) []starlark.Value {
 	items := make([]starlark.Value, len(vals))
 	for i, v := range vals {
 		items[i] = starlark.MakeInt64(v)
 	}
-	return starlark.NewList(items)
+	return items
+}
+
+func frozenListFromValues(vals []starlark.Value) *starlark.List {
+	cp := make([]starlark.Value, len(vals))
+	copy(cp, vals)
+	l := starlark.NewList(cp)
+	l.Freeze()
+	return l
+}
+
+func floatSliceToStarlarkList(vals []float64) *starlark.List {
+	return starlark.NewList(floatSliceToStarlarkValues(vals))
+}
+
+func int64SliceToStarlarkList(vals []int64) *starlark.List {
+	return starlark.NewList(int64SliceToStarlarkValues(vals))
+}
+
+func (sc *ScriptContext) ensureCachedStarlarkLists() *cachedStarlarkLists {
+	sc.slMu.Lock()
+	defer sc.slMu.Unlock()
+
+	n := len(sc.Time)
+	if sc.cachedLists != nil && !sc.listsDirty && len(sc.slTime) == n {
+		return sc.cachedLists
+	}
+
+	if len(sc.slTime) != n {
+		sc.slTime = int64SliceToStarlarkValues(sc.Time)
+		sc.slOpen = floatSliceToStarlarkValues(sc.Open)
+		sc.slHigh = floatSliceToStarlarkValues(sc.High)
+		sc.slLow = floatSliceToStarlarkValues(sc.Low)
+		sc.slClose = floatSliceToStarlarkValues(sc.Close)
+		sc.slVolume = floatSliceToStarlarkValues(sc.Volume)
+		sc.slDelta = floatSliceToStarlarkValues(sc.Delta)
+		sc.slBidVolume = floatSliceToStarlarkValues(sc.BidVolume)
+		sc.slAskVolume = floatSliceToStarlarkValues(sc.AskVolume)
+		sc.slCumDelta = floatSliceToStarlarkValues(sc.CumDelta)
+	}
+
+	sc.cachedLists = &cachedStarlarkLists{
+		time:      frozenListFromValues(sc.slTime),
+		open:      frozenListFromValues(sc.slOpen),
+		high:      frozenListFromValues(sc.slHigh),
+		low:       frozenListFromValues(sc.slLow),
+		close:     frozenListFromValues(sc.slClose),
+		volume:    frozenListFromValues(sc.slVolume),
+		delta:     frozenListFromValues(sc.slDelta),
+		cumDelta:  frozenListFromValues(sc.slCumDelta),
+		bidVolume: frozenListFromValues(sc.slBidVolume),
+		askVolume: frozenListFromValues(sc.slAskVolume),
+	}
+	sc.listsDirty = false
+	return sc.cachedLists
 }
 
 // ToStarlark translates the ScriptContext into a Starlark struct accessible via ctx.* in scripts.
-func (sc *ScriptContext) ToStarlark(grantedPerms []string, client *security.SafeHttpClient) *starlarkstruct.Struct {
+func (sc *ScriptContext) ToStarlark(evalCtx context.Context, grantedPerms []string, client *security.SafeHttpClient) *starlarkstruct.Struct {
+	if evalCtx == nil {
+		evalCtx = context.Background()
+	}
+	lists := sc.ensureCachedStarlarkLists()
 	orderflowDict := starlark.StringDict{
-		"delta":      floatSliceToStarlarkList(sc.Delta),
-		"cum_delta":  floatSliceToStarlarkList(sc.CumDelta),
-		"bid_volume": floatSliceToStarlarkList(sc.BidVolume),
-		"ask_volume": floatSliceToStarlarkList(sc.AskVolume),
+		"delta":      lists.delta,
+		"cum_delta":  lists.cumDelta,
+		"bid_volume": lists.bidVolume,
+		"ask_volume": lists.askVolume,
 	}
 	orderflowStruct := starlarkstruct.FromStringDict(starlark.String("orderflow"), orderflowDict)
 
@@ -141,7 +394,7 @@ func (sc *ScriptContext) ToStarlark(grantedPerms []string, client *security.Safe
 				return nil, fmt.Errorf("http client is not configured")
 			}
 
-			reqCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			reqCtx, cancel := context.WithTimeout(evalCtx, 5*time.Second)
 			defer cancel()
 
 			body, statusCode, err := client.Get(reqCtx, urlStr, headers, grantedPerms)
@@ -188,12 +441,12 @@ func (sc *ScriptContext) ToStarlark(grantedPerms []string, client *security.Safe
 	ipcStruct := starlarkstruct.FromStringDict(starlark.String("ipc"), ipcDict)
 
 	ctxDict := starlark.StringDict{
-		"time":       int64SliceToStarlarkList(sc.Time),
-		"open":       floatSliceToStarlarkList(sc.Open),
-		"high":       floatSliceToStarlarkList(sc.High),
-		"low":        floatSliceToStarlarkList(sc.Low),
-		"close":      floatSliceToStarlarkList(sc.Close),
-		"volume":     floatSliceToStarlarkList(sc.Volume),
+		"time":       lists.time,
+		"open":       lists.open,
+		"high":       lists.high,
+		"low":        lists.low,
+		"close":      lists.close,
+		"volume":     lists.volume,
 		"symbol":     starlark.String(sc.Symbol),
 		"resolution": starlark.String(sc.Resolution),
 		"orderflow":  orderflowStruct,
